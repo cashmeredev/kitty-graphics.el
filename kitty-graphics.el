@@ -44,6 +44,7 @@
 (declare-function org-attach-dir "org-attach" (&optional create-if-not-exists-p))
 (declare-function org-link-preview "org" (&optional arg beg end))
 (declare-function org-link-preview-region "org" (&optional include-linked refresh beg end))
+(declare-function dired-get-file-for-visit "dired" ())
 (declare-function image-mode-setup-winprops "image-mode" ())
 (declare-function shr-rescale-image "shr" (data &optional content-type width height max-width max-height))
 (defvar org-image-actual-width)
@@ -624,8 +625,12 @@ With prefix ARG \\[universal-argument], clear previews."
         (major-mode-suspend)
         (setq major-mode 'image-mode
               mode-name "Image[Kitty]")
-        (use-local-map (if (boundp 'image-mode-map) image-mode-map
-                         (make-sparse-keymap)))
+        (let ((map (make-sparse-keymap)))
+          (set-keymap-parent map (if (boundp 'image-mode-map) image-mode-map
+                                   special-mode-map))
+          (define-key map (kbd "q") #'kill-current-buffer)
+          (use-local-map map))
+        (setq-local buffer-read-only t)
         (when-let ((file (buffer-file-name)))
           (when (kitty-gfx--image-file-p file)
             (kitty-gfx-display-image
@@ -663,6 +668,43 @@ We extract the :file or :data from the image properties."
                   (when data (delete-file file t))))
             (error nil))))
     (apply orig-fn spec alt args)))
+
+;;;; Dired integration
+
+;;;###autoload
+(defun kitty-gfx-dired-preview ()
+  "Preview the image file at point in dired.
+Opens a side window with the image displayed via Kitty graphics.
+Press `q' in the preview buffer to close it."
+  (interactive)
+  (unless (derived-mode-p 'dired-mode)
+    (user-error "Not in a dired buffer"))
+  (let ((file (dired-get-file-for-visit)))
+    (unless (kitty-gfx--image-file-p file)
+      (user-error "Not an image file"))
+    (let* ((buf-name (format "*kitty-preview: %s*" (file-name-nondirectory file)))
+           (buf (get-buffer-create buf-name))
+           (win (display-buffer-in-side-window
+                 buf '((side . right) (window-width . 0.5)))))
+      (with-current-buffer buf
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert (format "  %s\n\n" (file-name-nondirectory file))))
+        (setq-local buffer-read-only t)
+        (let ((map (make-sparse-keymap)))
+          (define-key map (kbd "q")
+                      (lambda () (interactive)
+                        (let ((win (get-buffer-window (current-buffer))))
+                          (kitty-gfx-remove-images)
+                          (kill-buffer (current-buffer))
+                          (when (window-live-p win)
+                            (delete-window win)))))
+          (use-local-map map))
+        (kitty-gfx-display-image
+         file (point-min) (point-max)
+         (min (- (window-width win) 2) kitty-gfx-max-width)
+         (min (- (window-height win) 3) kitty-gfx-max-height))
+        (goto-char (point-min))))))
 
 ;;;; Integration install/uninstall
 
