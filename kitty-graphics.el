@@ -1,10 +1,10 @@
 ;;; kitty-graphics.el --- Display images in terminal Emacs via Kitty graphics protocol -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2025
+;; Copyright (C) 2025-2026
 ;;
-;; Author: vterm-graphics contributors
-;; Version: 0.1.0
-;; URL: https://git.cashmere.rs/vterm-graphics.git
+;; Author: cashmere
+;; Version: 0.2.0
+;; URL: https://git.cashmere.rs/kitty-graphics.git
 ;; Keywords: terminals, images, multimedia
 ;; Package-Requires: ((emacs "27.1"))
 
@@ -138,16 +138,55 @@ rather than accumulate.")
            (equal (getenv "TERM_PROGRAM") "ghostty"))))
 
 (defun kitty-gfx--query-cell-size ()
-  "Try to determine terminal cell size in pixels.
-Falls back to reasonable defaults (8x16) if query fails."
-  ;; Use Kitty's XTWINOPS CSI 16 t to query cell size.
-  ;; The terminal responds with CSI 6 ; height ; width t
-  ;; For now, use sensible defaults — async query is complex in Emacs.
-  ;; TODO: Parse response from CSI 16 t if we can make it work.
-  (unless kitty-gfx--cell-pixel-width
-    (setq kitty-gfx--cell-pixel-width 8))
-  (unless kitty-gfx--cell-pixel-height
-    (setq kitty-gfx--cell-pixel-height 16)))
+  "Query terminal for cell size in pixels using CSI 16 t (XTWINOPS).
+The terminal responds with CSI 6 ; HEIGHT ; WIDTH t.
+Falls back to reasonable defaults if query fails or times out."
+  (unless (and kitty-gfx--cell-pixel-width kitty-gfx--cell-pixel-height)
+    (condition-case nil
+        (let ((response "")
+              (done nil)
+              (deadline (+ (float-time) 0.5)))  ; 500ms timeout
+          ;; Send CSI 16 t — request cell size in pixels
+          (send-string-to-terminal "\e[16t")
+          ;; Read response characters until we get the full sequence
+          ;; Expected: ESC [ 6 ; HEIGHT ; WIDTH t
+          (while (and (not done) (< (float-time) deadline))
+            (let ((ch (with-timeout (0.1 nil)
+                        (read-event nil nil 0.1))))
+              (when ch
+                (setq response (concat response (string ch)))
+                ;; Check if response ends with 't' (end of CSI response)
+                (when (string-suffix-p "t" response)
+                  (setq done t)))))
+          ;; Parse the response: ESC [ 6 ; HEIGHT ; WIDTH t
+          (when (string-match "\e\\[6;\\([0-9]+\\);\\([0-9]+\\)t" response)
+            (let ((h (string-to-number (match-string 1 response)))
+                  (w (string-to-number (match-string 2 response))))
+              (when (and (> w 0) (> h 0))
+                (setq kitty-gfx--cell-pixel-width w
+                      kitty-gfx--cell-pixel-height h)
+                (kitty-gfx--log "cell-size query: %dx%d pixels" w h)))))
+      (error nil))
+    ;; Fallback if query failed
+    (unless kitty-gfx--cell-pixel-width
+      (setq kitty-gfx--cell-pixel-width 8))
+    (unless kitty-gfx--cell-pixel-height
+      (setq kitty-gfx--cell-pixel-height 16))
+    (kitty-gfx--log "cell-size final: %dx%d"
+                     kitty-gfx--cell-pixel-width kitty-gfx--cell-pixel-height)))
+
+;;;; Synchronized output
+
+(defun kitty-gfx--sync-begin ()
+  "Begin synchronized output (BSU).
+The terminal buffers output until `kitty-gfx--sync-end' is called,
+preventing partial rendering and flicker."
+  (ignore-errors (send-string-to-terminal "\e[?2026h")))
+
+(defun kitty-gfx--sync-end ()
+  "End synchronized output (ESU).
+Flushes buffered output to the terminal all at once."
+  (ignore-errors (send-string-to-terminal "\e[?2026l")))
 
 ;;;; Protocol layer
 
@@ -230,41 +269,52 @@ Coordinates are 1-indexed terminal positions."
 Relies on placement IDs (p=PID) — re-placing with the same PID
 replaces the previous placement without needing to delete first.
 Caches last position per overlay to skip redundant re-placements.
-Deletes placements for overlays that scrolled out of view."
+Deletes placements for overlays that scrolled out of view.
+All terminal output is wrapped in synchronized output (BSU/ESU)
+to prevent flicker."
   (when (and kitty-graphics-mode (not (display-graphic-p)))
-    (walk-windows
-     (lambda (win)
-       (with-current-buffer (window-buffer win)
-         (when kitty-gfx--overlays
-           (let* ((edges (window-edges win))
-                  (win-bottom (nth 3 edges)))
-             (dolist (ov kitty-gfx--overlays)
-               (when (overlay-buffer ov)
-                 (let ((pos (kitty-gfx--overlay-screen-pos ov))
-                       (rows (overlay-get ov 'kitty-gfx-rows))
-                       (last-row (overlay-get ov 'kitty-gfx-last-row))
-                       (last-col (overlay-get ov 'kitty-gfx-last-col)))
-                   (if (and pos (<= (+ (car pos) rows) (1+ win-bottom)))
-                       ;; Visible and fits — place if position changed
-                       (let ((new-row (car pos))
-                             (new-col (cdr pos)))
-                         (unless (and (eql new-row last-row)
-                                      (eql new-col last-col))
-                           (overlay-put ov 'kitty-gfx-last-row new-row)
-                           (overlay-put ov 'kitty-gfx-last-col new-col)
-                           (kitty-gfx--place-image
-                            (overlay-get ov 'kitty-gfx-id)
-                            (overlay-get ov 'kitty-gfx-pid)
-                            (overlay-get ov 'kitty-gfx-cols)
-                            rows new-row new-col)))
-                     ;; Not visible or overflows — delete if was placed
-                     (when last-row
-                       (overlay-put ov 'kitty-gfx-last-row nil)
-                       (overlay-put ov 'kitty-gfx-last-col nil)
-                       (kitty-gfx--delete-placement
-                        (overlay-get ov 'kitty-gfx-id)
-                        (overlay-get ov 'kitty-gfx-pid)))))))))))
-     nil 'visible)))
+    (kitty-gfx--sync-begin)
+    (unwind-protect
+        (walk-windows
+         (lambda (win)
+           (with-current-buffer (window-buffer win)
+             (when kitty-gfx--overlays
+               (let* ((edges (window-edges win))
+                      (win-bottom (nth 3 edges)))
+                 (dolist (ov kitty-gfx--overlays)
+                   (when (overlay-buffer ov)
+                     (kitty-gfx--refresh-overlay ov win-bottom)))))))
+         nil 'visible)
+      (kitty-gfx--sync-end))))
+
+(defun kitty-gfx--refresh-overlay (ov win-bottom)
+  "Refresh a single overlay OV.  WIN-BOTTOM is the window's bottom edge.
+Places the image if visible and position changed, or deletes placement
+if the overlay scrolled out of view."
+  (let ((pos (kitty-gfx--overlay-screen-pos ov))
+        (rows (overlay-get ov 'kitty-gfx-rows))
+        (last-row (overlay-get ov 'kitty-gfx-last-row))
+        (last-col (overlay-get ov 'kitty-gfx-last-col)))
+    (if (and pos (<= (+ (car pos) rows) (1+ win-bottom)))
+        ;; Visible and fits — place if position changed
+        (let ((new-row (car pos))
+              (new-col (cdr pos)))
+          (unless (and (eql new-row last-row)
+                       (eql new-col last-col))
+            (overlay-put ov 'kitty-gfx-last-row new-row)
+            (overlay-put ov 'kitty-gfx-last-col new-col)
+            (kitty-gfx--place-image
+             (overlay-get ov 'kitty-gfx-id)
+             (overlay-get ov 'kitty-gfx-pid)
+             (overlay-get ov 'kitty-gfx-cols)
+             rows new-row new-col)))
+      ;; Not visible or overflows — delete if was placed
+      (when last-row
+        (overlay-put ov 'kitty-gfx-last-row nil)
+        (overlay-put ov 'kitty-gfx-last-col nil)
+        (kitty-gfx--delete-placement
+         (overlay-get ov 'kitty-gfx-id)
+         (overlay-get ov 'kitty-gfx-pid))))))
 
 (defun kitty-gfx--schedule-refresh ()
   "Schedule an image refresh after the current redisplay completes."
@@ -284,15 +334,37 @@ Deletes placements for overlays that scrolled out of view."
 (defun kitty-gfx--on-buffer-change (_frame-or-window)
   "Handle buffer change for image refresh.
 Clears visible placements first since the displayed buffer changed."
-  (ignore-errors
-    (send-string-to-terminal "\e_Ga=d,d=a,q=2\e\\"))
+  (kitty-gfx--sync-begin)
+  (unwind-protect
+      (progn
+        (ignore-errors
+          (send-string-to-terminal "\e_Ga=d,d=a,q=2\e\\"))
+        ;; Reset position cache so images get re-placed
+        (dolist (buf (buffer-list))
+          (with-current-buffer buf
+            (dolist (ov kitty-gfx--overlays)
+              (when (overlay-buffer ov)
+                (overlay-put ov 'kitty-gfx-last-row nil)
+                (overlay-put ov 'kitty-gfx-last-col nil))))))
+    (kitty-gfx--sync-end))
   (kitty-gfx--schedule-refresh))
 
 (defun kitty-gfx--on-window-change (_frame)
   "Handle window configuration change for image refresh.
 Clears visible placements first since window layout changed."
-  (ignore-errors
-    (send-string-to-terminal "\e_Ga=d,d=a,q=2\e\\"))
+  (kitty-gfx--sync-begin)
+  (unwind-protect
+      (progn
+        (ignore-errors
+          (send-string-to-terminal "\e_Ga=d,d=a,q=2\e\\"))
+        ;; Reset position cache so images get re-placed
+        (dolist (buf (buffer-list))
+          (with-current-buffer buf
+            (dolist (ov kitty-gfx--overlays)
+              (when (overlay-buffer ov)
+                (overlay-put ov 'kitty-gfx-last-row nil)
+                (overlay-put ov 'kitty-gfx-last-col nil))))))
+    (kitty-gfx--sync-end))
   (kitty-gfx--schedule-refresh))
 
 (defun kitty-gfx--on-redisplay ()
@@ -651,22 +723,31 @@ We extract the :file or :data from the image properties."
              ;; shr image spec is (image . PROPS) from `create-image'
              (props (and (consp spec) (cdr spec)))
              (data (plist-get props :data))
-             (url (plist-get props :file)))
+             (url (plist-get props :file))
+             (type (plist-get props :type)))
         (insert (or alt "[image]"))
         (let ((end (point)))
-          (condition-case nil
-              (let ((file (cond
-                           (url (when (file-exists-p url) url))
-                           (data
-                            (let ((tmp (make-temp-file "kitty-shr-" nil ".png")))
-                              (with-temp-file tmp
-                                (set-buffer-multibyte nil)
-                                (insert data))
-                              tmp)))))
+          (condition-case err
+              (let* ((suffix (cond
+                              ((eq type 'jpeg) ".jpg")
+                              ((eq type 'gif) ".gif")
+                              ((eq type 'webp) ".webp")
+                              ((eq type 'svg) ".svg")
+                              (t ".png")))
+                     (file (cond
+                            (url (when (file-exists-p url) url))
+                            (data
+                             (let ((tmp (make-temp-file "kitty-shr-" nil suffix)))
+                               (with-temp-file tmp
+                                 (set-buffer-multibyte nil)
+                                 (insert data))
+                               tmp))))
+                     (temp-p (and data file)))
                 (when file
                   (kitty-gfx-display-image file start end)
-                  (when data (delete-file file t))))
-            (error nil))))
+                  (when temp-p (delete-file file t))))
+            (error
+             (kitty-gfx--log "shr-put-image error: %s" (error-message-string err))))))
     (apply orig-fn spec alt args)))
 
 ;;;; Dired integration
@@ -706,10 +787,78 @@ Press `q' in the preview buffer to close it."
          (min (- (window-height win) 3) kitty-gfx-max-height))
         (goto-char (point-min))))))
 
+;;;; Dirvish integration
+
+;; Forward declarations for dirvish
+(declare-function dirvish-define-preview "dirvish" (&rest args))
+(declare-function dirvish--special-buffer "dirvish" (type dv &optional new))
+(defvar dirvish-image-exts)
+(defvar dirvish-preview-dispatchers)
+(defvar dirvish--available-preview-dispatchers)
+
+(defun kitty-gfx--dirvish-preview (file _ext preview-window _dv)
+  "Dirvish preview dispatcher for images in terminal via Kitty graphics.
+FILE is the file to preview, PREVIEW-WINDOW is the target window.
+Returns a buffer recipe, or nil if not in terminal or not an image."
+  (when (and kitty-graphics-mode
+             (not (display-graphic-p))
+             (kitty-gfx--supported-p))
+    (let* ((buf-name (format " *kitty-dirvish: %s*" (file-name-nondirectory file)))
+           (buf (get-buffer-create buf-name))
+           (max-cols (min (- (window-width preview-window) 2) kitty-gfx-max-width))
+           (max-rows (min (- (window-height preview-window) 3) kitty-gfx-max-height)))
+      (with-current-buffer buf
+        ;; Clean up any previous images in this buffer
+        (let ((inhibit-read-only t))
+          (kitty-gfx-remove-images)
+          (erase-buffer)
+          (insert (format "\n  %s\n\n" (file-name-nondirectory file))))
+        (setq-local buffer-read-only t)
+        (kitty-gfx-display-image file (point-min) (point-max) max-cols max-rows)
+        (goto-char (point-min)))
+      ;; Return buffer recipe for dirvish dispatch
+      `(buffer . ,buf))))
+
+(defun kitty-gfx--install-dirvish ()
+  "Install kitty-graphics as a dirvish preview dispatcher.
+Registers `kitty-image' dispatcher and prepends it to the dispatcher list."
+  (with-eval-after-load 'dirvish
+    ;; Register our dispatcher in dirvish's registry.
+    ;; dirvish-define-preview is a macro that creates dirvish-NAME-dp function
+    ;; and adds to dirvish--available-preview-dispatchers.
+    ;; We simulate what the macro does since we can't use it at load time
+    ;; (dirvish may not be loaded yet).
+    (unless (assq 'kitty-image dirvish--available-preview-dispatchers)
+      (push (cons 'kitty-image
+                   (list :doc "Preview images using Kitty graphics protocol"
+                         :require nil))
+            dirvish--available-preview-dispatchers))
+    ;; Create the dispatcher function that dirvish expects
+    (defalias 'dirvish-kitty-image-dp
+      (lambda (file ext preview-window dv)
+        (when (and (boundp 'dirvish-image-exts)
+                   (member ext dirvish-image-exts))
+          (kitty-gfx--dirvish-preview file ext preview-window dv))))
+    ;; Prepend kitty-image to dispatchers if not already there
+    (unless (memq 'kitty-image dirvish-preview-dispatchers)
+      (setq dirvish-preview-dispatchers
+            (cons 'kitty-image dirvish-preview-dispatchers)))
+    (kitty-gfx--log "dirvish: installed kitty-image dispatcher")))
+
+(defun kitty-gfx--uninstall-dirvish ()
+  "Remove kitty-graphics dirvish preview dispatcher."
+  (when (boundp 'dirvish-preview-dispatchers)
+    (setq dirvish-preview-dispatchers
+          (delq 'kitty-image dirvish-preview-dispatchers)))
+  (when (boundp 'dirvish--available-preview-dispatchers)
+    (setq dirvish--available-preview-dispatchers
+          (assq-delete-all 'kitty-image dirvish--available-preview-dispatchers)))
+  (fmakunbound 'dirvish-kitty-image-dp))
+
 ;;;; Integration install/uninstall
 
 (defun kitty-gfx--install-integrations ()
-  "Install advice on org-mode, image-mode, shr."
+  "Install advice on org-mode, image-mode, shr, dirvish."
   (with-eval-after-load 'org
     (advice-add 'org-display-inline-images :around
                 #'kitty-gfx--org-display-advice)
@@ -729,7 +878,8 @@ Press `q' in the preview buffer to close it."
                 #'kitty-gfx--image-mode-advice))
   (with-eval-after-load 'shr
     (advice-add 'shr-put-image :around
-                #'kitty-gfx--shr-put-image-advice)))
+                #'kitty-gfx--shr-put-image-advice))
+  (kitty-gfx--install-dirvish))
 
 (defun kitty-gfx--uninstall-integrations ()
   "Remove all advice."
@@ -741,7 +891,8 @@ Press `q' in the preview buffer to close it."
   (when (fboundp 'org-link-preview-region)
     (advice-remove 'org-link-preview-region #'kitty-gfx--org-link-preview-region-advice))
   (advice-remove 'image-mode #'kitty-gfx--image-mode-advice)
-  (advice-remove 'shr-put-image #'kitty-gfx--shr-put-image-advice))
+  (advice-remove 'shr-put-image #'kitty-gfx--shr-put-image-advice)
+  (kitty-gfx--uninstall-dirvish))
 
 ;;;; Buffer cleanup
 

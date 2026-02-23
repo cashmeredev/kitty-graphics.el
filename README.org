@@ -15,6 +15,8 @@ Integrations are provided for:
 - *org-mode* --- inline images via =C-c C-x C-v= (both =org-toggle-inline-images= and =org-link-preview= for org 10.0+)
 - *image-mode* --- terminal-aware image file viewing
 - *shr/eww* --- inline images in HTML rendering (eww, mu4e, gnus)
+- *dired* --- image preview in side window (=P= key)
+- *dirvish* --- native preview dispatcher for image files
 
 * Requirements
 
@@ -52,7 +54,12 @@ Enable the global minor mode:
 (kitty-graphics-mode 1)
 #+end_src
 
-Then in any org-mode buffer, toggle inline images with =C-c C-x C-v=.
+Then:
+- In org-mode: toggle inline images with =C-c C-x C-v=
+- In dired: press =P= on an image file for a side-window preview
+- In dirvish: image previews work automatically (no extra config)
+- Open an image file: =image-mode= displays it via Kitty
+- In eww/mu4e/gnus: HTML images render inline
 
 ** Commands
 
@@ -62,6 +69,7 @@ Then in any org-mode buffer, toggle inline images with =C-c C-x C-v=.
 | ~kitty-gfx-display-image~  | Display a single image at point          |
 | ~kitty-gfx-remove-images~  | Remove images in region or buffer        |
 | ~kitty-gfx-clear-all~      | Remove all images from all buffers       |
+| ~kitty-gfx-dired-preview~  | Preview image at point in dired          |
 
 ** Customization
 
@@ -74,14 +82,23 @@ Then in any org-mode buffer, toggle inline images with =C-c C-x C-v=.
 
 * How It Works
 
-1. Image data is transmitted once via APC escape sequences (~a=t~, store only)
-2. Overlays with a ~display~ property reserve blank space in Emacs buffers
-3. After each redisplay, direct placements (~a=p~) are emitted via
+1. On startup, cell pixel size is queried via ~CSI 16 t~ (XTWINOPS) for
+   accurate image scaling. Falls back to 8x16 if the query times out.
+2. Image data is transmitted once via APC escape sequences (~a=t~, store only)
+3. Overlays with a ~display~ property reserve blank space in Emacs buffers
+4. After each redisplay, direct placements (~a=p~) are emitted via
    ~send-string-to-terminal~ at the overlay's screen coordinates
-4. Each placement uses a unique placement ID (~p=PID~) so re-placements
+5. All placement output is wrapped in synchronized output (~BSU/ESU~,
+   =DEC mode 2026=) to prevent partial rendering and flicker
+6. Each placement uses a unique placement ID (~p=PID~) so re-placements
    at new positions replace the old rendering without accumulation
-5. Position caching skips redundant re-placements when nothing moved
-6. Placements are deleted when overlays scroll out of view
+7. Position caching skips redundant re-placements when nothing moved
+8. Placements are deleted when overlays scroll out of view
+
+* Supported Formats
+
+PNG is sent directly to the terminal. Other formats (JPEG, GIF, WebP, SVG,
+TIFF, BMP) are converted to PNG via ImageMagick before transmission.
 
 * Origins
 
