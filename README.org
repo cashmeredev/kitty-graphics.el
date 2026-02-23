@@ -1,0 +1,97 @@
+#+TITLE: kitty-graphics.el
+#+AUTHOR: cashmere
+
+Display images in terminal Emacs (~emacs -nw~) using the [[https://sw.kovidgoyal.net/kitty/graphics-protocol/][Kitty graphics protocol]].
+
+* Overview
+
+~kitty-graphics.el~ renders images directly in terminal Emacs using Kitty's
+graphics protocol with direct placements. Images are transmitted once to the
+terminal, then positioned at overlay screen coordinates after each redisplay.
+They scroll with text, survive buffer switches, and work in split windows ---
+they're managed as overlays in Emacs's display engine.
+
+Integrations are provided for:
+- *org-mode* --- inline images via =C-c C-x C-v= (both =org-toggle-inline-images= and =org-link-preview= for org 10.0+)
+- *image-mode* --- terminal-aware image file viewing
+- *shr/eww* --- inline images in HTML rendering (eww, mu4e, gnus)
+
+* Requirements
+
+- Emacs >= 27.1
+- [[https://sw.kovidgoyal.net/kitty/][Kitty]] >= 0.20.0 (or WezTerm/Ghostty with direct placement support)
+- ImageMagick (~magick~ / ~convert~ / ~identify~) for non-PNG formats and image sizing
+- Launch Emacs with ~TERM=xterm-256color~ (Emacs often can't find the ~xterm-kitty~ terminfo)
+
+* Installation
+
+** straight.el
+
+#+begin_src emacs-lisp
+(use-package kitty-graphics
+  :straight (:local-repo "~/projects/kitty-graphics")
+  :if (and (not (display-graphic-p)) (getenv "KITTY_PID"))
+  :config
+  (kitty-graphics-mode 1))
+#+end_src
+
+** Manual
+
+#+begin_src emacs-lisp
+(add-to-list 'load-path "~/projects/kitty-graphics")
+(require 'kitty-graphics)
+(when (and (not (display-graphic-p)) (getenv "KITTY_PID"))
+  (kitty-graphics-mode 1))
+#+end_src
+
+* Usage
+
+Enable the global minor mode:
+
+#+begin_src emacs-lisp
+(kitty-graphics-mode 1)
+#+end_src
+
+Then in any org-mode buffer, toggle inline images with =C-c C-x C-v=.
+
+** Commands
+
+| Command                    | Description                              |
+|----------------------------+------------------------------------------|
+| ~kitty-graphics-mode~      | Toggle the global minor mode             |
+| ~kitty-gfx-display-image~  | Display a single image at point          |
+| ~kitty-gfx-remove-images~  | Remove images in region or buffer        |
+| ~kitty-gfx-clear-all~      | Remove all images from all buffers       |
+
+** Customization
+
+| Variable                   | Default | Description                         |
+|----------------------------+---------+-------------------------------------|
+| ~kitty-gfx-max-width~     |      80 | Maximum image width in columns      |
+| ~kitty-gfx-max-height~    |      24 | Maximum image height in rows        |
+| ~kitty-gfx-render-delay~  |   0.016 | Debounce delay for re-rendering (s) |
+| ~kitty-gfx-debug~         |     nil | Log debug info to ~/tmp/kitty-gfx.log~ |
+
+* How It Works
+
+1. Image data is transmitted once via APC escape sequences (~a=t~, store only)
+2. Overlays with a ~display~ property reserve blank space in Emacs buffers
+3. After each redisplay, direct placements (~a=p~) are emitted via
+   ~send-string-to-terminal~ at the overlay's screen coordinates
+4. Each placement uses a unique placement ID (~p=PID~) so re-placements
+   at new positions replace the old rendering without accumulation
+5. Position caching skips redundant re-placements when nothing moved
+6. Placements are deleted when overlays scroll out of view
+
+* Origins
+
+This package grew out of work on [[https://github.com/akermu/emacs-libvterm][emacs-libvterm]] (vterm). The initial
+implementation added Kitty graphics passthrough to vterm --- intercepting
+APC escape sequences from programs running inside vterm and forwarding
+them to the outer terminal. That work proved the ~send-string-to-terminal~
+approach was viable and led to this standalone package that works in any
+terminal Emacs buffer, independent of vterm.
+
+* License
+
+GPL-3.0-or-later
