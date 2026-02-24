@@ -3,6 +3,12 @@
 
 Display images in terminal Emacs (~emacs -nw~) using the [[https://sw.kovidgoyal.net/kitty/graphics-protocol/][Kitty graphics protocol]].
 
+* Demo
+
+[[file:demo-1.gif]]
+
+[[file:demo-2.gif]]
+
 * Foreword
 
 I got the opportunity to subscribe to the highest Claude level. I'm allowed to use it outside of work. I was able to extend Emacs in terminal mode with the kitty protocol. Out of curiosity I wanted to know if a thought I had for months was possible or not, which was basically to extend libvterm with the kitty image protocol and then utilize vterm to display those images inside Emacs Terminal.

@@ -1,0 +1,30 @@
+#+TITLE: Kitty Graphics Test
+
+* Test inline images
+
+Here is an inline image using file: link:
+
+[[file:test-image.png]]
+
+Some text after the image to verify overlay positioning.
+
+* Another section
+
+This section has no images, just text to test scrolling behavior.
+
+Line 1
+Line 2
+Line 3
+Line 4
+Line 5
+Line 6
+Line 7
+Line 8
+Line 9
+Line 10
+
+* Relative path test
+
+[[./test-image.png]]
+
+End of test file.
