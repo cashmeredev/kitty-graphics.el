@@ -3,6 +3,12 @@
 
 Display images in terminal Emacs (~emacs -nw~) using the [[https://sw.kovidgoyal.net/kitty/graphics-protocol/][Kitty graphics protocol]].
 
+* Foreword
+
+I got the opportunity to subscribe to the highest Claude level. I'm allowed to use it outside of work. I was able to extend Emacs in terminal mode with the kitty protocol. Out of curiosity I wanted to know if a thought I had for months was possible or not, which was basically to extend libvterm with the kitty image protocol and then utilize vterm to display those images inside Emacs Terminal.
+
+Besides, I don't even have the guts to release it, even though my intention of such a release would be first and foremost for the people who have been asking for such a feature specifically for years, or for other developers to use it as some kind of reference. So idk, while I totally agree that the current AI slop is getting to be exhausting, we as humans should judge projects on a project by project basis.
+
 * Overview
 
 ~kitty-graphics.el~ renders images directly in terminal Emacs using Kitty's
@@ -24,6 +30,10 @@ Integrations are provided for:
 - [[https://sw.kovidgoyal.net/kitty/][Kitty]] >= 0.20.0 (or WezTerm/Ghostty with direct placement support)
 - ImageMagick (~magick~ / ~convert~ / ~identify~) for non-PNG formats and image sizing
 - Launch Emacs with ~TERM=xterm-256color~ (Emacs often can't find the ~xterm-kitty~ terminfo)
+  
+  #+begin_src sh
+  TERM=xterm-256color emacsclient -nw
+  #+end_src
 
 * Installation
 
@@ -63,22 +73,22 @@ Then:
 
 ** Commands
 
-| Command                    | Description                              |
-|----------------------------+------------------------------------------|
-| ~kitty-graphics-mode~      | Toggle the global minor mode             |
-| ~kitty-gfx-display-image~  | Display a single image at point          |
-| ~kitty-gfx-remove-images~  | Remove images in region or buffer        |
-| ~kitty-gfx-clear-all~      | Remove all images from all buffers       |
-| ~kitty-gfx-dired-preview~  | Preview image at point in dired          |
+| Command                 | Description                        |
+|-------------------------+------------------------------------|
+| ~kitty-graphics-mode~     | Toggle the global minor mode       |
+| ~kitty-gfx-display-image~ | Display a single image at point    |
+| ~kitty-gfx-remove-images~ | Remove images in region or buffer  |
+| ~kitty-gfx-clear-all~     | Remove all images from all buffers |
+| ~kitty-gfx-dired-preview~ | Preview image at point in dired    |
 
 ** Customization
 
-| Variable                   | Default | Description                         |
-|----------------------------+---------+-------------------------------------|
-| ~kitty-gfx-max-width~     |      80 | Maximum image width in columns      |
-| ~kitty-gfx-max-height~    |      24 | Maximum image height in rows        |
-| ~kitty-gfx-render-delay~  |   0.016 | Debounce delay for re-rendering (s) |
-| ~kitty-gfx-debug~         |     nil | Log debug info to ~/tmp/kitty-gfx.log~ |
+| Variable               | Default | Description                          |
+|------------------------+---------+--------------------------------------|
+| ~kitty-gfx-max-width~    |      80 | Maximum image width in columns       |
+| ~kitty-gfx-max-height~   |      24 | Maximum image height in rows         |
+| ~kitty-gfx-render-delay~ |   0.016 | Debounce delay for re-rendering (s)  |
+| ~kitty-gfx-debug~        |     nil | Log debug info to ~/tmp/kitty-gfx.log~ |
 
 * How It Works
 
@@ -100,15 +110,13 @@ Then:
 PNG is sent directly to the terminal. Other formats (JPEG, GIF, WebP, SVG,
 TIFF, BMP) are converted to PNG via ImageMagick before transmission.
 
-* Origins
+* Known Limitations
 
-This package grew out of work on [[https://github.com/akermu/emacs-libvterm][emacs-libvterm]] (vterm). The initial
-implementation added Kitty graphics passthrough to vterm --- intercepting
-APC escape sequences from programs running inside vterm and forwarding
-them to the outer terminal. That work proved the ~send-string-to-terminal~
-approach was viable and led to this standalone package that works in any
-terminal Emacs buffer, independent of vterm.
+- No tmux support 
+- Primary focus on kitty terminal. While other terminals should work too, I wont give any guarantee
+- Animated GIFs display only the first frame
+- Without ImageMagick, only PNG files work and image sizing falls back to a fixed default
 
 * License
 
-GPL-3.0-or-later
+GPL-2.0-or-later
