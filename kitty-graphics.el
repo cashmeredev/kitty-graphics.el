@@ -298,10 +298,27 @@ the window's scroll range."
              (win-left (nth 0 edges))
              (win-pos (posn-at-point pos win)))
         (when win-pos
-          (let ((col-row (posn-col-row win-pos)))
+          (let* ((col-row (posn-col-row win-pos))
+                 (row (cdr col-row))
+                 (posn-col (car col-row))
+                 (body-left (nth 0 (window-body-edges win)))
+                 (buf-col (with-current-buffer buf
+                            (save-excursion
+                              (goto-char pos)
+                              (current-column))))
+                 ;; posn-col-row is correct for most overlays (includes
+                 ;; line numbers, margins).  But overlays with display
+                 ;; properties wider than the underlying text inflate
+                 ;; posn-col.  Detect this: if posn-col minus buf-col
+                 ;; exceeds a reasonable gutter width, it's inflated —
+                 ;; fall back to body-left + buf-col.
+                 (col (if (> (- posn-col buf-col)
+                             (- body-left win-left))
+                          (+ body-left buf-col)
+                        (+ win-left posn-col))))
             (when col-row
-              (cons (+ win-top (cdr col-row) 1)
-                    (+ win-left (car col-row) 1)))))))))
+              (cons (+ win-top row 1)
+                    (1+ col)))))))))
 
 ;;;; Refresh cycle
 
@@ -601,6 +618,9 @@ The buffer should be writable (caller handles `inhibit-read-only')."
          (img-rows (max 1 (round (* s (cdr base-dims)))))
          (h-pad (max 0 (/ (- wc img-cols) 2)))
          (v-pad (max 0 (/ (- wr img-rows) 2))))
+    (kitty-gfx--log "centered: file=%s px=%S base=%S scale=%.2f img=%dx%d win=%dx%d pad=h%d,v%d"
+                     (file-name-nondirectory abs-file) px base-dims s
+                     img-cols img-rows wc wr h-pad v-pad)
     ;; Vertical centering: newlines before the image
     (dotimes (_ v-pad) (insert "\n"))
     ;; Horizontal centering: spaces to shift the overlay start column
@@ -877,12 +897,15 @@ Values > 1.0 zoom in, < 1.0 zoom out.")
              (max-cols (min win-w kitty-gfx-max-width))
              (max-rows (min win-h kitty-gfx-max-height)))
         ;; Remove existing images and clear buffer
+        (kitty-gfx--log "image-mode-render: win-w=%d win-h=%d max-cols=%d max-rows=%d"
+                         win-w win-h max-cols max-rows)
         (kitty-gfx-remove-images)
         (erase-buffer)
         (kitty-gfx--display-image-centered
          file max-cols max-rows win-w win-h
          kitty-gfx--image-scale)
-        (goto-char (point-min))))))
+        (goto-char (point-min))
+        (set-buffer-modified-p nil)))))
 
 (defun kitty-gfx-image-increase-size ()
   "Zoom in on the image in image-mode."
@@ -907,19 +930,30 @@ Values > 1.0 zoom in, < 1.0 zoom out.")
   (if (and kitty-graphics-mode (not (display-graphic-p)))
       (progn
         (major-mode-suspend)
-        (setq major-mode 'image-mode
+        ;; Use our own major-mode symbol so evil-collection's
+        ;; image-mode bindings (which call native image functions
+        ;; that fail in terminal) don't override our keymap.
+        (setq major-mode 'kitty-gfx-image-mode
               mode-name "Image[Kitty]")
         (let ((map (make-sparse-keymap)))
-          (set-keymap-parent map (if (boundp 'image-mode-map) image-mode-map
-                                   special-mode-map))
+          (set-keymap-parent map special-mode-map)
           (define-key map (kbd "q") #'kill-current-buffer)
           (define-key map (kbd "+") #'kitty-gfx-image-increase-size)
+          (define-key map (kbd "=") #'kitty-gfx-image-increase-size)
           (define-key map (kbd "-") #'kitty-gfx-image-decrease-size)
           (define-key map (kbd "0") #'kitty-gfx-image-reset-size)
           (use-local-map map))
+        ;; If evil is loaded, bind zoom keys in normal state so they
+        ;; aren't shadowed by evil's default normal-state bindings.
+        (when (fboundp 'evil-local-set-key)
+          (evil-local-set-key 'normal (kbd "+") #'kitty-gfx-image-increase-size)
+          (evil-local-set-key 'normal (kbd "=") #'kitty-gfx-image-increase-size)
+          (evil-local-set-key 'normal (kbd "-") #'kitty-gfx-image-decrease-size)
+          (evil-local-set-key 'normal (kbd "0") #'kitty-gfx-image-reset-size)
+          (evil-local-set-key 'normal (kbd "q") #'kill-current-buffer))
         (setq-local buffer-read-only t)
         (kitty-gfx--image-mode-render)
-        (run-mode-hooks 'image-mode-hook))
+        (set-buffer-modified-p nil))
     (apply orig-fn args)))
 
 ;;;; shr integration (eww, mu4e, gnus)
