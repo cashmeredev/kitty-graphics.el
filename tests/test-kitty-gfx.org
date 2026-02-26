@@ -27,4 +27,16 @@ Line 10
 
 [[./test-image.png]]
 
+* LaTeX fragment preview test
+
+Inline math: $E = mc^2$
+
+Display math:
+
+\begin{equation}
+\int_0^\infty e^{-x^2} dx = \frac{\sqrt{\pi}}{2}
+\end{equation}
+
+Another inline: $\sum_{i=1}^{n} i = \frac{n(n+1)}{2}$
+
 End of test file.

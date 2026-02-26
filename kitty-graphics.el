@@ -45,10 +45,16 @@
 (declare-function org-link-preview "org" (&optional arg beg end))
 (declare-function org-link-preview-region "org" (&optional include-linked refresh beg end))
 (declare-function org-fold-folded-p "org-fold" (&optional pos spec-or-alias))
+(declare-function org--latex-preview-region "org" (beg end))
+(declare-function org-clear-latex-preview "org" (&optional beg end))
+(declare-function org--make-preview-overlay "org" (beg end movefile imagetype))
 (declare-function dired-get-file-for-visit "dired" ())
 (declare-function image-mode-setup-winprops "image-mode" ())
 (declare-function shr-rescale-image "shr" (data &optional content-type width height max-width max-height))
 (defvar org-image-actual-width)
+(defvar org-preview-latex-image-directory)
+(defvar org-format-latex-options)
+(declare-function org-combine-plists "org-macs" (&rest plists))
 (defvar image-mode-map)
 
 ;;;; Customization
@@ -735,6 +741,72 @@ With prefix ARG \\[universal-argument], clear previews."
       (kitty-gfx--org-display-inline-images-tty include-linked beg end)
     (funcall orig-fn include-linked refresh beg end)))
 
+;;;; LaTeX fragment preview integration
+
+(defun kitty-gfx--org-latex-preview-advice (orig-fn &optional arg beg end)
+  "Around advice for `org-latex-preview'.
+Bypasses org's `display-graphic-p' guard so LaTeX fragments are
+rendered to images via dvipng/dvisvgm and displayed via Kitty
+graphics.  The image generation pipeline does not require a GUI."
+  (if (and kitty-graphics-mode (not (display-graphic-p)))
+      (cond
+       ;; C-u = clear previews in region/subtree
+       ((equal arg '(4))
+        (kitty-gfx--org-clear-latex-preview beg end))
+       ;; C-u C-u = clear all previews in buffer
+       ((equal arg '(16))
+        (kitty-gfx--org-clear-latex-preview))
+       ;; Default = generate and display previews
+       (t
+        (let ((start (or beg (if (use-region-p) (region-beginning) (point-min))))
+              (stop (or end (if (use-region-p) (region-end) (point-max)))))
+          ;; In terminal, face attributes may return "unspecified-fg" which
+          ;; breaks org-latex-color-format.  Force concrete colors.
+          (let ((org-format-latex-options
+                 (org-combine-plists
+                  org-format-latex-options
+                  (list :foreground
+                        (let ((fg (face-attribute 'default :foreground nil)))
+                          (if (and (stringp fg)
+                                   (not (string-prefix-p "unspecified" fg)))
+                              fg
+                            "Black"))
+                        :background "Transparent"))))
+            ;; Suppress clear-image-cache which requires a GUI frame.
+            (cl-letf (((symbol-function 'clear-image-cache) #'ignore))
+              (org--latex-preview-region start stop))))))
+    (funcall orig-fn arg beg end)))
+
+(defun kitty-gfx--org-make-preview-overlay-advice (orig-fn beg end movefile imagetype)
+  "Around advice for `org--make-preview-overlay'.
+Intercepts LaTeX preview overlay creation to display the generated
+image via Kitty graphics instead of an Emacs image spec."
+  (if (and kitty-graphics-mode (not (display-graphic-p)))
+      (when (and movefile (file-exists-p movefile))
+        ;; Don't create duplicate overlays at the same position
+        (unless (cl-some (lambda (ov) (overlay-get ov 'kitty-gfx))
+                         (overlays-in beg end))
+          (kitty-gfx-display-image movefile beg end)
+          ;; Tag the most recently created overlay with org properties
+          ;; so org-clear-latex-preview can find and clean it up.
+          (when-let ((ov (car kitty-gfx--overlays)))
+            (overlay-put ov 'org-overlay-type 'org-latex-overlay)
+            (overlay-put ov 'modification-hooks
+                         (list (lambda (o after &rest _)
+                                 (when after
+                                   (kitty-gfx--remove-overlay o)))))
+            ov)))
+    (funcall orig-fn beg end movefile imagetype)))
+
+(defun kitty-gfx--org-clear-latex-preview (&optional beg end)
+  "Remove Kitty graphics LaTeX preview overlays in region BEG..END."
+  (let ((start (or beg (point-min)))
+        (stop (or end (point-max))))
+    (dolist (ov (overlays-in start stop))
+      (when (and (overlay-get ov 'kitty-gfx)
+                 (eq (overlay-get ov 'org-overlay-type) 'org-latex-overlay))
+        (kitty-gfx--remove-overlay ov)))))
+
 ;;;; image-mode integration
 
 (defun kitty-gfx--image-mode-advice (orig-fn &rest args)
@@ -921,7 +993,12 @@ Registers `kitty-image' dispatcher and prepends it to the dispatcher list."
       (advice-add 'org-link-preview-region :around
                   #'kitty-gfx--org-link-preview-region-advice))
     ;; Refresh images when org cycles heading visibility
-    (add-hook 'org-cycle-hook #'kitty-gfx--on-org-cycle))
+    (add-hook 'org-cycle-hook #'kitty-gfx--on-org-cycle)
+    ;; LaTeX fragment preview in terminal
+    (advice-add 'org-latex-preview :around
+                #'kitty-gfx--org-latex-preview-advice)
+    (advice-add 'org--make-preview-overlay :around
+                #'kitty-gfx--org-make-preview-overlay-advice))
   (with-eval-after-load 'image-mode
     (advice-add 'image-mode :around
                 #'kitty-gfx--image-mode-advice))
@@ -940,6 +1017,8 @@ Registers `kitty-image' dispatcher and prepends it to the dispatcher list."
   (when (fboundp 'org-link-preview-region)
     (advice-remove 'org-link-preview-region #'kitty-gfx--org-link-preview-region-advice))
   (remove-hook 'org-cycle-hook #'kitty-gfx--on-org-cycle)
+  (advice-remove 'org-latex-preview #'kitty-gfx--org-latex-preview-advice)
+  (advice-remove 'org--make-preview-overlay #'kitty-gfx--org-make-preview-overlay-advice)
   (advice-remove 'image-mode #'kitty-gfx--image-mode-advice)
   (advice-remove 'shr-put-image #'kitty-gfx--shr-put-image-advice)
   (kitty-gfx--uninstall-dirvish))
