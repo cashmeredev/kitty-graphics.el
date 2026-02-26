@@ -44,6 +44,7 @@
 (declare-function org-attach-dir "org-attach" (&optional create-if-not-exists-p))
 (declare-function org-link-preview "org" (&optional arg beg end))
 (declare-function org-link-preview-region "org" (&optional include-linked refresh beg end))
+(declare-function org-fold-folded-p "org-fold" (&optional pos spec-or-alias))
 (declare-function dired-get-file-for-visit "dired" ())
 (declare-function image-mode-setup-winprops "image-mode" ())
 (declare-function shr-rescale-image "shr" (data &optional content-type width height max-width max-height))
@@ -245,13 +246,38 @@ Uses direct placement: move cursor, then `a=p' with `c' and `r' params."
 
 ;;;; Position mapping
 
+(defun kitty-gfx--in-folded-region-p (pos)
+  "Non-nil if POS is inside a folded region (collapsed heading, block, etc.).
+Checks org-fold (org 9.6+, text-property based) first, then falls
+back to overlay-based invisibility for legacy org and outline-mode.
+Ignores cosmetic invisibility like hidden link brackets (`org-link')."
+  (or
+   ;; org-fold (org 9.6+): text-property based folding.
+   ;; org-fold-folded-p only checks structural folds (outline, block,
+   ;; drawer), not cosmetic link bracket hiding.
+   (and (fboundp 'org-fold-folded-p)
+        (condition-case nil
+            (org-fold-folded-p pos)
+          (error nil)))
+   ;; Legacy / non-org overlay-based folding (outline-mode, etc.)
+   (let ((inv (get-char-property pos 'invisible)))
+     (and inv (not (eq inv 'org-link))))))
+
 (defun kitty-gfx--overlay-screen-pos (ov)
   "Return (TERM-ROW . TERM-COL) for overlay OV, or nil if not visible.
-Coordinates are 1-indexed terminal positions."
+Coordinates are 1-indexed terminal positions.
+Returns nil when the overlay position is inside a folded region
+\(e.g., a collapsed org heading), even if the position is within
+the window's scroll range."
   (let* ((buf (overlay-buffer ov))
          (pos (overlay-start ov))
          (win (and buf (get-buffer-window buf))))
-    (when (and win pos (pos-visible-in-window-p pos win))
+    (when (and win pos
+               (pos-visible-in-window-p pos win)
+               ;; Check that the text isn't hidden by structural folding
+               ;; (outline, org-fold, etc.) but allow cosmetic invisibility
+               ;; like org-link bracket hiding.
+               (not (kitty-gfx--in-folded-region-p pos)))
       (let* ((edges (window-edges win))
              (win-top (nth 1 edges))
              (win-left (nth 0 edges))
@@ -593,6 +619,27 @@ BEG/END span the overlay region.  MAX-COLS/MAX-ROWS limit size."
 
 ;;;; Org-mode integration
 
+(defun kitty-gfx--on-org-cycle (&rest _args)
+  "Handle org visibility cycling.
+Deletes all current-buffer placements from the terminal, clears the
+position cache, then schedules a refresh that re-places only the
+overlays that are still visible (not inside a fold)."
+  (when (and kitty-graphics-mode kitty-gfx--overlays)
+    (kitty-gfx--sync-begin)
+    (unwind-protect
+        (dolist (ov kitty-gfx--overlays)
+          (when (overlay-buffer ov)
+            ;; Delete this overlay's terminal placement
+            (let ((id (overlay-get ov 'kitty-gfx-id))
+                  (pid (overlay-get ov 'kitty-gfx-pid)))
+              (when (and id pid)
+                (kitty-gfx--delete-placement id pid)))
+            ;; Clear position cache so visible images get re-placed
+            (overlay-put ov 'kitty-gfx-last-row nil)
+            (overlay-put ov 'kitty-gfx-last-col nil)))
+      (kitty-gfx--sync-end))
+    (kitty-gfx--schedule-refresh)))
+
 (defun kitty-gfx--image-file-p (file)
   "Return non-nil if FILE has an image extension."
   (let ((ext (file-name-extension file)))
@@ -872,7 +919,9 @@ Registers `kitty-image' dispatcher and prepends it to the dispatcher list."
                   #'kitty-gfx--org-link-preview-advice))
     (when (fboundp 'org-link-preview-region)
       (advice-add 'org-link-preview-region :around
-                  #'kitty-gfx--org-link-preview-region-advice)))
+                  #'kitty-gfx--org-link-preview-region-advice))
+    ;; Refresh images when org cycles heading visibility
+    (add-hook 'org-cycle-hook #'kitty-gfx--on-org-cycle))
   (with-eval-after-load 'image-mode
     (advice-add 'image-mode :around
                 #'kitty-gfx--image-mode-advice))
@@ -890,6 +939,7 @@ Registers `kitty-image' dispatcher and prepends it to the dispatcher list."
     (advice-remove 'org-link-preview #'kitty-gfx--org-link-preview-advice))
   (when (fboundp 'org-link-preview-region)
     (advice-remove 'org-link-preview-region #'kitty-gfx--org-link-preview-region-advice))
+  (remove-hook 'org-cycle-hook #'kitty-gfx--on-org-cycle)
   (advice-remove 'image-mode #'kitty-gfx--image-mode-advice)
   (advice-remove 'shr-put-image #'kitty-gfx--shr-put-image-advice)
   (kitty-gfx--uninstall-dirvish))
