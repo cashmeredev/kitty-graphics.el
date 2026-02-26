@@ -1,2 +1,5 @@
 *.elc
 .direnv/
+ltximg/
+\#*\#
+.\#*
