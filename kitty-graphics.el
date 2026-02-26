@@ -64,13 +64,15 @@
   :group 'multimedia
   :prefix "kitty-gfx-")
 
-(defcustom kitty-gfx-max-width 80
-  "Maximum image width in terminal columns."
+(defcustom kitty-gfx-max-width 120
+  "Maximum image width in terminal columns for inline images.
+For full-window modes like doc-view, the window size is used instead."
   :type 'integer
   :group 'kitty-graphics)
 
-(defcustom kitty-gfx-max-height 24
-  "Maximum image height in terminal rows."
+(defcustom kitty-gfx-max-height 40
+  "Maximum image height in terminal rows for inline images.
+For full-window modes like doc-view, the window size is used instead."
   :type 'integer
   :group 'kitty-graphics)
 
@@ -327,8 +329,8 @@ if the overlay scrolled out of view."
         (rows (overlay-get ov 'kitty-gfx-rows))
         (last-row (overlay-get ov 'kitty-gfx-last-row))
         (last-col (overlay-get ov 'kitty-gfx-last-col)))
-    (if (and pos (<= (+ (car pos) rows) (1+ win-bottom)))
-        ;; Visible and fits — place if position changed
+    (if (and pos (<= (car pos) win-bottom))
+        ;; Visible (start is on screen) — place if position changed
         (let ((new-row (car pos))
               (new-col (cdr pos)))
           (unless (and (eql new-row last-row)
@@ -567,6 +569,51 @@ BEG/END span the overlay region.  MAX-COLS/MAX-ROWS limit size."
     (kitty-gfx--make-overlay start stop image-id cols rows)
     ;; Schedule initial render
     (kitty-gfx--schedule-refresh)))
+
+(defun kitty-gfx--display-image-centered (file max-cols max-rows
+                                                &optional win-cols win-rows
+                                                scale)
+  "Display FILE centered in the current buffer.
+MAX-COLS and MAX-ROWS are the maximum image dimensions at scale 1.0.
+WIN-COLS and WIN-ROWS are the available window dimensions for centering;
+they default to MAX-COLS and MAX-ROWS if not provided.
+SCALE (default 1.0) multiplies the computed cell dims for zoom.
+The buffer should be writable (caller handles `inhibit-read-only')."
+  (let* ((s (or scale 1.0))
+         (wc (or win-cols max-cols))
+         (wr (or win-rows max-rows))
+         (abs-file (expand-file-name file))
+         (px (kitty-gfx--image-pixel-size abs-file))
+         ;; Compute natural cell dims (capped at max)
+         (base-dims (if px
+                        (kitty-gfx--compute-cell-dims
+                         (car px) (cdr px) max-cols max-rows)
+                      (cons (min 40 max-cols) (min 15 max-rows))))
+         ;; Apply zoom scale
+         (img-cols (max 1 (round (* s (car base-dims)))))
+         (img-rows (max 1 (round (* s (cdr base-dims)))))
+         (h-pad (max 0 (/ (- wc img-cols) 2)))
+         (v-pad (max 0 (/ (- wr img-rows) 2))))
+    ;; Vertical centering: newlines before the image
+    (dotimes (_ v-pad) (insert "\n"))
+    ;; Horizontal centering: spaces to shift the overlay start column
+    (insert (make-string h-pad ?\s))
+    (let* ((img-start (point))
+           (_ (insert "\n"))
+           ;; Ensure image is transmitted (use cache for data, not dims)
+           (cached (gethash abs-file kitty-gfx--image-cache))
+           (image-id (if cached (car cached) (kitty-gfx--alloc-id))))
+      (unless cached
+        (let* ((png (kitty-gfx--convert-to-png abs-file))
+               (b64 (kitty-gfx--read-file-base64 png)))
+          (kitty-gfx--transmit-image image-id b64)
+          (puthash abs-file (cons image-id (cons img-cols img-rows))
+                   kitty-gfx--image-cache)
+          (when (and png (not (string= png abs-file)))
+            (delete-file png t))))
+      ;; Create overlay at the scaled dimensions
+      (kitty-gfx--make-overlay img-start (point) image-id img-cols img-rows)
+      (kitty-gfx--schedule-refresh))))
 
 (defun kitty-gfx-remove-images (&optional beg end)
   "Remove all kitty-gfx overlays in region BEG..END (defaults to whole buffer)."
