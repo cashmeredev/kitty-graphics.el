@@ -863,6 +863,45 @@ image via Kitty graphics instead of an Emacs image spec."
 
 ;;;; image-mode integration
 
+(defvar-local kitty-gfx--image-scale 1.0
+  "Zoom scale factor for image-mode display.
+Values > 1.0 zoom in, < 1.0 zoom out.")
+
+(defun kitty-gfx--image-mode-render ()
+  "Render the current image file centered at current scale."
+  (when-let ((file (buffer-file-name)))
+    (when (kitty-gfx--image-file-p file)
+      (let* ((inhibit-read-only t)
+             (win-w (- (window-body-width) 2))
+             (win-h (- (window-body-height) 2))
+             (max-cols (min win-w kitty-gfx-max-width))
+             (max-rows (min win-h kitty-gfx-max-height)))
+        ;; Remove existing images and clear buffer
+        (kitty-gfx-remove-images)
+        (erase-buffer)
+        (kitty-gfx--display-image-centered
+         file max-cols max-rows win-w win-h
+         kitty-gfx--image-scale)
+        (goto-char (point-min))))))
+
+(defun kitty-gfx-image-increase-size ()
+  "Zoom in on the image in image-mode."
+  (interactive)
+  (setq kitty-gfx--image-scale (* kitty-gfx--image-scale 1.25))
+  (kitty-gfx--image-mode-render))
+
+(defun kitty-gfx-image-decrease-size ()
+  "Zoom out on the image in image-mode."
+  (interactive)
+  (setq kitty-gfx--image-scale (max 0.1 (* kitty-gfx--image-scale 0.8)))
+  (kitty-gfx--image-mode-render))
+
+(defun kitty-gfx-image-reset-size ()
+  "Reset image zoom to default in image-mode."
+  (interactive)
+  (setq kitty-gfx--image-scale 1.0)
+  (kitty-gfx--image-mode-render))
+
 (defun kitty-gfx--image-mode-advice (orig-fn &rest args)
   "Around advice for `image-mode'."
   (if (and kitty-graphics-mode (not (display-graphic-p)))
@@ -874,14 +913,12 @@ image via Kitty graphics instead of an Emacs image spec."
           (set-keymap-parent map (if (boundp 'image-mode-map) image-mode-map
                                    special-mode-map))
           (define-key map (kbd "q") #'kill-current-buffer)
+          (define-key map (kbd "+") #'kitty-gfx-image-increase-size)
+          (define-key map (kbd "-") #'kitty-gfx-image-decrease-size)
+          (define-key map (kbd "0") #'kitty-gfx-image-reset-size)
           (use-local-map map))
         (setq-local buffer-read-only t)
-        (when-let ((file (buffer-file-name)))
-          (when (kitty-gfx--image-file-p file)
-            (kitty-gfx-display-image
-             file (point-min) (point-max)
-             (min (- (window-body-width) 2) kitty-gfx-max-width)
-             (min (- (window-body-height) 2) kitty-gfx-max-height))))
+        (kitty-gfx--image-mode-render)
         (run-mode-hooks 'image-mode-hook))
     (apply orig-fn args)))
 
