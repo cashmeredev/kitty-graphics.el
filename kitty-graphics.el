@@ -48,6 +48,13 @@
 (declare-function org--latex-preview-region "org" (beg end))
 (declare-function org-clear-latex-preview "org" (&optional beg end))
 (declare-function org--make-preview-overlay "org" (beg end movefile imagetype))
+(declare-function doc-view-mode-p "doc-view" ())
+(declare-function doc-view-goto-page "doc-view" (page))
+(declare-function doc-view-insert-image "doc-view" (file &rest args))
+(declare-function doc-view-enlarge "doc-view" (factor))
+(declare-function doc-view-scale-reset "doc-view" ())
+(defvar doc-view--current-cache-dir)
+(defvar doc-view--image-file-pattern)
 (declare-function dired-get-file-for-visit "dired" ())
 (declare-function image-mode-setup-winprops "image-mode" ())
 (declare-function shr-rescale-image "shr" (data &optional content-type width height max-width max-height))
@@ -916,6 +923,77 @@ We extract the :file or :data from the image properties."
              (kitty-gfx--log "shr-put-image error: %s" (error-message-string err))))))
     (apply orig-fn spec alt args)))
 
+;;;; doc-view integration
+
+(defun kitty-gfx--doc-view-mode-p-advice (orig-fn type)
+  "Around advice for `doc-view-mode-p'.
+Bypasses the `display-graphic-p' check so doc-view's conversion
+pipeline runs in terminal mode with Kitty graphics.
+TYPE is the document type symbol (pdf, dvi, ps, etc.)."
+  (if (and kitty-graphics-mode (not (display-graphic-p)))
+      ;; Run the original with display-graphic-p temporarily forced to t.
+      ;; This bypasses the GUI guard while keeping all the per-type
+      ;; tool availability checks intact.
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t)))
+        (funcall orig-fn type))
+    (funcall orig-fn type)))
+
+(defvar-local kitty-gfx--doc-view-overlay nil
+  "The Kitty graphics overlay used for doc-view page display.")
+
+(defvar-local kitty-gfx--doc-view-scale 1.0
+  "Zoom scale factor for doc-view page display.
+Values > 1.0 zoom in, < 1.0 zoom out.")
+
+(defvar-local kitty-gfx--doc-view-current-file nil
+  "Path to the current doc-view page image file.
+Stored so zoom commands can re-render without querying `doc-view-current-image'.")
+
+(defun kitty-gfx--doc-view-insert-image-advice (orig-fn file &rest args)
+  "Around advice for `doc-view-insert-image'.
+Displays the page image via Kitty graphics instead of an Emacs
+image spec.  FILE is the path to the page PNG."
+  (if (and kitty-graphics-mode (not (display-graphic-p)))
+      (when (and file (file-exists-p file))
+        ;; Remember current file for zoom commands
+        (setq kitty-gfx--doc-view-current-file file)
+        ;; Remove previous page image
+        (when kitty-gfx--doc-view-overlay
+          (kitty-gfx--remove-overlay kitty-gfx--doc-view-overlay)
+          (setq kitty-gfx--doc-view-overlay nil))
+        ;; Clear the buffer (removes "Welcome to DocView!" text)
+        (let* ((inhibit-read-only t)
+               (win-w (- (window-body-width) 1))
+               (win-h (- (window-body-height) 1)))
+          (erase-buffer)
+          (kitty-gfx--display-image-centered
+           file win-w win-h win-w win-h
+           kitty-gfx--doc-view-scale)
+          (setq kitty-gfx--doc-view-overlay (car kitty-gfx--overlays)))
+        (goto-char (point-min)))
+    (apply orig-fn file args)))
+
+(defun kitty-gfx--doc-view-enlarge-advice (orig-fn factor)
+  "Around advice for `doc-view-enlarge'.
+Updates `kitty-gfx--doc-view-scale' and re-renders the page."
+  (if (and kitty-graphics-mode (not (display-graphic-p)))
+      (when kitty-gfx--doc-view-current-file
+        (setq kitty-gfx--doc-view-scale
+              (* kitty-gfx--doc-view-scale factor))
+        (kitty-gfx--doc-view-insert-image-advice
+         nil kitty-gfx--doc-view-current-file))
+    (funcall orig-fn factor)))
+
+(defun kitty-gfx--doc-view-scale-reset-advice (orig-fn &rest args)
+  "Around advice for `doc-view-scale-reset'.
+Resets `kitty-gfx--doc-view-scale' to 1.0 and re-renders the page."
+  (if (and kitty-graphics-mode (not (display-graphic-p)))
+      (when kitty-gfx--doc-view-current-file
+        (setq kitty-gfx--doc-view-scale 1.0)
+        (kitty-gfx--doc-view-insert-image-advice
+         nil kitty-gfx--doc-view-current-file))
+    (apply orig-fn args)))
+
 ;;;; Dired integration
 
 ;;;###autoload
@@ -1052,6 +1130,15 @@ Registers `kitty-image' dispatcher and prepends it to the dispatcher list."
   (with-eval-after-load 'shr
     (advice-add 'shr-put-image :around
                 #'kitty-gfx--shr-put-image-advice))
+  (with-eval-after-load 'doc-view
+    (advice-add 'doc-view-mode-p :around
+                #'kitty-gfx--doc-view-mode-p-advice)
+    (advice-add 'doc-view-insert-image :around
+                #'kitty-gfx--doc-view-insert-image-advice)
+    (advice-add 'doc-view-enlarge :around
+                #'kitty-gfx--doc-view-enlarge-advice)
+    (advice-add 'doc-view-scale-reset :around
+                #'kitty-gfx--doc-view-scale-reset-advice))
   (kitty-gfx--install-dirvish))
 
 (defun kitty-gfx--uninstall-integrations ()
@@ -1066,6 +1153,10 @@ Registers `kitty-image' dispatcher and prepends it to the dispatcher list."
   (remove-hook 'org-cycle-hook #'kitty-gfx--on-org-cycle)
   (advice-remove 'org-latex-preview #'kitty-gfx--org-latex-preview-advice)
   (advice-remove 'org--make-preview-overlay #'kitty-gfx--org-make-preview-overlay-advice)
+  (advice-remove 'doc-view-mode-p #'kitty-gfx--doc-view-mode-p-advice)
+  (advice-remove 'doc-view-insert-image #'kitty-gfx--doc-view-insert-image-advice)
+  (advice-remove 'doc-view-enlarge #'kitty-gfx--doc-view-enlarge-advice)
+  (advice-remove 'doc-view-scale-reset #'kitty-gfx--doc-view-scale-reset-advice)
   (advice-remove 'image-mode #'kitty-gfx--image-mode-advice)
   (advice-remove 'shr-put-image #'kitty-gfx--shr-put-image-advice)
   (kitty-gfx--uninstall-dirvish))
