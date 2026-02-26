@@ -25,6 +25,8 @@ they're managed as overlays in Emacs's display engine.
 
 Integrations are provided for:
 - *org-mode* --- inline images via =C-c C-x C-v= (both =org-toggle-inline-images= and =org-link-preview= for org 10.0+)
+- *org LaTeX preview* --- render LaTeX fragments as images via =C-c C-x C-l=
+- *doc-view* --- PDF/DVI/PS viewing with page navigation and zoom
 - *image-mode* --- terminal-aware image file viewing
 - *shr/eww* --- inline images in HTML rendering (eww, mu4e, gnus)
 - *dired* --- image preview in side window (=P= key)
@@ -35,6 +37,8 @@ Integrations are provided for:
 - Emacs >= 27.1
 - [[https://sw.kovidgoyal.net/kitty/][Kitty]] >= 0.20.0 (or WezTerm/Ghostty with direct placement support)
 - ImageMagick (~magick~ / ~convert~ / ~identify~) for non-PNG formats and image sizing
+- For LaTeX preview: a TeX distribution with ~dvipng~ (e.g. ~texlive~)
+- For doc-view: ~ghostscript~ (for PDF), ~dvipng~ (for DVI) --- same tools as GUI Emacs
 - Launch Emacs with ~TERM=xterm-256color~ (Emacs often can't find the ~xterm-kitty~ terminfo)
   
   #+begin_src sh
@@ -72,6 +76,8 @@ Enable the global minor mode:
 
 Then:
 - In org-mode: toggle inline images with =C-c C-x C-v=
+- In org-mode: preview LaTeX fragments with =C-c C-x C-l= (requires a LaTeX installation and =dvipng=)
+- Open a PDF: =doc-view-mode= renders pages via Kitty (=n= / =p= to navigate, =+= / =-= / =0= to zoom)
 - In dired: press =P= on an image file for a side-window preview
 - In dirvish: image previews work automatically (no extra config)
 - Open an image file: =image-mode= displays it via Kitty
@@ -89,12 +95,15 @@ Then:
 
 ** Customization
 
-| Variable               | Default | Description                          |
-|------------------------+---------+--------------------------------------|
-| ~kitty-gfx-max-width~    |      80 | Maximum image width in columns       |
-| ~kitty-gfx-max-height~   |      24 | Maximum image height in rows         |
-| ~kitty-gfx-render-delay~ |   0.016 | Debounce delay for re-rendering (s)  |
-| ~kitty-gfx-debug~        |     nil | Log debug info to ~/tmp/kitty-gfx.log~ |
+| Variable               | Default | Description                              |
+|------------------------+---------+------------------------------------------|
+| ~kitty-gfx-max-width~    |     120 | Maximum inline image width in columns    |
+| ~kitty-gfx-max-height~   |      40 | Maximum inline image height in rows      |
+| ~kitty-gfx-render-delay~ |   0.016 | Debounce delay for re-rendering (s)      |
+| ~kitty-gfx-debug~        |     nil | Log debug info to ~/tmp/kitty-gfx.log~     |
+
+These defaults control inline image sizing (org-mode, eww, dired previews).
+Doc-view ignores these and fills the window, with =+= / =-= / =0= for zoom.
 
 * How It Works
 
@@ -122,6 +131,7 @@ TIFF, BMP) are converted to PNG via ImageMagick before transmission.
 - Primary focus on kitty terminal. While other terminals should work too, I wont give any guarantee
 - Animated GIFs display only the first frame
 - Without ImageMagick, only PNG files work and image sizing falls back to a fixed default
+- Doc-view page may briefly flash at wrong position before centering on initial load
 
 * License
 
