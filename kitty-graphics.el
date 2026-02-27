@@ -4,7 +4,7 @@
 ;;
 ;; Author: cashmere
 ;; Version: 0.2.0
-;; URL: https://git.cashmere.rs/kitty-graphics.git
+;; URL: https://github.com/cashmeredev/kitty-graphics.el
 ;; Keywords: terminals, images, multimedia
 ;; Package-Requires: ((emacs "27.1"))
 
