@@ -708,12 +708,16 @@ underline/color from bleeding through the overlay."
   (mapconcat (lambda (_) (propertize (make-string cols ?\s) 'face 'default))
              (number-sequence 1 rows) "\n"))
 
-(defun kitty-gfx--make-overlay (beg end image-id cols rows)
+(defun kitty-gfx--make-overlay (beg end image-id cols rows &optional reuse-pid)
   "Create overlay from BEG to END for image IMAGE-ID (COLS x ROWS).
 The overlay's display property shows blank space that the terminal
-fills with the image via direct placement."
+fills with the image via direct placement.
+When REUSE-PID is non-nil, reuse that placement ID instead of
+allocating a new one.  This lets the terminal atomically replace
+the old placement (same PID, new dimensions/position) without a
+delete step, avoiding visual glitches in some terminals."
   (let ((ov (make-overlay beg end nil t nil))
-        (pid (kitty-gfx--alloc-placement-id)))
+        (pid (or reuse-pid (kitty-gfx--alloc-placement-id))))
     (overlay-put ov 'display
                  (concat (kitty-gfx--make-blank-display cols rows) "\n"))
     (overlay-put ov 'face 'default)  ; override inherited faces (org-link underline etc.)
@@ -738,19 +742,24 @@ data so the image can be re-placed without retransmitting."
     (send-string-to-terminal
      (format "\e_Ga=d,d=i,i=%d,p=%d,q=2\e\\" id pid))))
 
-(defun kitty-gfx--remove-overlay (ov)
-  "Remove overlay OV and delete its placement from terminal."
+(defun kitty-gfx--remove-overlay (ov &optional keep-placement)
+  "Remove overlay OV and delete its placement from terminal.
+When KEEP-PLACEMENT is non-nil, skip the terminal-side delete so
+the placement ID can be reused by a subsequent overlay (avoids
+visual glitches from delete+re-place sequences in some terminals)."
   (let ((id (overlay-get ov 'kitty-gfx-id))
         (pid (overlay-get ov 'kitty-gfx-pid)))
-    (kitty-gfx--log "remove-overlay: id=%s pid=%s buf=%s"
-                     id pid (when (overlay-buffer ov) (buffer-name (overlay-buffer ov))))
+    (kitty-gfx--log "remove-overlay: id=%s pid=%s keep=%s buf=%s"
+                     id pid keep-placement
+                     (when (overlay-buffer ov) (buffer-name (overlay-buffer ov))))
     (when (overlay-buffer ov)
-      (condition-case err
-          (when (and id pid)
-            (kitty-gfx--delete-placement id pid))
-        (error
-         (kitty-gfx--log "remove-overlay: error deleting placement: %s"
-                          (error-message-string err))))
+      (unless keep-placement
+        (condition-case err
+            (when (and id pid)
+              (kitty-gfx--delete-placement id pid))
+          (error
+           (kitty-gfx--log "remove-overlay: error deleting placement: %s"
+                            (error-message-string err)))))
       (delete-overlay ov))
     (setq kitty-gfx--overlays (delq ov kitty-gfx--overlays))
     (kitty-gfx--log "remove-overlay: done (remaining=%d)" (length kitty-gfx--overlays))))
@@ -803,12 +812,14 @@ BEG/END span the overlay region.  MAX-COLS/MAX-ROWS limit size."
 
 (defun kitty-gfx--display-image-centered (file max-cols max-rows
                                                 &optional win-cols win-rows
-                                                scale)
+                                                scale reuse-pid)
   "Display FILE centered in the current buffer.
 MAX-COLS and MAX-ROWS are the maximum image dimensions at scale 1.0.
 WIN-COLS and WIN-ROWS are the available window dimensions for centering;
 they default to MAX-COLS and MAX-ROWS if not provided.
 SCALE (default 1.0) multiplies the computed cell dims for zoom.
+REUSE-PID, when non-nil, is passed to `kitty-gfx--make-overlay' so the
+new placement atomically replaces the old one (same PID, new dims).
 The buffer should be writable (caller handles `inhibit-read-only')."
   (let* ((s (or scale 1.0))
          (wc (or win-cols max-cols))
@@ -850,7 +861,7 @@ The buffer should be writable (caller handles `inhibit-read-only')."
               (ignore-errors (delete-file png))))))
       ;; Create overlay at the scaled dimensions
       (when (or cached-id (gethash abs-file kitty-gfx--image-cache))
-        (kitty-gfx--make-overlay img-start (point) image-id img-cols img-rows)
+        (kitty-gfx--make-overlay img-start (point) image-id img-cols img-rows reuse-pid)
         (kitty-gfx--schedule-refresh)))))
 
 (defun kitty-gfx-remove-images (&optional beg end)
@@ -1134,16 +1145,23 @@ Values > 1.0 zoom in, < 1.0 zoom out.")
              (win-w (- (window-body-width) 2))
              (win-h (- (window-body-height) 2))
              (max-cols (min win-w kitty-gfx-max-width))
-             (max-rows (min win-h kitty-gfx-max-height)))
-        ;; Remove existing images and clear buffer
-        (kitty-gfx--log "image-mode-render: file=%s scale=%.2f win=%dx%d max=%dx%d"
+             (max-rows (min win-h kitty-gfx-max-height))
+             ;; Save the old placement ID before removing overlays.
+             ;; Reusing it avoids delete+re-place glitches (WezTerm #5892).
+             (old-pid (when (car kitty-gfx--overlays)
+                        (overlay-get (car kitty-gfx--overlays) 'kitty-gfx-pid))))
+        (kitty-gfx--log "image-mode-render: file=%s scale=%.2f win=%dx%d max=%dx%d reuse-pid=%s"
                          (file-name-nondirectory file) kitty-gfx--image-scale
-                         win-w win-h max-cols max-rows)
-        (kitty-gfx-remove-images)
+                         win-w win-h max-cols max-rows old-pid)
+        ;; Remove overlays but skip terminal-side delete when we have
+        ;; a PID to reuse (the new placement will atomically replace it).
+        (dolist (ov (overlays-in (point-min) (point-max)))
+          (when (overlay-get ov 'kitty-gfx)
+            (kitty-gfx--remove-overlay ov old-pid)))
         (erase-buffer)
         (kitty-gfx--display-image-centered
          file max-cols max-rows win-w win-h
-         kitty-gfx--image-scale)
+         kitty-gfx--image-scale old-pid)
         (goto-char (point-min))
         (set-buffer-modified-p nil)))))
 
@@ -1280,19 +1298,22 @@ image spec.  FILE is the path to the page PNG."
         (kitty-gfx--log "doc-view-insert: file=%s scale=%.2f" file kitty-gfx--doc-view-scale)
         ;; Remember current file for zoom commands
         (setq kitty-gfx--doc-view-current-file file)
-        ;; Remove previous page image
-        (when kitty-gfx--doc-view-overlay
-          (kitty-gfx--remove-overlay kitty-gfx--doc-view-overlay)
-          (setq kitty-gfx--doc-view-overlay nil))
-        ;; Clear the buffer (removes "Welcome to DocView!" text)
-        (let* ((inhibit-read-only t)
-               (win-w (- (window-body-width) 1))
-               (win-h (- (window-body-height) 1)))
-          (erase-buffer)
-          (kitty-gfx--display-image-centered
-           file win-w win-h win-w win-h
-           kitty-gfx--doc-view-scale)
-          (setq kitty-gfx--doc-view-overlay (car kitty-gfx--overlays)))
+        ;; Save old PID and remove overlay without terminal-side delete
+        ;; so the new placement atomically replaces it (WezTerm #5892).
+        (let ((old-pid (when kitty-gfx--doc-view-overlay
+                         (overlay-get kitty-gfx--doc-view-overlay 'kitty-gfx-pid))))
+          (when kitty-gfx--doc-view-overlay
+            (kitty-gfx--remove-overlay kitty-gfx--doc-view-overlay old-pid)
+            (setq kitty-gfx--doc-view-overlay nil))
+          ;; Clear the buffer (removes "Welcome to DocView!" text)
+          (let* ((inhibit-read-only t)
+                 (win-w (- (window-body-width) 1))
+                 (win-h (- (window-body-height) 1)))
+            (erase-buffer)
+            (kitty-gfx--display-image-centered
+             file win-w win-h win-w win-h
+             kitty-gfx--doc-view-scale old-pid)
+            (setq kitty-gfx--doc-view-overlay (car kitty-gfx--overlays))))
         (goto-char (point-min)))
     (apply orig-fn file args)))
 
