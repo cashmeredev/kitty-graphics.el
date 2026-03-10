@@ -94,6 +94,16 @@ This debounces rapid redisplay events.  Default is ~1 frame at 60fps."
   :type 'number
   :group 'kitty-graphics)
 
+(defcustom kitty-gfx-use-pre-redisplay nil
+  "When non-nil, use `pre-redisplay-functions' instead of `post-command-hook'.
+This is an experimental option for comparing refresh trigger strategies.
+`pre-redisplay-functions' is more targeted (fires only when a window
+actually needs redisplay and receives the specific window), whereas
+`post-command-hook' fires on every command unconditionally.
+Toggle at runtime by disabling/re-enabling `kitty-graphics-mode'."
+  :type 'boolean
+  :group 'kitty-graphics)
+
 (defcustom kitty-gfx-debug nil
   "When non-nil, log debug info to *kitty-gfx-debug* buffer."
   :type 'boolean
@@ -157,6 +167,15 @@ Most recently used at the front.")
   "Next placement ID (p=PID) for direct placements.
 Each overlay gets a unique PID so repeated placements replace
 rather than accumulate.")
+
+(defvar kitty-gfx--trigger-count 0
+  "Count of refresh scheduling triggers since last reset.
+Used for comparing `post-command-hook' vs `pre-redisplay-functions'.")
+
+(defvar kitty-gfx--trigger-skipped 0
+  "Count of triggers that were skipped (no overlays in window).
+Only counted when using `pre-redisplay-functions' or instrumented
+`post-command-hook'.")
 
 ;;;; Terminal detection
 
@@ -409,8 +428,12 @@ to prevent flicker."
                        (cl-incf hidden)))))))
            nil 'visible)
         (kitty-gfx--sync-end))
-      (kitty-gfx--log "refresh: done total=%d placed=%d hidden=%d pruned=%d"
-                       total-overlays placed hidden pruned))))
+      (kitty-gfx--log "refresh: done total=%d placed=%d hidden=%d pruned=%d triggers=%d skipped=%d strategy=%s"
+                       total-overlays placed hidden pruned
+                       kitty-gfx--trigger-count kitty-gfx--trigger-skipped
+                       (if kitty-gfx-use-pre-redisplay "pre-redisplay" "post-command"))
+      (setq kitty-gfx--trigger-count 0
+            kitty-gfx--trigger-skipped 0))))
 
 (defun kitty-gfx--refresh-overlay (ov win-bottom)
   "Refresh a single overlay OV.  WIN-BOTTOM is the window's bottom edge.
@@ -557,7 +580,17 @@ buffer before settling to one)."
 
 (defun kitty-gfx--on-redisplay ()
   "Post-command hook to schedule image refresh."
+  (cl-incf kitty-gfx--trigger-count)
   (kitty-gfx--schedule-refresh))
+
+(defun kitty-gfx--on-pre-redisplay (win)
+  "Pre-redisplay hook to schedule image refresh for WIN.
+Only schedules if WIN's buffer has kitty-gfx overlays, which avoids
+unnecessary work for buffers without images."
+  (cl-incf kitty-gfx--trigger-count)
+  (if (buffer-local-value 'kitty-gfx--overlays (window-buffer win))
+      (kitty-gfx--schedule-refresh)
+    (cl-incf kitty-gfx--trigger-skipped)))
 
 ;;;; Image processing
 
@@ -916,15 +949,23 @@ The buffer should be writable (caller handles `inhibit-read-only')."
   (add-hook 'window-scroll-functions #'kitty-gfx--on-window-scroll)
   (add-hook 'window-size-change-functions #'kitty-gfx--on-window-change)
   (add-hook 'window-buffer-change-functions #'kitty-gfx--on-buffer-change)
-  (add-hook 'post-command-hook #'kitty-gfx--on-redisplay)
-  (add-hook 'kill-buffer-hook #'kitty-gfx--kill-buffer-hook))
+  (if kitty-gfx-use-pre-redisplay
+      (add-hook 'pre-redisplay-functions #'kitty-gfx--on-pre-redisplay)
+    (add-hook 'post-command-hook #'kitty-gfx--on-redisplay))
+  (add-hook 'kill-buffer-hook #'kitty-gfx--kill-buffer-hook)
+  (setq kitty-gfx--trigger-count 0
+        kitty-gfx--trigger-skipped 0)
+  (kitty-gfx--log "install-hooks: strategy=%s"
+                   (if kitty-gfx-use-pre-redisplay "pre-redisplay" "post-command")))
 
 (defun kitty-gfx--uninstall-hooks ()
   "Remove redisplay hooks."
   (remove-hook 'window-scroll-functions #'kitty-gfx--on-window-scroll)
   (remove-hook 'window-size-change-functions #'kitty-gfx--on-window-change)
   (remove-hook 'window-buffer-change-functions #'kitty-gfx--on-buffer-change)
+  ;; Remove both — safe even if only one was installed.
   (remove-hook 'post-command-hook #'kitty-gfx--on-redisplay)
+  (remove-hook 'pre-redisplay-functions #'kitty-gfx--on-pre-redisplay)
   (remove-hook 'kill-buffer-hook #'kitty-gfx--kill-buffer-hook))
 
 ;;;; Org-mode integration
