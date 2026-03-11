@@ -63,6 +63,7 @@
 (defvar org-format-latex-options)
 (declare-function org-combine-plists "org-macs" (&rest plists))
 (defvar image-mode-map)
+(declare-function markdown-overlays--resolve-image-url "markdown-overlays" (url))
 
 ;;;; Customization
 
@@ -1445,6 +1446,44 @@ Registers `kitty-image' dispatcher and prepends it to the dispatcher list."
           (assq-delete-all 'kitty-image dirvish--available-preview-dispatchers)))
   (fmakunbound 'dirvish-kitty-image-dp))
 
+;;;; markdown-overlays integration (agent-shell)
+
+(defun kitty-gfx--markdown-overlays-fontify-image-advice (orig-fn start end url-start url-end)
+  "Around advice for `markdown-overlays--fontify-image'.
+Displays markdown images ![alt](url) via Kitty graphics in terminal.
+Falls back to ORIG-FN in GUI."
+  (if (and kitty-graphics-mode (not (display-graphic-p)))
+      (when-let* ((url (buffer-substring-no-properties url-start url-end))
+                  (path (markdown-overlays--resolve-image-url url))
+                  ((file-exists-p path))
+                  ((kitty-gfx--image-file-p path)))
+        (kitty-gfx--log "markdown-overlays-image: %s" path)
+        (condition-case err
+            (kitty-gfx-display-image
+             path start end
+             kitty-gfx-max-width kitty-gfx-max-height)
+          (error
+           (kitty-gfx--log "markdown-overlays-image error: %s" (error-message-string err)))))
+    (funcall orig-fn start end url-start url-end)))
+
+(defun kitty-gfx--markdown-overlays-fontify-image-file-path-advice (orig-fn start end path-start path-end)
+  "Around advice for `markdown-overlays--fontify-image-file-path'.
+Displays bare image file paths via Kitty graphics in terminal.
+Falls back to ORIG-FN in GUI."
+  (if (and kitty-graphics-mode (not (display-graphic-p)))
+      (when-let* ((raw (buffer-substring-no-properties path-start path-end))
+                  (path (markdown-overlays--resolve-image-url raw))
+                  ((file-exists-p path))
+                  ((kitty-gfx--image-file-p path)))
+        (kitty-gfx--log "markdown-overlays-path: %s" path)
+        (condition-case err
+            (kitty-gfx-display-image
+             path start end
+             kitty-gfx-max-width kitty-gfx-max-height)
+          (error
+           (kitty-gfx--log "markdown-overlays-path error: %s" (error-message-string err)))))
+    (funcall orig-fn start end path-start path-end)))
+
 ;;;; Integration install/uninstall
 
 (defun kitty-gfx--install-integrations ()
@@ -1485,6 +1524,11 @@ Registers `kitty-image' dispatcher and prepends it to the dispatcher list."
                 #'kitty-gfx--doc-view-enlarge-advice)
     (advice-add 'doc-view-scale-reset :around
                 #'kitty-gfx--doc-view-scale-reset-advice))
+  (with-eval-after-load 'markdown-overlays
+    (advice-add 'markdown-overlays--fontify-image :around
+                #'kitty-gfx--markdown-overlays-fontify-image-advice)
+    (advice-add 'markdown-overlays--fontify-image-file-path :around
+                #'kitty-gfx--markdown-overlays-fontify-image-file-path-advice))
   (kitty-gfx--install-dirvish))
 
 (defun kitty-gfx--uninstall-integrations ()
@@ -1505,6 +1549,8 @@ Registers `kitty-image' dispatcher and prepends it to the dispatcher list."
   (advice-remove 'doc-view-scale-reset #'kitty-gfx--doc-view-scale-reset-advice)
   (advice-remove 'image-mode #'kitty-gfx--image-mode-advice)
   (advice-remove 'shr-put-image #'kitty-gfx--shr-put-image-advice)
+  (advice-remove 'markdown-overlays--fontify-image #'kitty-gfx--markdown-overlays-fontify-image-advice)
+  (advice-remove 'markdown-overlays--fontify-image-file-path #'kitty-gfx--markdown-overlays-fontify-image-file-path-advice)
   (kitty-gfx--uninstall-dirvish))
 
 ;;;; Buffer cleanup
