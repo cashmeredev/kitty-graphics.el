@@ -119,6 +119,20 @@ This debounces rapid redisplay events.  Default is ~1 frame at 60fps."
 ;; Forward declaration — defined by `define-minor-mode' below.
 (defvar kitty-graphics-mode)
 
+(defvar kitty-gfx--active-backend nil
+  "Symbol identifying the active graphics backend: `kitty' or `sixel'.
+Set by `kitty-gfx--detect-protocol'.")
+
+(defvar kitty-gfx--backends nil
+  "Alist mapping backend symbols to operation alists.
+Each backend alist maps operation symbols to functions:
+  `detect'      — () -> bool: return non-nil if backend is supported
+  `prepare'     — (file image-id) -> id-or-nil: prepare/transmit image
+  `place'       — (ov id pid cols rows term-row term-col): place image
+  `delete'      — (ov id pid): delete placement
+  `cleanup'     — (file id): cleanup resources for file
+  `cleanup-all' — (): cleanup all resources.")
+
 (defvar kitty-gfx--next-id 1
   "Next image ID to assign (1-4294967295).
 With direct placements, any uint32 ID works — no 256-color constraint.")
@@ -128,6 +142,15 @@ With direct placements, any uint32 ID works — no 256-color constraint.")
 When exceeded, the least recently used image is evicted and its
 terminal data deleted via `a=d'."
   :type 'integer
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-preferred-protocol 'auto
+  "Preferred graphics protocol to use.
+Choices: `auto' (try Kitty first, then Sixel), `kitty', or `sixel'.
+Default is `auto'."
+  :type '(choice (const :tag "Auto-detect (Kitty → Sixel)" auto)
+                 (const :tag "Kitty graphics protocol" kitty)
+                 (const :tag "Sixel protocol" sixel))
   :group 'kitty-graphics)
 
 (defvar kitty-gfx--image-cache (make-hash-table :test 'equal)
@@ -161,17 +184,52 @@ rather than accumulate.")
 
 ;;;; Terminal detection
 
-(defun kitty-gfx--supported-p ()
-  "Return non-nil if the terminal supports Kitty graphics."
-  (let ((supported (and (not (display-graphic-p))
-                        (or (getenv "KITTY_PID")
-                            (equal (getenv "TERM_PROGRAM") "kitty")
-                            (equal (getenv "TERM_PROGRAM") "WezTerm")
-                            (equal (getenv "TERM_PROGRAM") "ghostty")))))
-    (kitty-gfx--log "supported-p: %s (graphic=%s KITTY_PID=%s TERM_PROGRAM=%s)"
-                     supported (display-graphic-p)
-                     (getenv "KITTY_PID") (getenv "TERM_PROGRAM"))
-    supported))
+(defun kitty-gfx--backend-fn (op)
+  "Return the backend function for operation OP.
+Looks up OP in the active backend's operation alist.
+Signals an error if no backend is active or OP is missing."
+  (unless kitty-gfx--active-backend
+    (error "No active graphics backend"))
+  (let* ((backend-alist (alist-get kitty-gfx--active-backend kitty-gfx--backends))
+         (fn (alist-get op backend-alist)))
+    (unless fn
+      (error "Backend %s does not implement operation %s"
+             kitty-gfx--active-backend op))
+    fn))
+
+(defun kitty-gfx--detect-protocol ()
+  "Detect and activate a graphics protocol backend.
+Returns non-nil if a supported backend is found.
+Sets `kitty-gfx--active-backend' to the detected backend symbol."
+  (if (display-graphic-p)
+      (progn
+        (kitty-gfx--log "detect-protocol: GUI frame, no terminal graphics")
+        (setq kitty-gfx--active-backend nil)
+        nil)
+      (let ((pref kitty-gfx-preferred-protocol)
+            (detected nil))
+        (kitty-gfx--log "detect-protocol: preference=%s" pref)
+        (cond
+         ;; Explicit backend preference
+         ((eq pref 'kitty)
+          (let ((fn (alist-get 'detect (alist-get 'kitty kitty-gfx--backends))))
+            (when (and fn (funcall fn))
+              (setq detected 'kitty))))
+         ((eq pref 'sixel)
+          (let ((fn (alist-get 'detect (alist-get 'sixel kitty-gfx--backends))))
+            (when (and fn (funcall fn))
+              (setq detected 'sixel))))
+         ;; Auto: try Kitty first (fast env check), then Sixel
+         (t
+          (let ((kitty-fn (alist-get 'detect (alist-get 'kitty kitty-gfx--backends))))
+            (if (and kitty-fn (funcall kitty-fn))
+                (setq detected 'kitty)
+              (let ((sixel-fn (alist-get 'detect (alist-get 'sixel kitty-gfx--backends))))
+                (when (and sixel-fn (funcall sixel-fn))
+                  (setq detected 'sixel)))))))
+        (setq kitty-gfx--active-backend detected)
+        (kitty-gfx--log "detect-protocol: result=%s" detected)
+        detected)))
 
 (defun kitty-gfx--query-cell-size ()
   "Query terminal for cell size in pixels using CSI 16 t (XTWINOPS).
@@ -289,6 +347,215 @@ Uses direct placement: move cursor, then `a=p' with `c' and `r' params."
     (send-string-to-terminal
      (format "\e7\e[%d;%dH\e_Gq=2,a=p,i=%d,p=%d,c=%d,r=%d\e\\\e8"
              term-row term-col image-id placement-id cols rows))))
+
+;;;; Kitty backend
+
+(defun kitty-gfx--kitty-detect ()
+  "Return non-nil if the terminal supports Kitty graphics protocol."
+  (let ((supported (or (getenv "KITTY_PID")
+                       (equal (getenv "TERM_PROGRAM") "kitty")
+                       (equal (getenv "TERM_PROGRAM") "WezTerm")
+                       (equal (getenv "TERM_PROGRAM") "ghostty"))))
+    (kitty-gfx--log "kitty-detect: %s (KITTY_PID=%s TERM_PROGRAM=%s)"
+                     supported (getenv "KITTY_PID") (getenv "TERM_PROGRAM"))
+    supported))
+
+(defun kitty-gfx--kitty-prepare (file image-id)
+  "Prepare image FILE for Kitty display.
+Converts to PNG if needed, encodes to base64, transmits to terminal.
+Returns IMAGE-ID on success, nil on failure."
+  (let* ((png (kitty-gfx--convert-to-png file))
+         (temp-p (and png (not (string= png file)))))
+    (unwind-protect
+        (let ((b64 (when png (kitty-gfx--read-file-base64 png))))
+          (if (not b64)
+              (progn
+                (kitty-gfx--log "kitty-prepare: skipped %s (conversion failed)" file)
+                nil)
+            (kitty-gfx--log "kitty-prepare: transmit id=%d b64-len=%d png=%s"
+                             image-id (length b64) png)
+            (kitty-gfx--transmit-image image-id b64)
+            image-id))
+      (when temp-p
+        (ignore-errors (delete-file png))))))
+
+(defun kitty-gfx--kitty-place (_ov image-id placement-id cols rows term-row term-col)
+  "Place Kitty image at terminal position.
+OV is the overlay (unused by Kitty backend but part of the interface)."
+  (kitty-gfx--place-image image-id placement-id cols rows term-row term-col))
+
+(defun kitty-gfx--kitty-delete (_ov image-id placement-id)
+  "Delete Kitty placement PID of image ID."
+  (kitty-gfx--delete-placement image-id placement-id))
+
+(defun kitty-gfx--kitty-cleanup (_file image-id)
+  "Cleanup Kitty image data for FILE (identified by IMAGE-ID)."
+  (kitty-gfx--delete-by-id image-id))
+
+(defun kitty-gfx--kitty-cleanup-all ()
+  "Cleanup all Kitty images."
+  (kitty-gfx--delete-all-images))
+
+;;;; Sixel backend
+
+(defvar kitty-gfx--sixel-temp-files nil
+  "List of temporary Sixel files created for caching.")
+
+(defvar kitty-gfx--sixel-cache (make-hash-table :test 'equal)
+  "Maps (file . dims-string) to temp sixel file paths.")
+
+(defun kitty-gfx--sixel-detect ()
+  "Return non-nil if the terminal likely supports Sixel protocol."
+  (let* ((term (getenv "TERM"))
+         (term-prog (getenv "TERM_PROGRAM"))
+         (in-tmux (getenv "TMUX"))
+         (supported (and term
+                         (not in-tmux)  ; Sixel doesn't work in tmux
+                         (or (string-match-p "xterm\\|vt[0-9]" term)
+                             (member term-prog '("foot" "Konsole" "mintty" "mlterm"))))))
+    (kitty-gfx--log "sixel-detect: %s (TERM=%s TERM_PROGRAM=%s TMUX=%s)"
+                     supported term term-prog (if in-tmux "yes" "no"))
+    supported))
+
+(defun kitty-gfx--sixel-cache-path (file cols rows)
+  "Return deterministic temp file path for FILE at COLS x ROWS."
+  (let* ((key (format "%s:%dx%d" file cols rows))
+         (hash (md5 key)))
+    (expand-file-name (concat "kitty-gfx-sixel-" hash ".six") temporary-file-directory)))
+
+(defun kitty-gfx--sixel-encode (png-file cols rows)
+  "Encode PNG-FILE as Sixel data for COLS x ROWS cells.
+Returns Sixel data string or nil on failure.
+Computes pixel dimensions from cell size."
+  (let* ((cw (or kitty-gfx--cell-pixel-width 8))
+         (ch (or kitty-gfx--cell-pixel-height 16))
+         (pixel-w (* cols cw))
+         (pixel-h (* rows ch))
+         (convert (or (executable-find "magick") (executable-find "convert"))))
+    (if (not convert)
+        (progn
+          (kitty-gfx--log "sixel-encode: no ImageMagick, cannot encode")
+          (message "kitty-gfx: Sixel backend requires ImageMagick")
+          nil)
+      (kitty-gfx--log "sixel-encode: %s -> %dx%d pixels via %s"
+                       png-file pixel-w pixel-h convert)
+      (with-temp-buffer
+        (let* ((args (if (string-suffix-p "magick" convert)
+                         (list convert nil t nil "convert"
+                               png-file "-geometry" (format "%dx%d" pixel-w pixel-h)
+                               "sixel:-")
+                       (list convert nil t nil
+                             png-file "-geometry" (format "%dx%d" pixel-w pixel-h)
+                             "sixel:-")))
+               (exit-code (apply #'call-process args)))
+          (if (zerop exit-code)
+              (let ((data (buffer-string)))
+                (kitty-gfx--log "sixel-encode: success (%d bytes)" (length data))
+                data)
+            (kitty-gfx--log "sixel-encode: FAILED exit=%d" exit-code)
+            nil))))))
+
+(defun kitty-gfx--sixel-prepare (file _image-id)
+  "Prepare FILE for Sixel display.
+For Sixel, preparation just validates the file exists and is convertible.
+Actual encoding happens at place-time (needs dimensions).
+Returns non-nil on success."
+  (let ((png (kitty-gfx--convert-to-png file)))
+    (when png
+      (kitty-gfx--log "sixel-prepare: %s -> %s" file png)
+      ;; Cache the PNG path for later encoding
+      (puthash file png kitty-gfx--sixel-cache)
+      t)))
+
+(defun kitty-gfx--sixel-place (ov _image-id _placement-id cols rows term-row term-col)
+  "Place Sixel image at terminal position.
+Encodes on-demand if not cached, then emits DCS sequence."
+  (let* ((file (overlay-get ov 'kitty-gfx-file))
+         (png (gethash file kitty-gfx--sixel-cache))
+         (cache-path (kitty-gfx--sixel-cache-path file cols rows))
+         (sixel-data nil))
+    (if (not png)
+        (kitty-gfx--log "sixel-place: no PNG cached for %s" file)
+    ;; Check if sixel encoding is cached
+    (if (file-exists-p cache-path)
+        (progn
+          (kitty-gfx--log "sixel-place: using cached sixel %s" cache-path)
+          (with-temp-buffer
+            (set-buffer-multibyte nil)
+            (insert-file-contents-literally cache-path)
+            (setq sixel-data (buffer-string))))
+      ;; Encode on-demand
+      (kitty-gfx--log "sixel-place: encoding %s at %dx%d" png cols rows)
+      (setq sixel-data (kitty-gfx--sixel-encode png cols rows))
+      (when sixel-data
+        ;; Cache the encoding
+        (ignore-errors
+          (with-temp-file cache-path
+            (set-buffer-multibyte nil)
+            (insert sixel-data)))
+        (push cache-path kitty-gfx--sixel-temp-files)))
+      ;; Emit Sixel sequence if we have data
+      (when sixel-data
+        (kitty-gfx--log "sixel-place: emitting at row=%d col=%d" term-row term-col)
+        (ignore-errors
+          (send-string-to-terminal
+           (format "\e7\e[%d;%dH%s\e8" term-row term-col sixel-data)))))))
+
+(defun kitty-gfx--sixel-delete (ov _image-id _placement-id)
+  "Delete Sixel placement by overwriting with spaces.
+Sixel has no placement IDs — erase by writing spaces over the region."
+  (let ((last-row (overlay-get ov 'kitty-gfx-last-row))
+        (last-col (overlay-get ov 'kitty-gfx-last-col))
+        (rows (overlay-get ov 'kitty-gfx-rows))
+        (cols (overlay-get ov 'kitty-gfx-cols)))
+    (when (and last-row last-col rows cols)
+      (kitty-gfx--log "sixel-delete: erase row=%d col=%d %dx%d"
+                       last-row last-col cols rows)
+      (ignore-errors
+        (send-string-to-terminal
+         (format "\e7%s\e8"
+                 (mapconcat
+                  (lambda (r)
+                    (format "\e[%d;%dH%s" (+ last-row r) last-col (make-string cols ?\s)))
+                  (number-sequence 0 (1- rows))
+                  "")))))))
+
+(defun kitty-gfx--sixel-cleanup (file _image-id)
+  "Cleanup Sixel resources for FILE."
+  (remhash file kitty-gfx--sixel-cache)
+  ;; Remove cached sixel encodings for this file
+  (dolist (temp-file kitty-gfx--sixel-temp-files)
+    (when (string-match-p (regexp-quote (md5 file)) temp-file)
+      (kitty-gfx--log "sixel-cleanup: deleting %s" temp-file)
+      (ignore-errors (delete-file temp-file))
+      (setq kitty-gfx--sixel-temp-files (delete temp-file kitty-gfx--sixel-temp-files)))))
+
+(defun kitty-gfx--sixel-cleanup-all ()
+  "Cleanup all Sixel resources."
+  (kitty-gfx--log "sixel-cleanup-all: deleting %d temp files"
+                   (length kitty-gfx--sixel-temp-files))
+  (dolist (temp-file kitty-gfx--sixel-temp-files)
+    (ignore-errors (delete-file temp-file)))
+  (setq kitty-gfx--sixel-temp-files nil)
+  (clrhash kitty-gfx--sixel-cache))
+
+;; Register backends
+(setq kitty-gfx--backends
+      `((kitty . ((detect . ,#'kitty-gfx--kitty-detect)
+                  (prepare . ,#'kitty-gfx--kitty-prepare)
+                  (place . ,#'kitty-gfx--kitty-place)
+                  (delete . ,#'kitty-gfx--kitty-delete)
+                  (cleanup . ,#'kitty-gfx--kitty-cleanup)
+                  (cleanup-all . ,#'kitty-gfx--kitty-cleanup-all)))
+        (sixel . ((detect . ,#'kitty-gfx--sixel-detect)
+                  (prepare . ,#'kitty-gfx--sixel-prepare)
+                  (place . ,#'kitty-gfx--sixel-place)
+                  (delete . ,#'kitty-gfx--sixel-delete)
+                  (cleanup . ,#'kitty-gfx--sixel-cleanup)
+                  (cleanup-all . ,#'kitty-gfx--sixel-cleanup-all)))))
+
+;; Cleanup temp files on exit
+(add-hook 'kill-emacs-hook #'kitty-gfx--sixel-cleanup-all)
 
 ;;;; Position mapping
 
@@ -443,16 +710,15 @@ if the overlay scrolled out of view."
                               new-row new-col)
               (overlay-put ov 'kitty-gfx-last-row new-row)
               (overlay-put ov 'kitty-gfx-last-col new-col)
-              (kitty-gfx--place-image id pid
-               (overlay-get ov 'kitty-gfx-cols)
-               rows new-row new-col)))
+              (funcall (kitty-gfx--backend-fn 'place)
+                       ov id pid (overlay-get ov 'kitty-gfx-cols) rows new-row new-col)))
         ;; Not visible or overflows — delete if was placed
         (when last-row
           (kitty-gfx--log "refresh-ov: pid=%d hiding (was row=%d col=%d)"
                           pid last-row last-col)
           (overlay-put ov 'kitty-gfx-last-row nil)
           (overlay-put ov 'kitty-gfx-last-col nil)
-          (kitty-gfx--delete-placement id pid))))))
+          (funcall (kitty-gfx--backend-fn 'delete) ov id pid))))))
 
 (defvar kitty-gfx--refresh-pending nil
   "Non-nil if a refresh was requested during the cooldown period.")
@@ -677,8 +943,8 @@ With direct placements, COLS and ROWS map directly to terminal columns/rows."
               kitty-gfx--cache-lru)
     (let* ((victim (car (last kitty-gfx--cache-lru)))
            (victim-id (gethash victim kitty-gfx--image-cache)))
-      (when victim-id
-        (kitty-gfx--delete-by-id victim-id))
+      (when (and victim-id kitty-gfx--active-backend)
+        (funcall (kitty-gfx--backend-fn 'cleanup) victim victim-id))
       (remhash victim kitty-gfx--image-cache)
       (setq kitty-gfx--cache-lru (butlast kitty-gfx--cache-lru))
       (kitty-gfx--log "cache-evict: %s id=%s (remaining=%d)"
@@ -709,8 +975,9 @@ underline/color from bleeding through the overlay."
   (mapconcat (lambda (_) (propertize (make-string cols ?\s) 'face 'default))
              (number-sequence 1 rows) "\n"))
 
-(defun kitty-gfx--make-overlay (beg end image-id cols rows &optional reuse-pid)
+(defun kitty-gfx--make-overlay (beg end image-id cols rows file &optional reuse-pid)
   "Create overlay from BEG to END for image IMAGE-ID (COLS x ROWS).
+FILE is the source file path (needed by some backends for re-encoding).
 The overlay's display property shows blank space that the terminal
 fills with the image via direct placement.
 When REUSE-PID is non-nil, reuse that placement ID instead of
@@ -727,6 +994,7 @@ delete step, avoiding visual glitches in some terminals."
     (overlay-put ov 'kitty-gfx-pid pid)
     (overlay-put ov 'kitty-gfx-cols cols)
     (overlay-put ov 'kitty-gfx-rows rows)
+    (overlay-put ov 'kitty-gfx-file file)
     ;; Don't set evaporate — zero-width overlays (beg==end) would be
     ;; deleted immediately if evaporate is set.
     (push ov kitty-gfx--overlays)
@@ -756,8 +1024,8 @@ visual glitches from delete+re-place sequences in some terminals)."
     (when (overlay-buffer ov)
       (unless keep-placement
         (condition-case err
-            (when (and id pid)
-              (kitty-gfx--delete-placement id pid))
+            (when (and id pid kitty-gfx--active-backend)
+              (funcall (kitty-gfx--backend-fn 'delete) ov id pid))
           (error
            (kitty-gfx--log "remove-overlay: error deleting placement: %s"
                             (error-message-string err)))))
@@ -772,8 +1040,8 @@ visual glitches from delete+re-place sequences in some terminals)."
   "Display image FILE in the current buffer.
 BEG/END span the overlay region.  MAX-COLS/MAX-ROWS limit size."
   (interactive "fImage file: ")
-  (unless (kitty-gfx--supported-p)
-    (user-error "Terminal does not support Kitty graphics"))
+  (unless kitty-gfx--active-backend
+    (user-error "Terminal does not support graphics"))
   (let* ((max-c (or max-cols kitty-gfx-max-width))
          (max-r (or max-rows kitty-gfx-max-height))
          (abs-file (expand-file-name file))
@@ -792,22 +1060,13 @@ BEG/END span the overlay region.  MAX-COLS/MAX-ROWS limit size."
          (stop (or end (point))))
     (kitty-gfx--log "display-image: file=%s id=%d cols=%d rows=%d beg=%s end=%s cached=%s"
                     abs-file image-id cols rows start stop (if cached-id "yes" "no"))
-    ;; Transmit image if not cached
+    ;; Prepare image if not cached (backend-specific: transmit or validate)
     (unless cached-id
-      (let* ((png (kitty-gfx--convert-to-png abs-file))
-             (temp-p (and png (not (string= png abs-file)))))
-        (unwind-protect
-            (let ((b64 (when png (kitty-gfx--read-file-base64 png))))
-              (if (not b64)
-                  (kitty-gfx--log "display-image: skipped %s (conversion failed)" abs-file)
-                (kitty-gfx--log "transmit: id=%d b64-len=%d png=%s" image-id (length b64) png)
-                (kitty-gfx--transmit-image image-id b64)
-                (kitty-gfx--cache-put abs-file image-id)))
-          (when temp-p
-            (ignore-errors (delete-file png))))))
+      (when (funcall (kitty-gfx--backend-fn 'prepare) abs-file image-id)
+        (kitty-gfx--cache-put abs-file image-id)))
     ;; Create overlay with blank space (even for cached images, dims are fresh)
     (when (or cached-id (gethash abs-file kitty-gfx--image-cache))
-      (kitty-gfx--make-overlay start stop image-id cols rows)
+      (kitty-gfx--make-overlay start stop image-id cols rows abs-file)
       ;; Schedule initial render
       (kitty-gfx--schedule-refresh))))
 
@@ -850,19 +1109,11 @@ The buffer should be writable (caller handles `inhibit-read-only')."
            (cached-id (kitty-gfx--cache-get abs-file))
            (image-id (or cached-id (kitty-gfx--alloc-id))))
       (unless cached-id
-        (let* ((png (kitty-gfx--convert-to-png abs-file))
-               (temp-p (and png (not (string= png abs-file)))))
-          (unwind-protect
-              (let ((b64 (when png (kitty-gfx--read-file-base64 png))))
-                (if (not b64)
-                    (kitty-gfx--log "centered: skipped %s (conversion failed)" abs-file)
-                  (kitty-gfx--transmit-image image-id b64)
-                  (kitty-gfx--cache-put abs-file image-id)))
-            (when temp-p
-              (ignore-errors (delete-file png))))))
+        (when (funcall (kitty-gfx--backend-fn 'prepare) abs-file image-id)
+          (kitty-gfx--cache-put abs-file image-id)))
       ;; Create overlay at the scaled dimensions
       (when (or cached-id (gethash abs-file kitty-gfx--image-cache))
-        (kitty-gfx--make-overlay img-start (point) image-id img-cols img-rows reuse-pid)
+        (kitty-gfx--make-overlay img-start (point) image-id img-cols img-rows abs-file reuse-pid)
         (kitty-gfx--schedule-refresh)))))
 
 (defun kitty-gfx-remove-images (&optional beg end)
@@ -885,7 +1136,8 @@ The buffer should be writable (caller handles `inhibit-read-only')."
     (with-current-buffer buf
       (when kitty-gfx--overlays
         (kitty-gfx-remove-images))))
-  (kitty-gfx--delete-all-images)
+  (when kitty-gfx--active-backend
+    (funcall (kitty-gfx--backend-fn 'cleanup-all)))
   (clrhash kitty-gfx--image-cache)
   (setq kitty-gfx--cache-lru nil)
   (setq kitty-gfx--next-id 1)
@@ -896,31 +1148,41 @@ The buffer should be writable (caller handles `inhibit-read-only')."
 
 ;;;###autoload
 (define-minor-mode kitty-graphics-mode
-  "Display images in terminal Emacs via Kitty graphics protocol."
+  "Display images in terminal Emacs via graphics protocol (Kitty or Sixel)."
   :global t
-  :lighter " KittyGfx"
+  :lighter (:eval (concat " KittyGfx["
+                          (pcase kitty-gfx--active-backend
+                            ('kitty "K")
+                            ('sixel "S")
+                            (_ "?"))
+                          "]"))
   (if kitty-graphics-mode
-      (if (kitty-gfx--supported-p)
+      (if (kitty-gfx--detect-protocol)
           (progn
-            (kitty-gfx--log "mode: enabling")
-            (kitty-gfx--delete-all-images)  ; clear stale state
+            (kitty-gfx--log "mode: enabling (backend=%s)" kitty-gfx--active-backend)
+            (when kitty-gfx--active-backend
+              (funcall (kitty-gfx--backend-fn 'cleanup-all)))  ; clear stale state
             (kitty-gfx--query-cell-size)
             (kitty-gfx--install-hooks)
             (kitty-gfx--install-integrations)
-            (kitty-gfx--log "mode: enabled (cell=%dx%d)"
+            (kitty-gfx--log "mode: enabled (backend=%s cell=%dx%d)"
+                             kitty-gfx--active-backend
                              kitty-gfx--cell-pixel-width kitty-gfx--cell-pixel-height)
-            (message "Kitty graphics mode enabled"))
+            (message "Kitty graphics mode enabled (%s backend)"
+                     kitty-gfx--active-backend))
         (kitty-gfx--log "mode: terminal not supported, aborting enable")
         (setq kitty-graphics-mode nil)
         (message "Kitty graphics: terminal not supported"))
     (kitty-gfx--log "mode: disabling")
     (kitty-gfx--uninstall-hooks)
     (kitty-gfx--uninstall-integrations)
-    (kitty-gfx--delete-all-images)
+    (when kitty-gfx--active-backend
+      (funcall (kitty-gfx--backend-fn 'cleanup-all)))
     (when kitty-gfx--render-timer
       (cancel-timer kitty-gfx--render-timer))
     (setq kitty-gfx--render-timer nil
-          kitty-gfx--refresh-pending nil)
+          kitty-gfx--refresh-pending nil
+          kitty-gfx--active-backend nil)
     (kitty-gfx--log "mode: disabled")))
 
 (defun kitty-gfx--install-hooks ()
@@ -947,7 +1209,7 @@ Deletes image placements from the terminal, clears position caches,
 then schedules a refresh that re-places only the overlays that are
 still visible (not inside a fold)."
   (kitty-gfx--log "on-org-cycle: overlays=%d" (length kitty-gfx--overlays))
-  (when (and kitty-graphics-mode kitty-gfx--overlays)
+  (when (and kitty-graphics-mode kitty-gfx--overlays kitty-gfx--active-backend)
     (kitty-gfx--sync-begin)
     (unwind-protect
         (dolist (ov kitty-gfx--overlays)
@@ -955,7 +1217,7 @@ still visible (not inside a fold)."
             (let ((id (overlay-get ov 'kitty-gfx-id))
                   (pid (overlay-get ov 'kitty-gfx-pid)))
               (when (and id pid)
-                (kitty-gfx--delete-placement id pid)))
+                (funcall (kitty-gfx--backend-fn 'delete) ov id pid)))
             (overlay-put ov 'kitty-gfx-last-row nil)
             (overlay-put ov 'kitty-gfx-last-col nil)))
       (kitty-gfx--sync-end))
@@ -994,7 +1256,7 @@ Scans for file:, attachment:, and relative path links."
                               ((string= link-type "attachment")
                                (ignore-errors
                                  (require 'org-attach)
-                                 (when-let ((dir (org-attach-dir)))
+                                 (when-let* ((dir (org-attach-dir)))
                                    (expand-file-name path dir))))
                               (t path))))
                   (when (and file
@@ -1114,7 +1376,7 @@ image via Kitty graphics instead of an Emacs image spec."
           (kitty-gfx-display-image movefile beg end)
           ;; Tag the most recently created overlay with org properties
           ;; so org-clear-latex-preview can find and clean it up.
-          (when-let ((ov (car kitty-gfx--overlays)))
+          (when-let* ((ov (car kitty-gfx--overlays)))
             (overlay-put ov 'org-overlay-type 'org-latex-overlay)
             (overlay-put ov 'modification-hooks
                          (list (lambda (o after &rest _)
@@ -1140,7 +1402,7 @@ Values > 1.0 zoom in, < 1.0 zoom out.")
 
 (defun kitty-gfx--image-mode-render ()
   "Render the current image file centered at current scale."
-  (when-let ((file (buffer-file-name)))
+  (when-let* ((file (buffer-file-name)))
     (when (kitty-gfx--image-file-p file)
       (let* ((inhibit-read-only t)
              (win-w (- (window-body-width) 2))
@@ -1392,7 +1654,7 @@ FILE is the file to preview, PREVIEW-WINDOW is the target window.
 Returns a buffer recipe, or nil if not in terminal or not an image."
   (when (and kitty-graphics-mode
              (not (display-graphic-p))
-             (kitty-gfx--supported-p))
+             kitty-gfx--active-backend)
     (kitty-gfx--log "dirvish-preview: %s" file)
     (let* ((buf-name (format " *kitty-dirvish: %s*" (file-name-nondirectory file)))
            (buf (get-buffer-create buf-name))
@@ -1584,19 +1846,21 @@ and image-mode simultaneously)."
         (condition-case nil
             (let ((id (overlay-get ov 'kitty-gfx-id))
                   (pid (overlay-get ov 'kitty-gfx-pid)))
-              (when (and id pid)
+              (when (and id pid kitty-gfx--active-backend)
                 ;; Always delete the placement (it's buffer-specific)
-                (kitty-gfx--delete-placement id pid))
+                (funcall (kitty-gfx--backend-fn 'delete) ov id pid))
               ;; Only delete the image data if no other buffer uses it
               (when (and id (not (memq id deleted-ids)))
                 (if (kitty-gfx--image-id-in-other-buffers-p id)
                     (kitty-gfx--log "kill-buffer-hook: id=%d still used in other buffers, keeping" id)
-                  (kitty-gfx--delete-by-id id)
                   (push id deleted-ids))))
           (error nil)))
       ;; Remove cache entries only for IDs we actually deleted
       (when deleted-ids
         (kitty-gfx--log "kill-buffer-hook: cleaning cache for ids=%S" deleted-ids)
+        (when kitty-gfx--active-backend
+          (dolist (id deleted-ids)
+            (funcall (kitty-gfx--backend-fn 'cleanup) nil id)))
         (maphash (lambda (file id)
                    (when (memq id deleted-ids)
                      (kitty-gfx--cache-remove file)))
