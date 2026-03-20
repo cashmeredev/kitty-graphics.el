@@ -1,7 +1,7 @@
 #+TITLE: kitty-graphics.el
 #+AUTHOR: cashmere
 
-Display images in terminal Emacs (~emacs -nw~) using the [[https://sw.kovidgoyal.net/kitty/graphics-protocol/][Kitty graphics protocol]].
+Display images in terminal Emacs (~emacs -nw~) using the [[https://sw.kovidgoyal.net/kitty/graphics-protocol/][Kitty graphics protocol]] or [[https://en.wikipedia.org/wiki/Sixel][Sixel]].
 
 * Demo
 
@@ -17,11 +17,16 @@ Besides, I don't even have the guts to release it, even though my intention of s
 
 * Overview
 
-~kitty-graphics.el~ renders images directly in terminal Emacs using Kitty's
-graphics protocol with direct placements. Images are transmitted once to the
-terminal, then positioned at overlay screen coordinates after each redisplay.
-They scroll with text, survive buffer switches, and work in split windows ---
-they're managed as overlays in Emacs's display engine.
+~kitty-graphics.el~ renders images directly in terminal Emacs using either the
+Kitty graphics protocol or Sixel, selected automatically at startup. The backend
+dispatch tries Kitty first (fast ~KITTY_PID~ env check), then probes for Sixel
+support, so the package works across ~20+ terminals without configuration.
+
+With the Kitty backend, images are transmitted once and positioned via direct
+placements at overlay screen coordinates after each redisplay. The Sixel backend
+encodes images via ImageMagick and re-emits them on scroll. Both backends
+integrate with Emacs's overlay display engine --- images scroll with text,
+survive buffer switches, and work in split windows.
 
 Integrations are provided for:
 - *org-mode* --- inline images via =C-c C-x C-v= (both =org-toggle-inline-images= and =org-link-preview= for org 10.0+)
@@ -35,8 +40,10 @@ Integrations are provided for:
 * Requirements
 
 - Emacs >= 27.1
-- [[https://sw.kovidgoyal.net/kitty/][Kitty]] >= 0.20.0 (or WezTerm/Ghostty with direct placement support)
-- ImageMagick (~magick~ / ~convert~ / ~identify~) for non-PNG formats and image sizing
+- A supported terminal:
+  - *Kitty backend*: [[https://sw.kovidgoyal.net/kitty/][Kitty]] >= 0.20.0, WezTerm, or Ghostty
+  - *Sixel backend*: foot, Konsole, xterm (with ~+sixel~), mlterm, mintty, VS Code Terminal, and others with Sixel support
+- ImageMagick (~magick~ / ~convert~ / ~identify~) --- required for Sixel, and for non-PNG formats on Kitty
 - For LaTeX preview: a TeX distribution with ~dvipng~ (e.g. ~texlive~)
 - For doc-view: ~ghostscript~ (for PDF), ~dvipng~ (for DVI) --- same tools as GUI Emacs
 - Launch Emacs with ~TERM=xterm-256color~ (Emacs often can't find the ~xterm-kitty~ terminfo)
@@ -52,7 +59,7 @@ Integrations are provided for:
 #+begin_src emacs-lisp
 (use-package kitty-graphics
   :straight (:local-repo "~/projects/kitty-graphics")
-  :if (and (not (display-graphic-p)) (getenv "KITTY_PID"))
+  :if (not (display-graphic-p))
   :config
   (kitty-graphics-mode 1))
 #+end_src
@@ -62,7 +69,7 @@ Integrations are provided for:
 #+begin_src emacs-lisp
 (add-to-list 'load-path "~/projects/kitty-graphics")
 (require 'kitty-graphics)
-(when (and (not (display-graphic-p)) (getenv "KITTY_PID"))
+(when (not (display-graphic-p))
   (kitty-graphics-mode 1))
 #+end_src
 
@@ -95,28 +102,33 @@ Then:
 
 ** Customization
 
-| Variable               | Default | Description                              |
-|------------------------+---------+------------------------------------------|
-| ~kitty-gfx-max-width~    |     120 | Maximum inline image width in columns    |
-| ~kitty-gfx-max-height~   |      40 | Maximum inline image height in rows      |
-| ~kitty-gfx-render-delay~ |   0.016 | Debounce delay for re-rendering (s)      |
-| ~kitty-gfx-debug~        |     nil | Log debug info to ~/tmp/kitty-gfx.log~     |
+| Variable                       | Default | Description                              |
+|--------------------------------+---------+------------------------------------------|
+| ~kitty-gfx-preferred-protocol~  |    auto | Graphics protocol: auto, kitty, or sixel |
+| ~kitty-gfx-max-width~            |     120 | Maximum inline image width in columns    |
+| ~kitty-gfx-max-height~           |      40 | Maximum inline image height in rows      |
+| ~kitty-gfx-render-delay~         |   0.016 | Debounce delay for re-rendering (s)      |
+| ~kitty-gfx-debug~                |     nil | Log debug info to ~/tmp/kitty-gfx.log~     |
 
 These defaults control inline image sizing (org-mode, eww, dired previews).
 Doc-view ignores these and fills the window, with =+= / =-= / =0= for zoom.
 
 * How It Works
 
-1. On startup, cell pixel size is queried via ~CSI 16 t~ (XTWINOPS) for
-   accurate image scaling. Falls back to 8x16 if the query times out.
-2. Image data is transmitted once via APC escape sequences (~a=t~, store only)
-3. Overlays with a ~display~ property reserve blank space in Emacs buffers
-4. After each redisplay, direct placements (~a=p~) are emitted via
-   ~send-string-to-terminal~ at the overlay's screen coordinates
-5. All placement output is wrapped in synchronized output (~BSU/ESU~,
-   =DEC mode 2026=) to prevent partial rendering and flicker
-6. Each placement uses a unique placement ID (~p=PID~) so re-placements
-   at new positions replace the old rendering without accumulation
+1. On startup, backend dispatch selects a protocol: if ~kitty-gfx-preferred-protocol~
+   is ~auto~, it checks for Kitty (via ~KITTY_PID~), then probes Sixel via a DA1
+   query. The mode-line shows ~[K]~, ~[S]~, or ~[?]~ to indicate the active backend.
+2. Cell pixel size is queried via ~CSI 16 t~ (XTWINOPS) for accurate image
+   scaling. Falls back to 8x16 if the query times out.
+3. *Kitty path*: image data is transmitted once via APC escape sequences (~a=t~,
+   store only). Direct placements (~a=p~) position the image at overlay screen
+   coordinates after each redisplay, using unique placement IDs (~p=PID~).
+4. *Sixel path*: images are encoded to Sixel via ImageMagick and emitted
+   directly at overlay screen coordinates. Since Sixel is stateless, images
+   are re-emitted whenever they scroll to a new position.
+5. Overlays with a ~display~ property reserve blank space in Emacs buffers
+6. All output is wrapped in synchronized output (~BSU/ESU~, =DEC mode 2026=)
+   to prevent partial rendering and flicker
 7. Position caching skips redundant re-placements when nothing moved
 8. Placements are deleted when overlays scroll out of view
 
@@ -127,10 +139,10 @@ TIFF, BMP) are converted to PNG via ImageMagick before transmission.
 
 * Known Limitations
 
-- No tmux support 
-- Primary focus on kitty terminal. While other terminals should work too, I wont give any guarantee
+- No tmux support (neither Kitty passthrough nor Sixel)
 - Animated GIFs display only the first frame
-- Without ImageMagick, only PNG files work and image sizing falls back to a fixed default
+- Sixel is limited to 256 colors (vs truecolor on Kitty) and is stateless --- images are re-emitted on every scroll, which may be slower on large images
+- Without ImageMagick, only PNG files work on the Kitty backend; the Sixel backend requires ImageMagick unconditionally
 - Doc-view page may briefly flash at wrong position before centering on initial load
 
 * License
