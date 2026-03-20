@@ -3,7 +3,7 @@
 ;; Copyright (C) 2025-2026
 ;;
 ;; Author: cashmere
-;; Version: 0.2.1
+;; Version: 0.3.0
 ;; URL: https://github.com/cashmeredev/kitty-graphics.el
 ;; Keywords: terminals, images, multimedia
 ;; Package-Requires: ((emacs "27.1"))
