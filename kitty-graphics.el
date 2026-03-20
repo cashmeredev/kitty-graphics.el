@@ -104,11 +104,21 @@ This debounces rapid redisplay events.  Default is ~1 frame at 60fps."
   "File path for debug log output.")
 
 (defun kitty-gfx--log (fmt &rest args)
-  "Log to `kitty-gfx--log-file' when `kitty-gfx-debug' is non-nil."
+  "Log to `kitty-gfx--log-file' and *kitty-gfx-debug* buffer when debug is on."
   (when kitty-gfx-debug
     (let ((msg (concat (format-time-string "%H:%M:%S.%3N ")
                        (apply #'format fmt args) "\n")))
-      (ignore-errors (append-to-file msg nil kitty-gfx--log-file)))))
+      (ignore-errors (append-to-file msg nil kitty-gfx--log-file))
+      (ignore-errors
+        (let ((buf (get-buffer-create "*kitty-gfx-debug*")))
+          (with-current-buffer buf
+            (goto-char (point-max))
+            (insert msg)
+            ;; Trim buffer at 2500 lines
+            (when (> (line-number-at-pos (point-max)) 2500)
+              (goto-char (point-min))
+              (forward-line 500)
+              (delete-region (point-min) (point)))))))))
 
 ;;;; Constants — kept for reference if switching back to Unicode placeholders
 ;; (defconst kitty-gfx--placeholder-char #x10EEEE)
@@ -412,7 +422,8 @@ OV is the overlay (unused by Kitty backend but part of the interface)."
          (supported (and term
                          (not in-tmux)  ; Sixel doesn't work in tmux
                          (or (string-match-p "xterm\\|vt[0-9]" term)
-                             (member term-prog '("foot" "Konsole" "mintty" "mlterm"))))))
+                             (member term-prog '("foot" "Konsole" "mintty" "mlterm")))
+                         t)))
     (kitty-gfx--log "sixel-detect: %s (TERM=%s TERM_PROGRAM=%s TMUX=%s)"
                      supported term term-prog (if in-tmux "yes" "no"))
     supported))
@@ -437,16 +448,15 @@ Computes pixel dimensions from cell size."
           (kitty-gfx--log "sixel-encode: no ImageMagick, cannot encode")
           (message "kitty-gfx: Sixel backend requires ImageMagick")
           nil)
+      (when (string-suffix-p "convert" convert)
+        (kitty-gfx--log "sixel-encode: WARNING deprecated `convert' binary resolved: %s (use `magick' instead)" convert))
       (kitty-gfx--log "sixel-encode: %s -> %dx%d pixels via %s"
                        png-file pixel-w pixel-h convert)
       (with-temp-buffer
-        (let* ((args (if (string-suffix-p "magick" convert)
-                         (list convert nil t nil "convert"
-                               png-file "-geometry" (format "%dx%d" pixel-w pixel-h)
-                               "sixel:-")
-                       (list convert nil t nil
-                             png-file "-geometry" (format "%dx%d" pixel-w pixel-h)
-                             "sixel:-")))
+        (set-buffer-multibyte nil)
+        (let* ((args (list convert nil '(t nil) nil
+                           png-file "-geometry" (format "%dx%d" pixel-w pixel-h)
+                           "sixel:-"))
                (exit-code (apply #'call-process args)))
           (if (zerop exit-code)
               (let ((data (buffer-string)))
@@ -496,7 +506,10 @@ Encodes on-demand if not cached, then emits DCS sequence."
         (push cache-path kitty-gfx--sixel-temp-files)))
       ;; Emit Sixel sequence if we have data
       (when sixel-data
-        (kitty-gfx--log "sixel-place: emitting at row=%d col=%d" term-row term-col)
+        (let* ((cw (or kitty-gfx--cell-pixel-width 8))
+               (ch (or kitty-gfx--cell-pixel-height 16)))
+          (kitty-gfx--log "sixel-place: emitting at row=%d col=%d data-len=%d pixel-target=%dx%d"
+                          term-row term-col (length sixel-data) (* cols cw) (* rows ch)))
         (ignore-errors
           (send-string-to-terminal
            (format "\e7\e[%d;%dH%s\e8" term-row term-col sixel-data)))))))
@@ -601,31 +614,23 @@ the window's scroll range."
                ;; (outline, org-fold, etc.) but allow cosmetic invisibility
                ;; like org-link bracket hiding.
                (not (kitty-gfx--in-folded-region-p pos)))
-      (let* ((edges (window-edges win))
-             (win-top (nth 1 edges))
-             (win-left (nth 0 edges))
+      ;; posn-col-row returns coordinates relative to the window BODY
+      ;; (text area).  Use window-body-edges to convert to frame coords.
+      ;; body-left accounts for margins/fringes; body-top accounts for
+      ;; header-line.  +1 converts 0-based frame coords to 1-based terminal.
+      (let* ((body (window-body-edges win))
+             (body-left (nth 0 body))
+             (body-top (nth 1 body))
              (win-pos (posn-at-point pos win)))
         (when win-pos
           (let* ((col-row (posn-col-row win-pos))
                  (row (cdr col-row))
                  (posn-col (car col-row))
-                 (body-left (nth 0 (window-body-edges win)))
-                 (buf-col (with-current-buffer buf
-                            (save-excursion
-                              (goto-char pos)
-                              (current-column))))
-                 ;; posn-col-row is correct for most overlays (includes
-                 ;; line numbers, margins).  But overlays with display
-                 ;; properties wider than the underlying text inflate
-                 ;; posn-col.  Detect this: if posn-col minus buf-col
-                 ;; exceeds a reasonable gutter width, it's inflated —
-                 ;; fall back to body-left + buf-col.
-                 (col (if (> (- posn-col buf-col)
-                             (- body-left win-left))
-                          (+ body-left buf-col)
-                        (+ win-left posn-col))))
+                 (posn-xy (posn-x-y win-pos)))
+            (kitty-gfx--log "screen-pos-detail: pid=%s posn-col=%d posn-row=%d posn-xy=%S body-left=%d body-top=%d"
+                            (overlay-get ov 'kitty-gfx-pid) posn-col row posn-xy body-left body-top)
             (when col-row
-              (let ((result (cons (+ win-top row 1) (1+ col))))
+              (let ((result (cons (+ body-top row 1) (+ body-left posn-col 1))))
                 (kitty-gfx--log "screen-pos: pid=%s pos=%d -> row=%d col=%d"
                                 (overlay-get ov 'kitty-gfx-pid) pos
                                 (car result) (cdr result))
@@ -642,6 +647,10 @@ Deletes placements for overlays that scrolled out of view.
 All terminal output is wrapped in synchronized output (BSU/ESU)
 to prevent flicker."
   (when (and kitty-graphics-mode (not (display-graphic-p)))
+    ;; Force redisplay so posn-at-point sees up-to-date pixel positions
+    ;; after display property changes (e.g., org-toggle-inline-images
+    ;; creating multi-line blank overlays).
+    (redisplay t)
     ;; Re-query cell size if invalidated (e.g., after terminal resize)
     (unless (and kitty-gfx--cell-pixel-width kitty-gfx--cell-pixel-height)
       (kitty-gfx--query-cell-size))
@@ -760,6 +769,8 @@ then invalidates position caches and schedules a refresh."
   (let ((visible-bufs nil))
     (walk-windows (lambda (w) (push (window-buffer w) visible-bufs))
                   nil 'visible)
+    (kitty-gfx--log "on-buffer-change: visible-bufs=(%s)"
+                    (mapconcat #'buffer-name visible-bufs ", "))
     ;; Delete placements for buffers that are no longer in any window
     (dolist (buf (buffer-list))
       (with-current-buffer buf
@@ -771,8 +782,10 @@ then invalidates position caches and schedules a refresh."
             (when (overlay-buffer ov)
               (let ((id (overlay-get ov 'kitty-gfx-id))
                     (pid (overlay-get ov 'kitty-gfx-pid)))
-                (when (and id pid (overlay-get ov 'kitty-gfx-last-row))
-                  (kitty-gfx--delete-placement id pid)))
+                (if (overlay-get ov 'kitty-gfx-last-row)
+                    (when (and id pid)
+                      (kitty-gfx--delete-placement id pid))
+                  (kitty-gfx--log "on-buffer-change: ov pid=%s has no last-row (never placed or already cleaned)" pid)))
               (overlay-put ov 'kitty-gfx-last-row nil)
               (overlay-put ov 'kitty-gfx-last-col nil)))))))
   ;; Reset cache for visible buffers so they re-place correctly.
@@ -842,14 +855,16 @@ buffer before settling to one)."
 
 (defun kitty-gfx--image-pixel-size (file)
   "Return (WIDTH . HEIGHT) in pixels for image FILE, or nil."
-  (let ((identify (or (executable-find "identify")
-                      (executable-find "magick"))))
+  (let ((identify (or (executable-find "magick")
+                      (executable-find "identify"))))
     (when identify
+      (when (string-suffix-p "identify" identify)
+        (kitty-gfx--log "image-pixel-size: WARNING deprecated `identify' binary resolved: %s (use `magick' instead)" identify))
       (with-temp-buffer
         (let ((args (if (string-suffix-p "magick" identify)
-                        (list identify nil t nil "identify" "-format" "%w %h"
+                        (list identify nil '(t nil) nil "identify" "-format" "%w %h"
                               (concat file "[0]"))  ; first frame only
-                      (list identify nil t nil "-format" "%w %h"
+                      (list identify nil '(t nil) nil "-format" "%w %h"
                             (concat file "[0]")))))
           (let ((exit-code (apply #'call-process args)))
             (kitty-gfx--log "identify: exit=%d output=%S" exit-code (buffer-string))
@@ -881,9 +896,7 @@ conversion fails — callers must handle nil gracefully."
         (let ((out (make-temp-file "kitty-gfx-" nil ".png")))
           (kitty-gfx--log "convert-to-png: %s -> %s via %s" file out convert)
           (let ((exit-code
-                 (if (string-suffix-p "magick" convert)
-                     (call-process convert nil nil nil "convert" file out)
-                   (call-process convert nil nil nil file out))))
+                 (call-process convert nil nil nil file out)))
             (kitty-gfx--log "convert-to-png: exit-code=%s" exit-code)
             ;; Check that conversion produced a non-empty file
             (if (and (file-exists-p out)
@@ -1143,6 +1156,117 @@ The buffer should be writable (caller handles `inhibit-read-only')."
   (setq kitty-gfx--next-id 1)
   (setq kitty-gfx--next-placement-id 1)
   (kitty-gfx--log "clear-all: done (reset IDs to 1)"))
+
+;;;; Debug commands
+
+(defun kitty-gfx-debug-state ()
+  "Dump all critical kitty-gfx state to *kitty-gfx-debug-state* buffer."
+  (interactive)
+  (let ((buf (get-buffer-create "*kitty-gfx-debug-state*")))
+    (with-current-buffer buf
+      (erase-buffer)
+      (insert "=== kitty-gfx debug state ===\n")
+      (insert (format "Timestamp: %s\n" (format-time-string "%Y-%m-%d %H:%M:%S.%3N")))
+      (insert (format "Backend: %s\n" kitty-gfx--active-backend))
+      (insert (format "Cell pixel size: %sx%s\n"
+                      kitty-gfx--cell-pixel-width kitty-gfx--cell-pixel-height))
+      (insert (format "ImageMagick: magick=%s convert=%s identify=%s\n"
+                      (executable-find "magick")
+                      (executable-find "convert")
+                      (executable-find "identify")))
+      (insert (format "Next ID: %d  Next PID: %d\n"
+                      kitty-gfx--next-id kitty-gfx--next-placement-id))
+      (insert "\n--- Windows ---\n")
+      (walk-windows
+       (lambda (win)
+         (let ((edges (window-edges win))
+               (body (window-body-edges win)))
+           (insert (format "  win=%s buf=%s edges=%S body=%S size=%dx%d\n"
+                           win (buffer-name (window-buffer win))
+                           edges body
+                           (window-body-width win) (window-body-height win)))))
+       nil 'visible)
+      (insert "\n--- Overlays ---\n")
+      (let ((count 0))
+        (dolist (b (buffer-list))
+          (let ((ovs (buffer-local-value 'kitty-gfx--overlays b)))
+            (when ovs
+              (dolist (ov ovs)
+                (cl-incf count)
+                (let ((alive (not (null (overlay-buffer ov)))))
+                  (insert (format "  [%d] buf=%s alive=%s id=%s pid=%s cols=%s rows=%s\n"
+                                  count (buffer-name b) alive
+                                  (overlay-get ov 'kitty-gfx-id)
+                                  (overlay-get ov 'kitty-gfx-pid)
+                                  (overlay-get ov 'kitty-gfx-cols)
+                                  (overlay-get ov 'kitty-gfx-rows)))
+                  (insert (format "       file=%s\n"
+                                  (overlay-get ov 'kitty-gfx-file)))
+                  (insert (format "       buf-pos=%s-%s last-row=%s last-col=%s\n"
+                                  (and alive (overlay-start ov))
+                                  (and alive (overlay-end ov))
+                                  (overlay-get ov 'kitty-gfx-last-row)
+                                  (overlay-get ov 'kitty-gfx-last-col)))
+                  (when alive
+                    (let ((screen-pos (kitty-gfx--overlay-screen-pos ov)))
+                      (insert (format "       computed-screen-pos=%S\n" screen-pos)))))))))
+        (insert (format "\nTotal overlays: %d\n" count)))
+      (insert "\n--- Image cache ---\n")
+      (insert (format "  entries=%d lru-len=%d\n"
+                      (hash-table-count kitty-gfx--image-cache)
+                      (length kitty-gfx--cache-lru)))
+      (maphash (lambda (k v) (insert (format "  %s -> %s\n" k v)))
+               kitty-gfx--image-cache)
+      (insert "\n--- Sixel cache ---\n")
+      (insert (format "  entries=%d\n" (hash-table-count kitty-gfx--sixel-cache)))
+      (maphash (lambda (k v) (insert (format "  %s -> %s\n" k v)))
+               kitty-gfx--sixel-cache))
+    (display-buffer buf)
+    (message "kitty-gfx: debug state dumped to *kitty-gfx-debug-state*")))
+
+(defun kitty-gfx-debug-overlay-at-point ()
+  "Show deep debug info for the kitty-gfx overlay at point."
+  (interactive)
+  (let ((found nil))
+    (dolist (ov (overlays-at (point)))
+      (when (overlay-get ov 'kitty-gfx-id)
+        (setq found ov)))
+    (if (not found)
+        (message "kitty-gfx: no overlay at point")
+      (let* ((id (overlay-get found 'kitty-gfx-id))
+             (pid (overlay-get found 'kitty-gfx-pid))
+             (cols (overlay-get found 'kitty-gfx-cols))
+             (rows (overlay-get found 'kitty-gfx-rows))
+             (file (overlay-get found 'kitty-gfx-file))
+             (cw (or kitty-gfx--cell-pixel-width 8))
+             (ch (or kitty-gfx--cell-pixel-height 16))
+             (pixel-w (* (or cols 0) cw))
+             (pixel-h (* (or rows 0) ch))
+             (last-row (overlay-get found 'kitty-gfx-last-row))
+             (last-col (overlay-get found 'kitty-gfx-last-col))
+             (pos (overlay-start found))
+             (win (selected-window))
+             (win-pos (and pos (posn-at-point pos win)))
+             (col-row (and win-pos (posn-col-row win-pos)))
+             (edges (window-edges win))
+             (body-edges (window-body-edges win))
+             (buf-col (save-excursion
+                        (goto-char pos)
+                        (current-column)))
+             (screen-pos (kitty-gfx--overlay-screen-pos found))
+             (disp-prop (overlay-get found 'display))
+             (disp-len (if (stringp disp-prop) (length disp-prop) nil)))
+        (message (concat
+                  "kitty-gfx overlay: id=%s pid=%s file=%s\n"
+                  "  cols=%s rows=%s cell=%dx%d pixel=%dx%d\n"
+                  "  posn-col-row=%S win-edges=%S body-edges=%S buf-col=%d\n"
+                  "  computed-screen-pos=%S last-row=%s last-col=%s\n"
+                  "  display-prop-len=%s")
+                 id pid file
+                 cols rows cw ch pixel-w pixel-h
+                 col-row edges body-edges buf-col
+                 screen-pos last-row last-col
+                 disp-len)))))
 
 ;;;; Minor mode
 
