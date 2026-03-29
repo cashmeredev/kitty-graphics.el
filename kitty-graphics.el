@@ -1896,23 +1896,52 @@ the terminal supports text sizing."
              (not (display-graphic-p)))
     (kitty-gfx--org-apply-heading-sizes)))
 
+(defun kitty-gfx--nuke-headings ()
+  "Erase all heading multicell blocks in the current buffer.
+The `nuke' phase of nuke-and-repaint: erases every heading overlay's
+multicell block at its cached terminal position, then clears the
+cache.  The subsequent refresh cycle handles the `repaint' phase,
+re-emitting OSC 66 only for headings that are still visible
+\(not inside a fold)."
+  (let ((count 0))
+    (dolist (ov kitty-gfx--overlays)
+      (when (and (overlay-get ov 'kitty-gfx-heading)
+                 (overlay-buffer ov)
+                 (overlay-get ov 'kitty-gfx-last-row))
+        (kitty-gfx--erase-heading ov)
+        (overlay-put ov 'kitty-gfx-last-row nil)
+        (overlay-put ov 'kitty-gfx-last-col nil)
+        (cl-incf count)))
+    (when (> count 0)
+      (kitty-gfx--log "nuke-headings: erased %d heading blocks" count))
+    count))
+
 (defun kitty-gfx--on-org-cycle (&rest _args)
   "Handle org visibility cycling.
-Deletes image placements from the terminal, clears position caches,
-then schedules a refresh that re-places only the overlays that are
-still visible (not inside a fold)."
+Deletes image placements and erases heading multicell blocks from
+the terminal, clears position caches, then schedules a refresh
+that re-places only the overlays that are still visible (not
+inside a fold).  Heading overlays use nuke-and-repaint: erase all,
+then let the refresh cycle re-emit the visible ones."
   (kitty-gfx--log "on-org-cycle: overlays=%d" (length kitty-gfx--overlays))
-  (when (and kitty-graphics-mode kitty-gfx--overlays kitty-gfx--active-backend)
+  (when (and kitty-graphics-mode kitty-gfx--overlays)
     (kitty-gfx--sync-begin)
     (unwind-protect
         (dolist (ov kitty-gfx--overlays)
           (when (overlay-buffer ov)
-            (let ((id (overlay-get ov 'kitty-gfx-id))
-                  (pid (overlay-get ov 'kitty-gfx-pid)))
-              (when (and id pid)
-                (funcall (kitty-gfx--backend-fn 'delete) ov id pid)))
-            (overlay-put ov 'kitty-gfx-last-row nil)
-            (overlay-put ov 'kitty-gfx-last-col nil)))
+            (if (overlay-get ov 'kitty-gfx-heading)
+                ;; Heading overlay — erase multicell block (nuke phase)
+                (when (overlay-get ov 'kitty-gfx-last-row)
+                  (kitty-gfx--erase-heading ov)
+                  (overlay-put ov 'kitty-gfx-last-row nil)
+                  (overlay-put ov 'kitty-gfx-last-col nil))
+              ;; Image overlay — delete terminal placement
+              (let ((id (overlay-get ov 'kitty-gfx-id))
+                    (pid (overlay-get ov 'kitty-gfx-pid)))
+                (when (and id pid kitty-gfx--active-backend)
+                  (funcall (kitty-gfx--backend-fn 'delete) ov id pid)))
+              (overlay-put ov 'kitty-gfx-last-row nil)
+              (overlay-put ov 'kitty-gfx-last-col nil))))
       (kitty-gfx--sync-end))
     (kitty-gfx--schedule-refresh)))
 
