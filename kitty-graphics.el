@@ -1271,8 +1271,15 @@ avoid posn-at-point redraws destroying freshly-placed blocks."
         (last-col (overlay-get ov 'kitty-gfx-last-col)))
     (if (and pos
              (<= (car pos) win-bottom)
-             (<= (+ (car pos) rows -1) win-bottom))
-        ;; Visible — erase old position if moved, cache new position
+             (<= (+ (car pos) rows -1) win-bottom)
+             ;; Guard: org headings always start at column 1 (buffer
+             ;; line beginning).  If posn-at-point reports col > 1,
+             ;; the heading is visually mid-line due to org fold
+             ;; collapsing newlines between headings (S-TAB overview
+             ;; mode).  Skip rendering — placing a scaled heading
+             ;; mid-line overlaps with fold ellipsis and other headings.
+             (= (cdr pos) 1))
+        ;; Visible at column 1 — erase old position if moved, cache new
         (let ((new-row (car pos))
               (new-col (cdr pos)))
           (when (and last-row
