@@ -630,7 +630,16 @@ Encodes on-demand if not cached, then emits DCS sequence."
           (with-temp-file cache-path
             (set-buffer-multibyte nil)
             (insert sixel-data)))
-        (push cache-path kitty-gfx--sixel-temp-files)))
+        (push cache-path kitty-gfx--sixel-temp-files)
+        ;; LRU eviction: cap temp files at kitty-gfx-cache-size
+        (when (> (length kitty-gfx--sixel-temp-files) kitty-gfx-cache-size)
+          (let ((victim (car (last kitty-gfx--sixel-temp-files))))
+            (kitty-gfx--log "sixel-cache-evict: %s (count=%d max=%d)"
+                            victim (length kitty-gfx--sixel-temp-files)
+                            kitty-gfx-cache-size)
+            (ignore-errors (delete-file victim))
+            (setq kitty-gfx--sixel-temp-files
+                  (butlast kitty-gfx--sixel-temp-files))))))
       ;; Emit Sixel sequence if we have data
       (when sixel-data
         (let* ((cw (or kitty-gfx--cell-pixel-width 8))
@@ -669,9 +678,21 @@ Sixel has no placement IDs — erase by writing spaces over the region."
       (setq kitty-gfx--sixel-temp-files (delete temp-file kitty-gfx--sixel-temp-files)))))
 
 (defun kitty-gfx--sixel-cleanup-all ()
-  "Cleanup all Sixel resources."
+  "Cleanup all Sixel resources.
+Erases visible Sixel images from the terminal before cleaning
+disk/memory state, preventing pixel artifacts on mode disable."
   (kitty-gfx--log "sixel-cleanup-all: deleting %d temp files"
                    (length kitty-gfx--sixel-temp-files))
+  ;; Erase visible images from terminal (Sixel has no protocol-level
+  ;; delete — must overwrite cells with spaces).
+  (dolist (buf (buffer-list))
+    (with-current-buffer buf
+      (dolist (ov kitty-gfx--overlays)
+        (when (and (overlay-buffer ov)
+                   (not (overlay-get ov 'kitty-gfx-heading))
+                   (overlay-get ov 'kitty-gfx-last-row))
+          (funcall #'kitty-gfx--sixel-delete ov nil nil)))))
+  ;; Clean disk cache
   (dolist (temp-file kitty-gfx--sixel-temp-files)
     (ignore-errors (delete-file temp-file)))
   (setq kitty-gfx--sixel-temp-files nil)
@@ -2097,8 +2118,9 @@ With prefix ARG \\[universal-argument], clear previews."
 (defun kitty-gfx--org-latex-preview-advice (orig-fn &optional arg beg end)
   "Around advice for `org-latex-preview'.
 Bypasses org's `display-graphic-p' guard so LaTeX fragments are
-rendered to images via dvipng/dvisvgm and displayed via Kitty
-graphics.  The image generation pipeline does not require a GUI."
+rendered to images via dvipng/dvisvgm and displayed via
+kitty-graphics (works with both Kitty and Sixel backends).
+The image generation pipeline does not require a GUI."
   (if (and kitty-graphics-mode (not (display-graphic-p)))
       (cond
        ;; C-u = clear previews in region/subtree
@@ -2219,7 +2241,9 @@ Values > 1.0 zoom in, < 1.0 zoom out.")
         ;; image-mode bindings (which call native image functions
         ;; that fail in terminal) don't override our keymap.
         (setq major-mode 'kitty-gfx-image-mode
-              mode-name "Image[Kitty]")
+              mode-name (format "Image[%s]"
+                                (pcase kitty-gfx--active-backend
+                                  ('kitty "Kitty") ('sixel "Sixel") (_ "GFX"))))
         (let ((map (make-sparse-keymap)))
           (set-keymap-parent map special-mode-map)
           (define-key map (kbd "q") #'kill-current-buffer)
