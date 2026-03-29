@@ -62,6 +62,10 @@
 (defvar org-preview-latex-image-directory)
 (defvar org-format-latex-options)
 (declare-function org-combine-plists "org-macs" (&rest plists))
+(declare-function org-get-heading "org" (&optional no-tags no-todo no-priority no-comment))
+(declare-function org-link-display-format "ol" (s))
+(declare-function org-current-level "org" ())
+(defvar org-heading-regexp)
 (defvar image-mode-map)
 (declare-function markdown-overlays--resolve-image-url "markdown-overlays" (url))
 
@@ -232,6 +236,11 @@ nil means not yet queried.  Possible values after query:
   `scale'  -- full support (s= and w= both work, Kitty >= 0.40.0)
   `width'  -- width-only support (w= works, s= does not)
   `none'   -- no support (terminal ignores OSC 66 entirely)")
+
+(defvar-local kitty-gfx--heading-rescan-timer nil
+  "Timer for debouncing heading re-scans after text edits.
+Prevents queuing redundant `kitty-gfx--org-apply-heading-sizes'
+calls when multiple characters are typed rapidly.")
 
 ;;;; Terminal detection
 
@@ -732,9 +741,10 @@ TEXT is the string payload (max 4096 bytes UTF-8)."
 (defun kitty-gfx--heading-sgr (level)
   "Return SGR escape string for org heading at LEVEL.
 Applies bold + 24-bit foreground color from org-level-N face.
-Falls back to bold-only when color is unavailable."
+Falls back to bold-only when color is unavailable or face undefined."
   (let* ((face (intern (format "org-level-%d" (min level 8))))
-         (fg (face-attribute face :foreground nil t))
+         (fg (and (facep face)
+                  (face-attribute face :foreground nil t)))
          (color (when (and (stringp fg)
                            (not (string-prefix-p "unspecified" fg)))
                   (color-values fg))))
@@ -744,6 +754,43 @@ Falls back to bold-only when color is unavailable."
                 (/ (nth 1 color) 256)
                 (/ (nth 2 color) 256))
       "\e[1m")))
+
+(defun kitty-gfx--place-heading (ov)
+  "Emit OSC 66 to render heading overlay OV at its cached terminal position.
+Reads all needed data from overlay properties.  Emits:
+  save-cursor, move-to-position, SGR-color, OSC-66-payload, SGR-reset, restore-cursor."
+  (let* ((text (overlay-get ov 'kitty-gfx-heading-text))
+         (cell-s (overlay-get ov 'kitty-gfx-heading-cell-s))
+         (frac-n (overlay-get ov 'kitty-gfx-heading-frac-n))
+         (frac-d (overlay-get ov 'kitty-gfx-heading-frac-d))
+         (level (overlay-get ov 'kitty-gfx-heading-level))
+         (row (overlay-get ov 'kitty-gfx-last-row))
+         (col (overlay-get ov 'kitty-gfx-last-col))
+         (sgr (kitty-gfx--heading-sgr level))
+         ;; Build the OSC 66 metadata: s=S, and optionally n=N:d=D
+         (meta (if (and frac-n frac-d (> frac-d 0))
+                   (format "s=%d:n=%d:d=%d" cell-s frac-n frac-d)
+                 (format "s=%d" cell-s))))
+    (kitty-gfx--log "place-heading: L%d row=%d col=%d s=%d n=%d d=%d text=%S"
+                     level row col cell-s frac-n frac-d text)
+    (kitty-gfx--terminal-send
+     (format "\e7\e[%d;%dH%s\e]66;%s;%s\a\e[0m\e8"
+             row col sgr meta text))))
+
+(defun kitty-gfx--erase-heading (ov)
+  "Erase the multicell block of heading overlay OV at its cached position.
+Writes spaces across the heading's column span in the topmost row.
+Per OSC 66 overwrite Rules 2-3, overwriting any topmost-row cell
+erases the entire multicell block."
+  (let ((row (overlay-get ov 'kitty-gfx-last-row))
+        (col (overlay-get ov 'kitty-gfx-last-col))
+        (cols (overlay-get ov 'kitty-gfx-cols)))
+    (when (and row col cols (> cols 0))
+      (kitty-gfx--log "erase-heading: L%d row=%d col=%d cols=%d"
+                       (overlay-get ov 'kitty-gfx-heading-level) row col cols)
+      (kitty-gfx--terminal-send
+       (format "\e7\e[%d;%dH%s\e8"
+               row col (make-string cols ?\s))))))
 
 (defun kitty-gfx-run-self-tests ()
   "Run batch-safe self-tests for kitty-graphics.
@@ -797,7 +844,207 @@ Signals error on failure, prints success message otherwise."
       (cl-assert (kitty-gfx--validate-osc66
                   (nth 0 params) (nth 1 params) (nth 2 params) "test")
                  nil (format "decomposed scale %.1f should validate" scale))))
+  ;; heading-sgr: should return a string (falls back to bold in batch)
+  (let ((sgr (kitty-gfx--heading-sgr 1)))
+    (cl-assert (stringp sgr) nil "heading-sgr should return string")
+    (cl-assert (string-prefix-p "\e[" sgr) nil "heading-sgr should be SGR escape"))
+  ;; make-heading-overlay: creates overlay with correct properties
+  (with-temp-buffer
+    (insert "* Test Heading\nBody text\n")
+    (let* ((kitty-gfx--dry-run t)
+           (ov (kitty-gfx--make-heading-overlay 1 15 "Test Heading" 2.0 1)))
+      (cl-assert (overlay-get ov 'kitty-gfx) nil "overlay should have kitty-gfx")
+      (cl-assert (overlay-get ov 'kitty-gfx-heading) nil "should be heading type")
+      (cl-assert (equal (overlay-get ov 'kitty-gfx-heading-text) "Test Heading")
+                 nil "heading text mismatch")
+      (cl-assert (= (overlay-get ov 'kitty-gfx-heading-scale) 2.0)
+                 nil "heading scale mismatch")
+      (cl-assert (= (overlay-get ov 'kitty-gfx-heading-level) 1)
+                 nil "heading level mismatch")
+      (cl-assert (= (overlay-get ov 'kitty-gfx-heading-cell-s) 2)
+                 nil "cell-s should be 2 for scale 2.0")
+      (cl-assert (= (overlay-get ov 'kitty-gfx-rows) 2)
+                 nil "rows should match cell-s")
+      (cl-assert (stringp (overlay-get ov 'display))
+                 nil "should have display property")
+      (cl-assert (stringp (overlay-get ov 'after-string))
+                 nil "should have after-string for cell-s > 1")
+      (delete-overlay ov)))
+  ;; place-heading: verify escape sequence format in dry-run
+  (with-temp-buffer
+    (insert "* Hello World\nBody\n")
+    (let* ((kitty-gfx--dry-run t)
+           (kitty-gfx-debug t)
+           (ov (kitty-gfx--make-heading-overlay 1 14 "Hello World" 2.0 1)))
+      ;; Simulate cached position (normally set by refresh phase 1)
+      (overlay-put ov 'kitty-gfx-last-row 5)
+      (overlay-put ov 'kitty-gfx-last-col 1)
+      (kitty-gfx--place-heading ov)
+      ;; In dry-run, the escape was logged, not sent — verify overlay
+      ;; properties are intact (the function reads but doesn't modify them)
+      (cl-assert (= (overlay-get ov 'kitty-gfx-last-row) 5)
+                 nil "place-heading should not modify cached position")
+      (delete-overlay ov)))
+  ;; erase-heading: verify it runs without error in dry-run
+  (with-temp-buffer
+    (insert "* Erase Test\nBody\n")
+    (let* ((kitty-gfx--dry-run t)
+           (ov (kitty-gfx--make-heading-overlay 1 13 "Erase Test" 2.0 1)))
+      (overlay-put ov 'kitty-gfx-last-row 3)
+      (overlay-put ov 'kitty-gfx-last-col 1)
+      (kitty-gfx--erase-heading ov)
+      ;; After erase, cached position is still set (caller clears it)
+      (cl-assert (= (overlay-get ov 'kitty-gfx-last-row) 3)
+                 nil "erase-heading should not modify cached position")
+      (delete-overlay ov)))
+  ;; erase-heading: no-op when no cached position
+  (with-temp-buffer
+    (insert "* No Pos\nBody\n")
+    (let* ((kitty-gfx--dry-run t)
+           (ov (kitty-gfx--make-heading-overlay 1 9 "No Pos" 1.5 2)))
+      ;; No cached position — erase should be a no-op
+      (kitty-gfx--erase-heading ov)
+      (cl-assert (null (overlay-get ov 'kitty-gfx-last-row))
+                 nil "erase with no pos should be a no-op")
+      (delete-overlay ov)))
   (message "kitty-gfx: all self-tests passed"))
+
+;;;; Heading overlay management
+
+(defun kitty-gfx--make-heading-overlay (beg end text scale level)
+  "Create overlay from BEG to END for heading TEXT at SCALE.
+LEVEL is the org heading level (1-based).
+SCALE is the visual scale factor (float, e.g., 1.5 for 1.5x).
+Decomposed into OSC 66 parameters (s, n, d).  The cell scale s
+determines the multicell block height (rows).  Vertical space is
+reserved via an `after-string' of (s - 1) newlines.
+
+Does NOT emit any OSC 66 -- that happens during refresh."
+  (let* ((decomposed (kitty-gfx--decompose-scale scale))
+         (cell-s (nth 0 decomposed))
+         (frac-n (nth 1 decomposed))
+         (frac-d (nth 2 decomposed))
+         (rows cell-s)
+         (cols (* (length text) cell-s))
+         (ov (make-overlay beg end nil t nil)))
+    (overlay-put ov 'kitty-gfx t)
+    (overlay-put ov 'kitty-gfx-heading t)
+    (overlay-put ov 'kitty-gfx-heading-text text)
+    (overlay-put ov 'kitty-gfx-heading-scale (float scale))
+    (overlay-put ov 'kitty-gfx-heading-cell-s cell-s)
+    (overlay-put ov 'kitty-gfx-heading-frac-n frac-n)
+    (overlay-put ov 'kitty-gfx-heading-frac-d frac-d)
+    (overlay-put ov 'kitty-gfx-heading-level level)
+    (overlay-put ov 'kitty-gfx-cols cols)
+    (overlay-put ov 'kitty-gfx-rows rows)
+    ;; Replace the heading text with spaces via `display' property.
+    ;; Emacs draws these spaces on the heading's terminal cells.
+    ;; On incremental redraws, Emacs sees "still spaces" and skips
+    ;; the redraw, so our OSC 66 multicell blocks survive.
+    ;; Without this, Emacs redraws the heading markup which
+    ;; destroys multicell blocks via overwrite Rule 3.
+    (overlay-put ov 'display (make-string (- end beg) ?\s))
+    ;; Reserve vertical space: the cell block is `cell-s' rows tall,
+    ;; so we add (cell-s - 1) lines after the heading line.
+    ;; Each line is filled with spaces so Emacs actively draws them
+    ;; during incremental redisplay, naturally clearing ghost
+    ;; multicell fragments via overwrite Rule 3.
+    (when (> cell-s 1)
+      (let ((spaceline (concat (make-string 200 ?\s) "\n")))
+        (overlay-put ov 'after-string
+                     (apply #'concat
+                            (make-list (1- cell-s) spaceline)))))
+    ;; High priority so kitty-gfx overlays win over org-modern etc.
+    (overlay-put ov 'priority 100)
+    ;; Remove overlay when heading text is edited; rescan will
+    ;; re-create it with updated text.
+    (overlay-put ov 'modification-hooks
+                 (list #'kitty-gfx--heading-modified))
+    (overlay-put ov 'insert-in-front-hooks
+                 (list #'kitty-gfx--heading-modified))
+    (push ov kitty-gfx--overlays)
+    (kitty-gfx--log "make-heading-ov: L%d scale=%.2f s=%d n=%d d=%d text=%S beg=%d end=%d"
+                     level (float scale) cell-s frac-n frac-d text beg end)
+    ov))
+
+(defun kitty-gfx--heading-modified (ov after &rest _args)
+  "Modification hook for heading overlays.
+When the heading text is edited (AFTER is non-nil), remove the
+stale overlay and schedule a rescan to re-create it."
+  (when (and after (overlay-buffer ov))
+    (kitty-gfx--log "heading-modified: removing stale overlay at %d"
+                     (overlay-start ov))
+    (kitty-gfx--remove-overlay ov)
+    ;; Debounced rescan — don't re-scan on every keystroke
+    (when kitty-gfx--heading-rescan-timer
+      (cancel-timer kitty-gfx--heading-rescan-timer))
+    (setq kitty-gfx--heading-rescan-timer
+          (run-at-time 0.2 nil
+                       (lambda ()
+                         (setq kitty-gfx--heading-rescan-timer nil)
+                         (when (and kitty-graphics-mode
+                                    (derived-mode-p 'org-mode))
+                           (kitty-gfx--org-apply-heading-sizes)))))))
+
+(defun kitty-gfx--org-apply-heading-sizes (&optional beg end)
+  "Scan org headings in region BEG..END and create scaled overlays.
+Only creates overlays for headings with a scale > 1.0 in
+`kitty-gfx-heading-scales'.  Skips headings that already have
+a kitty-gfx heading overlay."
+  (when (derived-mode-p 'org-mode)
+    (let ((start (or beg (point-min)))
+          (stop (or end (point-max)))
+          (count 0))
+      (kitty-gfx--log "apply-heading-sizes: scanning %d..%d in %s"
+                       start stop (buffer-name))
+      (save-excursion
+        (goto-char start)
+        (while (re-search-forward org-heading-regexp stop t)
+          (let* ((level (org-current-level))
+                 (scale (alist-get level kitty-gfx-heading-scales))
+                 (line-beg (line-beginning-position))
+                 (line-end (line-end-position)))
+            (when (and scale (> scale 1.0))
+              ;; Skip if already has a heading overlay
+              (unless (cl-some (lambda (ov)
+                                 (overlay-get ov 'kitty-gfx-heading))
+                               (overlays-in line-beg line-end))
+                (let* ((raw (org-get-heading t t t t))
+                       (text (if (fboundp 'org-link-display-format)
+                                 (org-link-display-format raw)
+                               raw)))
+                  (kitty-gfx--make-heading-overlay
+                   line-beg line-end text scale level)
+                  (cl-incf count)))))))
+      (kitty-gfx--log "apply-heading-sizes: created %d overlays" count)
+      (when (> count 0)
+        (kitty-gfx--schedule-refresh)))))
+
+(defun kitty-gfx--org-remove-heading-sizes ()
+  "Remove all heading size overlays from the current buffer."
+  (let ((count 0))
+    (dolist (ov (overlays-in (point-min) (point-max)))
+      (when (overlay-get ov 'kitty-gfx-heading)
+        (kitty-gfx--remove-overlay ov)
+        (cl-incf count)))
+    (kitty-gfx--log "remove-heading-sizes: removed %d" count)))
+
+;;;###autoload
+(defun kitty-gfx-org-heading-sizes (&optional arg)
+  "Toggle scaled heading sizes in the current org buffer.
+With prefix ARG, remove heading sizes."
+  (interactive "P")
+  (unless (derived-mode-p 'org-mode)
+    (user-error "Not an org-mode buffer"))
+  (unless (eq kitty-gfx--text-sizing-support 'scale)
+    (user-error "Terminal does not support text sizing (needs Kitty >= 0.40.0)"))
+  (if (or arg (cl-some (lambda (ov) (overlay-get ov 'kitty-gfx-heading))
+                        (overlays-in (point-min) (point-max))))
+      (progn
+        (kitty-gfx--org-remove-heading-sizes)
+        (message "Heading sizes removed"))
+    (kitty-gfx--org-apply-heading-sizes)
+    (message "Heading sizes applied")))
 
 ;;;; Position mapping
 
@@ -867,6 +1114,24 @@ the window's scroll range."
 
 ;;;; Refresh cycle
 
+(defun kitty-gfx--emit-heading-overlays ()
+  "Phase 2: emit OSC 66 for all visible heading overlays.
+Walks all buffers that have overlays and emits `kitty-gfx--place-heading'
+for each heading overlay with a cached position.  Called after phase 1
+\(position computation) to avoid posn-at-point triggering redraws that
+destroy freshly-placed multicell blocks.
+
+Headings are stateless — the terminal has no memory of them, so we
+must re-emit on every refresh cycle, unlike images which use
+placement IDs for idempotent re-placement."
+  (dolist (buf (buffer-list))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (dolist (ov kitty-gfx--overlays)
+          (when (and (overlay-get ov 'kitty-gfx-heading)
+                     (overlay-get ov 'kitty-gfx-last-row))
+            (kitty-gfx--place-heading ov)))))))
+
 (defun kitty-gfx--refresh ()
   "Re-place all visible images after redisplay using direct placements.
 Relies on placement IDs (p=PID) — re-placing with the same PID
@@ -914,14 +1179,23 @@ to prevent flicker."
                          (cl-incf placed)
                        (cl-incf hidden)))))))
            nil 'visible)
+        ;; Phase 2: emit OSC 66 for all visible heading overlays.
+        ;; This runs AFTER all posn-at-point queries (phase 1) to
+        ;; prevent Emacs mini-redraws from destroying freshly-placed
+        ;; multicell blocks.  Headings are stateless — always re-emit.
+        (kitty-gfx--emit-heading-overlays)
         (kitty-gfx--sync-end))
       (kitty-gfx--log "refresh: done total=%d placed=%d hidden=%d pruned=%d"
                        total-overlays placed hidden pruned))))
 
 (defun kitty-gfx--refresh-overlay (ov win-bottom)
   "Refresh a single overlay OV.  WIN-BOTTOM is the window's bottom edge.
-Places the image if visible and position changed, or deletes placement
-if the overlay scrolled out of view."
+Dispatches to heading or image refresh based on overlay type."
+  (if (overlay-get ov 'kitty-gfx-heading)
+      ;; Heading overlay — phase 1: compute position + erase if moved.
+      ;; OSC 66 emission happens in phase 2 (kitty-gfx--emit-heading-overlays).
+      (kitty-gfx--refresh-heading-overlay ov win-bottom)
+  ;; Image overlay refresh
   (let ((pos (kitty-gfx--overlay-screen-pos ov))
         (rows (overlay-get ov 'kitty-gfx-rows))
         (last-row (overlay-get ov 'kitty-gfx-last-row))
@@ -956,7 +1230,40 @@ if the overlay scrolled out of view."
                           pid last-row last-col)
           (overlay-put ov 'kitty-gfx-last-row nil)
           (overlay-put ov 'kitty-gfx-last-col nil)
-          (funcall (kitty-gfx--backend-fn 'delete) ov id pid))))))
+          (funcall (kitty-gfx--backend-fn 'delete) ov id pid)))))))
+
+(defun kitty-gfx--refresh-heading-overlay (ov win-bottom)
+  "Refresh heading overlay OV.  WIN-BOTTOM is the window's bottom edge.
+Phase 1 of two-phase heading refresh: computes screen position,
+erases old multicell block if heading moved or became hidden,
+and caches the new position.  Does NOT emit OSC 66 — that
+happens in phase 2 (`kitty-gfx--emit-heading-overlays') to
+avoid posn-at-point redraws destroying freshly-placed blocks."
+  (let ((pos (kitty-gfx--overlay-screen-pos ov))
+        (rows (overlay-get ov 'kitty-gfx-rows))
+        (last-row (overlay-get ov 'kitty-gfx-last-row))
+        (last-col (overlay-get ov 'kitty-gfx-last-col)))
+    (if (and pos
+             (<= (car pos) win-bottom)
+             (<= (+ (car pos) rows -1) win-bottom))
+        ;; Visible — erase old position if moved, cache new position
+        (let ((new-row (car pos))
+              (new-col (cdr pos)))
+          (when (and last-row
+                     (not (and (eql new-row last-row)
+                               (eql new-col last-col))))
+            ;; Heading moved — erase at old position
+            (kitty-gfx--erase-heading ov))
+          (overlay-put ov 'kitty-gfx-last-row new-row)
+          (overlay-put ov 'kitty-gfx-last-col new-col)
+          (kitty-gfx--log "refresh-heading: L%d visible at row=%d col=%d"
+                           (overlay-get ov 'kitty-gfx-heading-level)
+                           new-row new-col))
+      ;; Not visible — erase if was placed, clear cache
+      (when last-row
+        (kitty-gfx--erase-heading ov))
+      (overlay-put ov 'kitty-gfx-last-row nil)
+      (overlay-put ov 'kitty-gfx-last-col nil))))
 
 (defvar kitty-gfx--refresh-pending nil
   "Non-nil if a refresh was requested during the cooldown period.")
@@ -1564,6 +1871,15 @@ The buffer should be writable (caller handles `inhibit-read-only')."
 
 ;;;; Org-mode integration
 
+(defun kitty-gfx--org-mode-heading-hook ()
+  "Org-mode hook to auto-apply heading sizes.
+Only activates when `kitty-gfx-heading-sizes-auto' is set and
+the terminal supports text sizing."
+  (when (and kitty-graphics-mode
+             (eq kitty-gfx--text-sizing-support 'scale)
+             (not (display-graphic-p)))
+    (kitty-gfx--org-apply-heading-sizes)))
+
 (defun kitty-gfx--on-org-cycle (&rest _args)
   "Handle org visibility cycling.
 Deletes image placements from the terminal, clears position caches,
@@ -2127,6 +2443,9 @@ Falls back to ORIG-FN in GUI."
                   #'kitty-gfx--org-link-preview-region-advice))
     ;; Refresh images when org cycles heading visibility
     (add-hook 'org-cycle-hook #'kitty-gfx--on-org-cycle)
+    ;; Auto-apply heading sizes when entering org buffers
+    (when kitty-gfx-heading-sizes-auto
+      (add-hook 'org-mode-hook #'kitty-gfx--org-mode-heading-hook))
     ;; LaTeX fragment preview in terminal
     (advice-add 'org-latex-preview :around
                 #'kitty-gfx--org-latex-preview-advice)
@@ -2156,6 +2475,7 @@ Falls back to ORIG-FN in GUI."
 
 (defun kitty-gfx--uninstall-integrations ()
   "Remove all advice."
+  (remove-hook 'org-mode-hook #'kitty-gfx--org-mode-heading-hook)
   (advice-remove 'org-display-inline-images #'kitty-gfx--org-display-advice)
   (advice-remove 'org-remove-inline-images #'kitty-gfx--org-remove-advice)
   (advice-remove 'org-toggle-inline-images #'kitty-gfx--org-toggle-advice)
