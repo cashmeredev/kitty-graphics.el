@@ -1316,19 +1316,30 @@ then invalidates position caches and schedules a refresh."
                           (buffer-name))
           (dolist (ov kitty-gfx--overlays)
             (when (overlay-buffer ov)
-              (let ((id (overlay-get ov 'kitty-gfx-id))
-                    (pid (overlay-get ov 'kitty-gfx-pid)))
-                (if (overlay-get ov 'kitty-gfx-last-row)
-                    (when (and id pid)
-                      (kitty-gfx--delete-placement id pid))
-                  (kitty-gfx--log "on-buffer-change: ov pid=%s has no last-row (never placed or already cleaned)" pid)))
-              (overlay-put ov 'kitty-gfx-last-row nil)
-              (overlay-put ov 'kitty-gfx-last-col nil)))))))
+              (if (overlay-get ov 'kitty-gfx-heading)
+                  ;; Heading overlay — erase multicell block to prevent
+                  ;; ghost artifacts if the new buffer doesn't fully
+                  ;; overwrite the heading's terminal cells.
+                  (when (overlay-get ov 'kitty-gfx-last-row)
+                    (kitty-gfx--erase-heading ov)
+                    (overlay-put ov 'kitty-gfx-last-row nil)
+                    (overlay-put ov 'kitty-gfx-last-col nil))
+                ;; Image overlay — delete terminal placement
+                (let ((id (overlay-get ov 'kitty-gfx-id))
+                      (pid (overlay-get ov 'kitty-gfx-pid)))
+                  (if (overlay-get ov 'kitty-gfx-last-row)
+                      (when (and id pid)
+                        (kitty-gfx--delete-placement id pid))
+                    (kitty-gfx--log "on-buffer-change: ov pid=%s has no last-row (never placed or already cleaned)" pid)))
+                (overlay-put ov 'kitty-gfx-last-row nil)
+                (overlay-put ov 'kitty-gfx-last-col nil))))))))
   ;; Reset cache for visible buffers so they re-place correctly.
+  ;; Heading overlays preserve cache (same rationale as on-window-change).
   (dolist (buf (buffer-list))
     (with-current-buffer buf
       (dolist (ov kitty-gfx--overlays)
-        (when (overlay-buffer ov)
+        (when (and (overlay-buffer ov)
+                   (not (overlay-get ov 'kitty-gfx-heading)))
           (overlay-put ov 'kitty-gfx-last-row nil)
           (overlay-put ov 'kitty-gfx-last-col nil)))))
   ;; Longer debounce: cancel any fast leading-edge cooldown and
@@ -1354,10 +1365,15 @@ buffer before settling to one)."
   (setq kitty-gfx--cell-pixel-width nil
         kitty-gfx--cell-pixel-height nil)
   ;; Reset position cache so images get re-placed at correct positions.
+  ;; Heading overlays PRESERVE their cache — the refresh cycle needs
+  ;; old→new position comparison to erase multicell blocks properly.
+  ;; Images can clear cache because re-placing with the same PID is
+  ;; idempotent (the terminal replaces the old placement).
   (dolist (buf (buffer-list))
     (with-current-buffer buf
       (dolist (ov kitty-gfx--overlays)
-        (when (overlay-buffer ov)
+        (when (and (overlay-buffer ov)
+                   (not (overlay-get ov 'kitty-gfx-heading)))
           (overlay-put ov 'kitty-gfx-last-row nil)
           (overlay-put ov 'kitty-gfx-last-col nil)))))
   ;; Longer debounce: cancel any fast leading-edge cooldown and
