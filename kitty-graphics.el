@@ -3,7 +3,7 @@
 ;; Copyright (C) 2025-2026
 ;;
 ;; Author: cashmere
-;; Version: 0.3.0
+;; Version: 0.4.0
 ;; URL: https://github.com/cashmeredev/kitty-graphics.el
 ;; Keywords: terminals, images, multimedia
 ;; Package-Requires: ((emacs "27.1"))
@@ -1721,6 +1721,7 @@ The buffer should be writable (caller handles `inhibit-read-only')."
       (insert (format "Backend: %s\n" kitty-gfx--active-backend))
       (insert (format "Cell pixel size: %sx%s\n"
                       kitty-gfx--cell-pixel-width kitty-gfx--cell-pixel-height))
+      (insert (format "Text sizing: %s\n" kitty-gfx--text-sizing-support))
       (insert (format "ImageMagick: magick=%s convert=%s identify=%s\n"
                       (executable-find "magick")
                       (executable-find "convert")
@@ -1744,15 +1745,23 @@ The buffer should be writable (caller handles `inhibit-read-only')."
             (when ovs
               (dolist (ov ovs)
                 (cl-incf count)
-                (let ((alive (not (null (overlay-buffer ov)))))
-                  (insert (format "  [%d] buf=%s alive=%s id=%s pid=%s cols=%s rows=%s\n"
+                (let ((alive (not (null (overlay-buffer ov))))
+                      (heading-p (overlay-get ov 'kitty-gfx-heading)))
+                  (insert (format "  [%d] buf=%s alive=%s type=%s cols=%s rows=%s\n"
                                   count (buffer-name b) alive
-                                  (overlay-get ov 'kitty-gfx-id)
-                                  (overlay-get ov 'kitty-gfx-pid)
+                                  (if heading-p "heading" "image")
                                   (overlay-get ov 'kitty-gfx-cols)
                                   (overlay-get ov 'kitty-gfx-rows)))
-                  (insert (format "       file=%s\n"
-                                  (overlay-get ov 'kitty-gfx-file)))
+                  (if heading-p
+                      (insert (format "       text=%S scale=%.2f level=%s s=%s\n"
+                                      (overlay-get ov 'kitty-gfx-heading-text)
+                                      (or (overlay-get ov 'kitty-gfx-heading-scale) 0)
+                                      (overlay-get ov 'kitty-gfx-heading-level)
+                                      (overlay-get ov 'kitty-gfx-heading-cell-s)))
+                    (insert (format "       id=%s pid=%s file=%s\n"
+                                    (overlay-get ov 'kitty-gfx-id)
+                                    (overlay-get ov 'kitty-gfx-pid)
+                                    (overlay-get ov 'kitty-gfx-file))))
                   (insert (format "       buf-pos=%s-%s last-row=%s last-col=%s\n"
                                   (and alive (overlay-start ov))
                                   (and alive (overlay-end ov))
