@@ -320,6 +320,87 @@ Falls back to reasonable defaults if query fails or times out."
     (kitty-gfx--log "cell-size final: %dx%d"
                      kitty-gfx--cell-pixel-width kitty-gfx--cell-pixel-height)))
 
+(defun kitty-gfx--query-text-sizing-support ()
+  "Detect terminal text sizing protocol support via CPR probing.
+Sends three cursor position queries interleaved with OSC 66 width
+and scale tests, then compares cursor column advancement.
+Sets `kitty-gfx--text-sizing-support' to `scale', `width', or `none'.
+
+The detection sequence (per Kitty spec):
+  CR → CPR1 → OSC66(w=2,\" \") → CPR2 → OSC66(s=2,\" \") → CPR3 → DSR
+
+Compare column positions:
+  x2 = x1+2 AND x3 = x2+2 → full scale support
+  x2 = x1+2 only           → width-only support
+  no advancement            → no support
+
+Uses DSR (device status report) as a sentinel to avoid hanging."
+  (if kitty-gfx--text-sizing-support
+      ;; Already detected — return cached result
+      (kitty-gfx--log "text-sizing: cached result=%s"
+                       kitty-gfx--text-sizing-support)
+    (condition-case err
+        (let ((response "")
+              (done nil)
+              (deadline (+ (float-time) 1.0)))
+          ;; Save cursor, CR to column 1, then interleaved CPR + OSC 66
+          ;; tests, DSR sentinel, erase line, restore cursor.
+          (send-string-to-terminal
+           (concat "\e7\r\e[6n"                 ; save + CR + CPR1
+                   "\e]66;w=2; \a\e[6n"         ; width test + CPR2
+                   "\e]66;s=2; \a\e[6n"         ; scale test + CPR3
+                   "\e[5n"                       ; DSR sentinel
+                   "\e[2K\e8"))                  ; erase line + restore
+          ;; Read until DSR response (ends with 'n') or timeout
+          (while (and (not done) (< (float-time) deadline))
+            (let ((ch (with-timeout (0.1 nil)
+                        (read-event nil nil 0.1))))
+              (if ch
+                  (progn
+                    (setq response (concat response (string ch)))
+                    (when (and (string-suffix-p "n" response)
+                               (>= (cl-count ?R response) 3))
+                      (setq done t)))
+                ;; No input — check if we have enough responses
+                (when (>= (cl-count ?R response) 3)
+                  (setq done t)))))
+          ;; Parse three CPR responses: ESC [ row ; col R
+          (let ((cols nil)
+                (start 0))
+            (while (string-match "\e\\[[0-9]+;\\([0-9]+\\)R" response start)
+              (push (string-to-number (match-string 1 response)) cols)
+              (setq start (match-end 0)))
+            (setq cols (nreverse cols))
+            (if (>= (length cols) 3)
+                (let ((x1 (nth 0 cols))
+                      (x2 (nth 1 cols))
+                      (x3 (nth 2 cols)))
+                  (kitty-gfx--log "text-sizing: CPR cols x1=%d x2=%d x3=%d"
+                                   x1 x2 x3)
+                  (cond
+                   ((and (eql x2 (+ x1 2)) (eql x3 (+ x2 2)))
+                    (setq kitty-gfx--text-sizing-support 'scale)
+                    (kitty-gfx--log "text-sizing: full support (scale)"))
+                   ((eql x2 (+ x1 2))
+                    (setq kitty-gfx--text-sizing-support 'width)
+                    (kitty-gfx--log "text-sizing: width-only support"))
+                   (t
+                    (setq kitty-gfx--text-sizing-support 'none)
+                    (kitty-gfx--log "text-sizing: no support"))))
+              (kitty-gfx--log "text-sizing: parse failed (got %d CPRs) raw=%S"
+                               (length cols) response)
+              (setq kitty-gfx--text-sizing-support 'none)))
+          ;; Flush any remaining terminal responses
+          (let ((flush-deadline (+ (float-time) 0.1)))
+            (while (< (float-time) flush-deadline)
+              (unless (read-event nil nil 0.02)
+                (setq flush-deadline 0)))))
+      (error
+       (kitty-gfx--log "text-sizing: query error: %s"
+                        (error-message-string err))
+       (setq kitty-gfx--text-sizing-support 'none))))
+  kitty-gfx--text-sizing-support)
+
 ;;;; Synchronized output
 
 (defun kitty-gfx--sync-begin ()
@@ -1426,6 +1507,8 @@ The buffer should be writable (caller handles `inhibit-read-only')."
                             ('kitty "K")
                             ('sixel "S")
                             (_ "?"))
+                          (if (eq kitty-gfx--text-sizing-support 'scale)
+                              "+T" "")
                           "]"))
   (if kitty-graphics-mode
       (if (kitty-gfx--detect-protocol)
@@ -1434,13 +1517,19 @@ The buffer should be writable (caller handles `inhibit-read-only')."
             (when kitty-gfx--active-backend
               (funcall (kitty-gfx--backend-fn 'cleanup-all)))  ; clear stale state
             (kitty-gfx--query-cell-size)
+            ;; Probe text sizing support (OSC 66) when on Kitty backend
+            (when (eq kitty-gfx--active-backend 'kitty)
+              (kitty-gfx--query-text-sizing-support))
             (kitty-gfx--install-hooks)
             (kitty-gfx--install-integrations)
-            (kitty-gfx--log "mode: enabled (backend=%s cell=%dx%d)"
+            (kitty-gfx--log "mode: enabled (backend=%s cell=%dx%d text-sizing=%s)"
                              kitty-gfx--active-backend
-                             kitty-gfx--cell-pixel-width kitty-gfx--cell-pixel-height)
-            (message "Kitty graphics mode enabled (%s backend)"
-                     kitty-gfx--active-backend))
+                             kitty-gfx--cell-pixel-width kitty-gfx--cell-pixel-height
+                             kitty-gfx--text-sizing-support)
+            (message "Kitty graphics mode enabled (%s backend%s)"
+                     kitty-gfx--active-backend
+                     (if (eq kitty-gfx--text-sizing-support 'scale)
+                         ", text sizing" "")))
         (kitty-gfx--log "mode: terminal not supported, aborting enable")
         (setq kitty-graphics-mode nil)
         (message "Kitty graphics: terminal not supported"))
@@ -1453,7 +1542,8 @@ The buffer should be writable (caller handles `inhibit-read-only')."
       (cancel-timer kitty-gfx--render-timer))
     (setq kitty-gfx--render-timer nil
           kitty-gfx--refresh-pending nil
-          kitty-gfx--active-backend nil)
+          kitty-gfx--active-backend nil
+          kitty-gfx--text-sizing-support nil)
     (kitty-gfx--log "mode: disabled")))
 
 (defun kitty-gfx--install-hooks ()
