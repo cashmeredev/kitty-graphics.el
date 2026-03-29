@@ -757,8 +757,10 @@ Falls back to bold-only when color is unavailable or face undefined."
 
 (defun kitty-gfx--place-heading (ov)
   "Emit OSC 66 to render heading overlay OV at its cached terminal position.
-Reads all needed data from overlay properties.  Emits:
-  save-cursor, move-to-position, SGR-color, OSC-66-payload, SGR-reset, restore-cursor."
+Pre-erases the target area using ECH before emitting, preventing
+artifacts from partial overwrites (adapted from mdfried's pattern).
+Sequence: save-cursor, erase-area, move-to-position, SGR-color,
+OSC-66-payload, SGR-reset, restore-cursor."
   (let* ((text (overlay-get ov 'kitty-gfx-heading-text))
          (cell-s (overlay-get ov 'kitty-gfx-heading-cell-s))
          (frac-n (overlay-get ov 'kitty-gfx-heading-frac-n))
@@ -766,6 +768,8 @@ Reads all needed data from overlay properties.  Emits:
          (level (overlay-get ov 'kitty-gfx-heading-level))
          (row (overlay-get ov 'kitty-gfx-last-row))
          (col (overlay-get ov 'kitty-gfx-last-col))
+         (cols (overlay-get ov 'kitty-gfx-cols))
+         (rows (overlay-get ov 'kitty-gfx-rows))
          (sgr (kitty-gfx--heading-sgr level))
          ;; Build the OSC 66 metadata: s=S, and optionally n=N:d=D
          (meta (if (and frac-n frac-d (> frac-d 0))
@@ -773,24 +777,46 @@ Reads all needed data from overlay properties.  Emits:
                  (format "s=%d" cell-s))))
     (kitty-gfx--log "place-heading: L%d row=%d col=%d s=%d n=%d d=%d text=%S"
                      level row col cell-s frac-n frac-d text)
+    ;; Pre-erase: clean the target area before emitting OSC 66.
+    ;; This prevents ghost artifacts from previous content or
+    ;; partially-overwritten multicell blocks.
+    (kitty-gfx--erase-heading-at row col (or cols 0) (or rows 1))
+    ;; Emit OSC 66 at the target position
     (kitty-gfx--terminal-send
      (format "\e7\e[%d;%dH%s\e]66;%s;%s\a\e[0m\e8"
              row col sgr meta text))))
 
+(defun kitty-gfx--erase-heading-at (row col cols rows)
+  "Erase a heading multicell block at ROW, COL spanning COLS x ROWS cells.
+Uses the ECH (Erase Character) escape `\\e[NX' which erases N characters
+at the cursor without moving it — more efficient than writing spaces.
+Disables DECAWM (auto-wrap) during erase to prevent wrapping artifacts
+when the erase area extends near the right edge.  Erases each row of
+the multicell block to ensure complete cleanup.
+Adapted from mdfried's erase-character dance."
+  (when (and row col cols rows (> cols 0) (> rows 0))
+    (kitty-gfx--terminal-send
+     (format "\e7\e[?7l\e[%d;%dH\e[%dX%s\e[?7h\e8"
+             row col cols
+             ;; For multi-row blocks (s > 1), erase additional rows
+             (if (> rows 1)
+                 (mapconcat
+                  (lambda (r)
+                    (format "\e[%d;%dH\e[%dX" (+ row r) col cols))
+                  (number-sequence 1 (1- rows)) "")
+               "")))))
+
 (defun kitty-gfx--erase-heading (ov)
-  "Erase the multicell block of heading overlay OV at its cached position.
-Writes spaces across the heading's column span in the topmost row.
-Per OSC 66 overwrite Rules 2-3, overwriting any topmost-row cell
-erases the entire multicell block."
+  "Erase the multicell block of heading overlay OV at its cached position."
   (let ((row (overlay-get ov 'kitty-gfx-last-row))
         (col (overlay-get ov 'kitty-gfx-last-col))
-        (cols (overlay-get ov 'kitty-gfx-cols)))
-    (when (and row col cols (> cols 0))
-      (kitty-gfx--log "erase-heading: L%d row=%d col=%d cols=%d"
-                       (overlay-get ov 'kitty-gfx-heading-level) row col cols)
-      (kitty-gfx--terminal-send
-       (format "\e7\e[%d;%dH%s\e8"
-               row col (make-string cols ?\s))))))
+        (cols (overlay-get ov 'kitty-gfx-cols))
+        (rows (overlay-get ov 'kitty-gfx-rows)))
+    (when (and row col)
+      (kitty-gfx--log "erase-heading: L%d row=%d col=%d cols=%d rows=%d"
+                       (overlay-get ov 'kitty-gfx-heading-level)
+                       row col (or cols 0) (or rows 0))
+      (kitty-gfx--erase-heading-at row col (or cols 0) (or rows 1)))))
 
 (defun kitty-gfx-run-self-tests ()
   "Run batch-safe self-tests for kitty-graphics.
