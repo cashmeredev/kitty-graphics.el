@@ -103,6 +103,10 @@ This debounces rapid redisplay events.  Default is ~1 frame at 60fps."
 (defvar kitty-gfx--log-file "/tmp/kitty-gfx.log"
   "File path for debug log output.")
 
+(defvar kitty-gfx--dry-run nil
+  "When non-nil, log escape sequences instead of sending to terminal.
+Useful for debugging and batch testing without a real terminal.")
+
 (defun kitty-gfx--log (fmt &rest args)
   "Log to `kitty-gfx--log-file' and *kitty-gfx-debug* buffer when debug is on."
   (when kitty-gfx-debug
@@ -119,6 +123,13 @@ This debounces rapid redisplay events.  Default is ~1 frame at 60fps."
               (goto-char (point-min))
               (forward-line 500)
               (delete-region (point-min) (point)))))))))
+
+(defun kitty-gfx--terminal-send (str)
+  "Send STR to terminal, or log it in dry-run mode.
+All terminal escape output should go through this function."
+  (if kitty-gfx--dry-run
+      (kitty-gfx--log "DRY-RUN-SEND: %S" str)
+    (ignore-errors (send-string-to-terminal str))))
 
 ;;;; Constants — kept for reference if switching back to Unicode placeholders
 ;; (defconst kitty-gfx--placeholder-char #x10EEEE)
@@ -163,6 +174,29 @@ Default is `auto'."
                  (const :tag "Sixel protocol" sixel))
   :group 'kitty-graphics)
 
+(defcustom kitty-gfx-heading-scales '((1 . 2.0) (2 . 1.5) (3 . 1.2))
+  "Alist mapping org heading level to visual scale factor.
+Headings at levels not listed use scale 1.0 (normal size).
+Requires Kitty >= 0.40.0 (text sizing protocol, OSC 66).
+
+Scale values are floats: 2.0 = double size, 1.5 = 50% larger.
+Any scale > 1.0 occupies 2+ terminal rows (multicell block).
+Maximum scale is 7.0 (limited by protocol)."
+  :type '(alist :key-type (integer :tag "Heading level")
+                :value-type (choice (const :tag "2.0x (double)" 2.0)
+                                    (const :tag "1.5x" 1.5)
+                                    (const :tag "1.2x" 1.2)
+                                    (number :tag "Custom (1.0-7.0)")))
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-heading-sizes-auto nil
+  "When non-nil, automatically apply heading sizes in org buffers.
+Heading sizes are applied when `org-mode' is activated and
+`kitty-graphics-mode' is enabled.  Set to nil to require manual
+activation via `kitty-gfx-org-heading-sizes'."
+  :type 'boolean
+  :group 'kitty-graphics)
+
 (defvar kitty-gfx--image-cache (make-hash-table :test 'equal)
   "Maps file paths to image IDs (integers).
 Only stores the terminal-side image ID — display dimensions are
@@ -191,6 +225,13 @@ Most recently used at the front.")
   "Next placement ID (p=PID) for direct placements.
 Each overlay gets a unique PID so repeated placements replace
 rather than accumulate.")
+
+(defvar kitty-gfx--text-sizing-support nil
+  "Cached text sizing protocol support level.
+nil means not yet queried.  Possible values after query:
+  `scale'  -- full support (s= and w= both work, Kitty >= 0.40.0)
+  `width'  -- width-only support (w= works, s= does not)
+  `none'   -- no support (terminal ignores OSC 66 entirely)")
 
 ;;;; Terminal detection
 
@@ -286,13 +327,13 @@ Falls back to reasonable defaults if query fails or times out."
 The terminal buffers output until `kitty-gfx--sync-end' is called,
 preventing partial rendering and flicker."
   (kitty-gfx--log "sync-begin")
-  (ignore-errors (send-string-to-terminal "\e[?2026h")))
+  (kitty-gfx--terminal-send "\e[?2026h"))
 
 (defun kitty-gfx--sync-end ()
   "End synchronized output (ESU).
 Flushes buffered output to the terminal all at once."
   (kitty-gfx--log "sync-end")
-  (ignore-errors (send-string-to-terminal "\e[?2026l")))
+  (kitty-gfx--terminal-send "\e[?2026l"))
 
 ;;;; Protocol layer
 
@@ -315,8 +356,7 @@ with `kitty-gfx--place-image'."
              (ctrl (if first
                        (format "a=t,q=2,f=100,i=%d,m=%d" id more)
                      (format "m=%d,q=2" more))))
-        (ignore-errors
-          (send-string-to-terminal (format "\e_G%s;%s\e\\" ctrl chunk)))
+        (kitty-gfx--terminal-send (format "\e_G%s;%s\e\\" ctrl chunk))
         (cl-incf chunk-count)
         (setq offset end
               first nil)))
@@ -325,14 +365,12 @@ with `kitty-gfx--place-image'."
 (defun kitty-gfx--delete-by-id (id)
   "Delete image with ID and free data."
   (kitty-gfx--log "delete-by-id: id=%d" id)
-  (ignore-errors
-    (send-string-to-terminal (format "\e_Ga=d,d=I,i=%d,q=2\e\\" id))))
+  (kitty-gfx--terminal-send (format "\e_Ga=d,d=I,i=%d,q=2\e\\" id)))
 
 (defun kitty-gfx--delete-all-images ()
   "Delete all visible placements and free data."
   (kitty-gfx--log "delete-all-images")
-  (ignore-errors
-    (send-string-to-terminal "\e_Ga=d,d=A,q=2\e\\")))
+  (kitty-gfx--terminal-send "\e_Ga=d,d=A,q=2\e\\"))
 
 ;;;; Direct placement (the core rendering mechanism)
 
@@ -353,10 +391,9 @@ COLS x ROWS is the size in terminal cells.
 Uses direct placement: move cursor, then `a=p' with `c' and `r' params."
   (kitty-gfx--log "place: id=%d pid=%d cols=%d rows=%d row=%d col=%d"
                    image-id placement-id cols rows term-row term-col)
-  (ignore-errors
-    (send-string-to-terminal
-     (format "\e7\e[%d;%dH\e_Gq=2,a=p,i=%d,p=%d,c=%d,r=%d\e\\\e8"
-             term-row term-col image-id placement-id cols rows))))
+  (kitty-gfx--terminal-send
+   (format "\e7\e[%d;%dH\e_Gq=2,a=p,i=%d,p=%d,c=%d,r=%d\e\\\e8"
+           term-row term-col image-id placement-id cols rows)))
 
 ;;;; Kitty backend
 
@@ -510,9 +547,8 @@ Encodes on-demand if not cached, then emits DCS sequence."
                (ch (or kitty-gfx--cell-pixel-height 16)))
           (kitty-gfx--log "sixel-place: emitting at row=%d col=%d data-len=%d pixel-target=%dx%d"
                           term-row term-col (length sixel-data) (* cols cw) (* rows ch)))
-        (ignore-errors
-          (send-string-to-terminal
-           (format "\e7\e[%d;%dH%s\e8" term-row term-col sixel-data)))))))
+        (kitty-gfx--terminal-send
+         (format "\e7\e[%d;%dH%s\e8" term-row term-col sixel-data))))))
 
 (defun kitty-gfx--sixel-delete (ov _image-id _placement-id)
   "Delete Sixel placement by overwriting with spaces.
@@ -524,14 +560,13 @@ Sixel has no placement IDs — erase by writing spaces over the region."
     (when (and last-row last-col rows cols)
       (kitty-gfx--log "sixel-delete: erase row=%d col=%d %dx%d"
                        last-row last-col cols rows)
-      (ignore-errors
-        (send-string-to-terminal
-         (format "\e7%s\e8"
-                 (mapconcat
-                  (lambda (r)
-                    (format "\e[%d;%dH%s" (+ last-row r) last-col (make-string cols ?\s)))
-                  (number-sequence 0 (1- rows))
-                  "")))))))
+      (kitty-gfx--terminal-send
+       (format "\e7%s\e8"
+               (mapconcat
+                (lambda (r)
+                  (format "\e[%d;%dH%s" (+ last-row r) last-col (make-string cols ?\s)))
+                (number-sequence 0 (1- rows))
+                ""))))))
 
 (defun kitty-gfx--sixel-cleanup (file _image-id)
   "Cleanup Sixel resources for FILE."
@@ -569,6 +604,119 @@ Sixel has no placement IDs — erase by writing spaces over the region."
 
 ;; Cleanup temp files on exit
 (add-hook 'kill-emacs-hook #'kitty-gfx--sixel-cleanup-all)
+
+;;;; Text sizing protocol (OSC 66)
+
+(defun kitty-gfx--decompose-scale (scale)
+  "Decompose SCALE (float) into OSC 66 parameters (s n d).
+Returns (CELL-S FRAC-N FRAC-D) where:
+  CELL-S is the integer cell scale (1-7, the s= parameter)
+  FRAC-N is the fractional numerator (0-15, the n= parameter)
+  FRAC-D is the fractional denominator (0-15, the d= parameter)
+
+Examples:
+  1.0 -> (1 0 0)  -- no scaling
+  2.0 -> (2 0 0)  -- double size, 2-row block
+  1.5 -> (2 3 4)  -- 2-row block, 3/4 fractional fill
+  1.2 -> (2 3 5)  -- 2-row block, 3/5 fractional fill
+  3.0 -> (3 0 0)  -- triple size, 3-row block"
+  (let* ((clamped (max 1.0 (min 7.0 (float scale))))
+         (s (max 1 (min 7 (ceiling clamped))))
+         (ratio (/ clamped s)))
+    (if (<= (abs (- ratio 1.0)) 0.01)
+        ;; Close enough to 1.0 -- no fractional part needed
+        (list s 0 0)
+      (let ((best-n 0)
+            (best-d 0)
+            (best-err 1.0))
+        (cl-loop for d from 2 to 15
+                 for n = (round (* ratio d))
+                 when (and (> n 0) (< n d) (<= n 15))
+                 do (let ((err (abs (- (/ (float n) d) ratio))))
+                      (when (< err best-err)
+                        (setq best-n n best-d d best-err err))))
+        (list s best-n best-d)))))
+
+(defun kitty-gfx--validate-osc66 (s n d text)
+  "Return non-nil if OSC 66 parameters are valid per protocol spec.
+S is cell scale (1-7), N is fractional numerator (0-15),
+D is fractional denominator (0-15, must be > N when non-zero),
+TEXT is the string payload (max 4096 bytes UTF-8)."
+  (and (<= 1 s 7)
+       (<= 0 n 15)
+       (<= 0 d 15)
+       (or (zerop d) (> d n))
+       (<= (length (encode-coding-string text 'utf-8)) 4096)))
+
+(defun kitty-gfx--heading-sgr (level)
+  "Return SGR escape string for org heading at LEVEL.
+Applies bold + 24-bit foreground color from org-level-N face.
+Falls back to bold-only when color is unavailable."
+  (let* ((face (intern (format "org-level-%d" (min level 8))))
+         (fg (face-attribute face :foreground nil t))
+         (color (when (and (stringp fg)
+                           (not (string-prefix-p "unspecified" fg)))
+                  (color-values fg))))
+    (if color
+        (format "\e[1;38;2;%d;%d;%dm"
+                (/ (nth 0 color) 256)
+                (/ (nth 1 color) 256)
+                (/ (nth 2 color) 256))
+      "\e[1m")))
+
+(defun kitty-gfx-run-self-tests ()
+  "Run batch-safe self-tests for kitty-graphics.
+Tests pure logic functions that don't require a terminal.
+Signals error on failure, prints success message otherwise."
+  (interactive)
+  ;; decompose-scale: identity
+  (cl-assert (equal (kitty-gfx--decompose-scale 1.0) '(1 0 0))
+             nil "decompose 1.0 failed")
+  ;; decompose-scale: integer scales
+  (cl-assert (equal (kitty-gfx--decompose-scale 2.0) '(2 0 0))
+             nil "decompose 2.0 failed")
+  (cl-assert (equal (kitty-gfx--decompose-scale 3.0) '(3 0 0))
+             nil "decompose 3.0 failed")
+  ;; decompose-scale: fractional scales produce valid params
+  (let ((r15 (kitty-gfx--decompose-scale 1.5)))
+    (cl-assert (= (nth 0 r15) 2) nil "1.5 cell-s should be 2")
+    (cl-assert (> (nth 1 r15) 0) nil "1.5 should have fractional n")
+    (cl-assert (> (nth 2 r15) (nth 1 r15)) nil "1.5: d must be > n"))
+  (let ((r12 (kitty-gfx--decompose-scale 1.2)))
+    (cl-assert (= (nth 0 r12) 2) nil "1.2 cell-s should be 2")
+    (cl-assert (> (nth 1 r12) 0) nil "1.2 should have fractional n")
+    (cl-assert (> (nth 2 r12) (nth 1 r12)) nil "1.2: d must be > n"))
+  ;; decompose-scale: clamping
+  (cl-assert (= (nth 0 (kitty-gfx--decompose-scale 0.5)) 1)
+             nil "scale < 1.0 should clamp cell-s to 1")
+  (cl-assert (= (nth 0 (kitty-gfx--decompose-scale 10.0)) 7)
+             nil "scale > 7.0 should clamp cell-s to 7")
+  ;; validate-osc66: valid params
+  (cl-assert (kitty-gfx--validate-osc66 2 3 4 "hello")
+             nil "valid params should pass")
+  (cl-assert (kitty-gfx--validate-osc66 1 0 0 "test")
+             nil "no-fraction params should pass")
+  ;; validate-osc66: invalid params
+  (cl-assert (not (kitty-gfx--validate-osc66 0 0 0 "x"))
+             nil "s=0 should fail")
+  (cl-assert (not (kitty-gfx--validate-osc66 8 0 0 "x"))
+             nil "s=8 should fail")
+  (cl-assert (not (kitty-gfx--validate-osc66 2 5 3 "x"))
+             nil "n > d should fail")
+  (cl-assert (not (kitty-gfx--validate-osc66 2 5 5 "x"))
+             nil "n = d should fail")
+  ;; validate-osc66: text length
+  (cl-assert (kitty-gfx--validate-osc66 1 0 0 (make-string 4096 ?a))
+             nil "4096 bytes should pass")
+  (cl-assert (not (kitty-gfx--validate-osc66 1 0 0 (make-string 4097 ?a)))
+             nil "4097 bytes should fail")
+  ;; All decomposed scales should validate
+  (dolist (scale '(1.0 1.2 1.5 2.0 2.5 3.0 4.0 5.0 6.0 7.0))
+    (let ((params (kitty-gfx--decompose-scale scale)))
+      (cl-assert (kitty-gfx--validate-osc66
+                  (nth 0 params) (nth 1 params) (nth 2 params) "test")
+                 nil (format "decomposed scale %.1f should validate" scale))))
+  (message "kitty-gfx: all self-tests passed"))
 
 ;;;; Position mapping
 
@@ -1020,9 +1168,8 @@ delete step, avoiding visual glitches in some terminals."
 Uses d=i (lowercase) to remove the placement but keep stored image
 data so the image can be re-placed without retransmitting."
   (kitty-gfx--log "delete-placement: id=%d pid=%d" id pid)
-  (ignore-errors
-    (send-string-to-terminal
-     (format "\e_Ga=d,d=i,i=%d,p=%d,q=2\e\\" id pid))))
+  (kitty-gfx--terminal-send
+   (format "\e_Ga=d,d=i,i=%d,p=%d,q=2\e\\" id pid)))
 
 (defun kitty-gfx--remove-overlay (ov &optional keep-placement)
   "Remove overlay OV and delete its placement from terminal.
