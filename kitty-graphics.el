@@ -68,6 +68,7 @@
 (defvar org-heading-regexp)
 (defvar image-mode-map)
 (declare-function markdown-overlays--resolve-image-url "markdown-overlays" (url))
+(declare-function json-encode "json" (object))
 
 ;;;; Customization
 
@@ -101,6 +102,12 @@ This debounces rapid redisplay events.  Default is ~1 frame at 60fps."
 
 (defcustom kitty-gfx-debug nil
   "When non-nil, log debug info to *kitty-gfx-debug* buffer."
+  :type 'boolean
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-enable-video nil
+  "When non-nil, enable inline video playback via mpv.
+Requires mpv with --vo=kitty support (mpv 0.36.0+)."
   :type 'boolean
   :group 'kitty-graphics)
 
@@ -241,6 +248,24 @@ nil means not yet queried.  Possible values after query:
   "Timer for debouncing heading re-scans after text edits.
 Prevents queuing redundant `kitty-gfx--org-apply-heading-sizes'
 calls when multiple characters are typed rapidly.")
+
+(defvar-local kitty-gfx--mpv-process nil
+  "The mpv process object for the current buffer's video.")
+
+(defvar-local kitty-gfx--mpv-ipc-socket nil
+  "Path to the mpv JSON IPC socket file.")
+
+(defvar-local kitty-gfx--mpv-ipc-connection nil
+  "Network process connected to mpv's IPC socket.")
+
+(defvar-local kitty-gfx--mpv-overlay nil
+  "The overlay reserving space for the video.")
+
+(defvar-local kitty-gfx--mpv-last-row nil
+  "Last known terminal row of the video overlay.")
+
+(defvar-local kitty-gfx--mpv-last-col nil
+  "Last known terminal column of the video overlay.")
 
 ;;;; Terminal detection
 
@@ -548,8 +573,9 @@ OV is the overlay (unused by Kitty backend but part of the interface)."
          (in-tmux (getenv "TMUX"))
          (supported (and term
                          (not in-tmux)  ; Sixel doesn't work in tmux
-                         (or (string-match-p "xterm\\|vt[0-9]" term)
-                             (member term-prog '("foot" "Konsole" "mintty" "mlterm")))
+                         (or (string-match-p "xterm\\|vt[0-9]\\|foot\\|contour" term)
+                             (member term-prog '("foot" "Konsole" "mintty" "mlterm"
+                                                 "contour" "WezTerm")))
                          t)))
     (kitty-gfx--log "sixel-detect: %s (TERM=%s TERM_PROGRAM=%s TMUX=%s)"
                      supported term term-prog (if in-tmux "yes" "no"))
@@ -1303,7 +1329,9 @@ to prevent flicker."
                      (kitty-gfx--refresh-overlay ov win-bottom)
                      (if (overlay-get ov 'kitty-gfx-last-row)
                          (cl-incf placed)
-                       (cl-incf hidden)))))))
+                       (cl-incf hidden)))))
+               ;; Refresh mpv video overlay position
+               (kitty-gfx--refresh-mpv-overlay)))
            nil 'visible)
         ;; Phase 2: emit OSC 66 for all visible heading overlays.
         ;; This runs AFTER all posn-at-point queries (phase 1) to
@@ -1992,6 +2020,7 @@ The buffer should be writable (caller handles `inhibit-read-only')."
         (setq kitty-graphics-mode nil)
         (message "Kitty graphics: terminal not supported"))
     (kitty-gfx--log "mode: disabling")
+    (kitty-gfx-stop-video)
     (kitty-gfx--uninstall-hooks)
     (kitty-gfx--uninstall-integrations)
     (when kitty-gfx--active-backend
@@ -2614,6 +2643,225 @@ Falls back to ORIG-FN in GUI."
            (kitty-gfx--log "markdown-overlays-path error: %s" (error-message-string err)))))
     (funcall orig-fn start end path-start path-end)))
 
+;;;; mpv video integration
+
+(defun kitty-gfx--mpv-available-p ()
+  "Return non-nil if mpv video playback is available."
+  (and kitty-gfx-enable-video
+       kitty-graphics-mode
+       (not (display-graphic-p))
+       (eq kitty-gfx--active-backend 'kitty)
+       (executable-find "mpv")))
+
+(defun kitty-gfx--mpv-ipc-send (command)
+  "Send COMMAND (a list) to mpv via JSON IPC.
+COMMAND is encoded as {\"command\": COMMAND}."
+  (when (and kitty-gfx--mpv-ipc-connection
+             (process-live-p kitty-gfx--mpv-ipc-connection))
+    (let ((json (concat (json-encode `(("command" . ,command))) "\n")))
+      (condition-case err
+          (process-send-string kitty-gfx--mpv-ipc-connection json)
+        (error
+         (kitty-gfx--log "mpv-ipc-send error: %s" (error-message-string err)))))))
+
+(defun kitty-gfx--mpv-ipc-connect (socket-path callback)
+  "Poll for SOCKET-PATH existence, then connect and call CALLBACK.
+Polls every 50ms, times out after 2 seconds."
+  (let ((attempts 0)
+        (max-attempts 40))
+    (cl-labels
+        ((try-connect ()
+           (cond
+            ((file-exists-p socket-path)
+             (condition-case err
+                 (let ((proc (make-network-process
+                              :name "kitty-gfx-mpv-ipc"
+                              :family 'local
+                              :service socket-path
+                              :buffer nil
+                              :noquery t
+                              :filter (lambda (_proc output)
+                                        (kitty-gfx--log "mpv-ipc: %s" output)))))
+                   (setq kitty-gfx--mpv-ipc-connection proc)
+                   (kitty-gfx--log "mpv: IPC connected to %s" socket-path)
+                   (when callback (funcall callback)))
+               (error
+                (kitty-gfx--log "mpv: IPC connect failed: %s" (error-message-string err))
+                (cl-incf attempts)
+                (when (< attempts max-attempts)
+                  (run-at-time 0.05 nil #'try-connect)))))
+            ((< attempts max-attempts)
+             (cl-incf attempts)
+             (run-at-time 0.05 nil #'try-connect))
+            (t
+             (kitty-gfx--log "mpv: IPC socket timeout after 2s")
+             (message "kitty-gfx: mpv IPC connection timed out")))))
+      (try-connect))))
+
+(defun kitty-gfx--mpv-compute-geometry ()
+  "Compute video geometry as (COL ROW WIDTH-PX HEIGHT-PX COLS ROWS).
+Uses the selected window dimensions and cell pixel size."
+  (kitty-gfx--query-cell-size)
+  (let* ((cw (or kitty-gfx--cell-pixel-width 8))
+         (ch (or kitty-gfx--cell-pixel-height 16))
+         (max-cols (min (- (window-body-width) 2) kitty-gfx-max-width))
+         (max-rows (min (- (window-body-height) 4) kitty-gfx-max-height))
+         ;; 16:9 aspect ratio, fit within max bounds
+         (video-cols max-cols)
+         (video-rows (min max-rows (max 10 (/ (* video-cols 9) 16))))
+         (width-px (* video-cols cw))
+         (height-px (* video-rows ch)))
+    (list 1 1 width-px height-px video-cols video-rows)))
+
+(defun kitty-gfx--mpv-overlay-position ()
+  "Return (ROW . COL) terminal position of the mpv overlay, or nil if hidden.
+ROW and COL are 1-based terminal cell coordinates."
+  (when (and kitty-gfx--mpv-overlay
+             (overlay-buffer kitty-gfx--mpv-overlay))
+    (let* ((ov kitty-gfx--mpv-overlay)
+           (start (overlay-start ov))
+           (win (get-buffer-window (overlay-buffer ov))))
+      (when (and win
+                 (pos-visible-in-window-p start win))
+        (let* ((win-edges (window-edges win nil nil t))
+               (win-top (nth 1 win-edges))
+               (win-left (nth 0 win-edges))
+               (coords (posn-col-row (posn-at-point start win)))
+               (col (+ win-left (car coords) 1))
+               (row (+ (/ win-top (or kitty-gfx--cell-pixel-height 16))
+                       (cdr coords) 1)))
+          (cons row col))))))
+
+(defun kitty-gfx--refresh-mpv-overlay ()
+  "Update mpv position if the overlay has moved.  Called from the refresh cycle."
+  (when (and kitty-gfx--mpv-process
+             (process-live-p kitty-gfx--mpv-process)
+             kitty-gfx--mpv-overlay)
+    (let ((pos (kitty-gfx--mpv-overlay-position)))
+      (if pos
+          (let ((row (car pos))
+                (col (cdr pos)))
+            (unless (and (eql row kitty-gfx--mpv-last-row)
+                         (eql col kitty-gfx--mpv-last-col))
+              (kitty-gfx--log "mpv: reposition to row=%d col=%d" row col)
+              (kitty-gfx--mpv-ipc-send (list "set_property" "vo-kitty-top" row))
+              (kitty-gfx--mpv-ipc-send (list "set_property" "vo-kitty-left" col))
+              (setq kitty-gfx--mpv-last-row row
+                    kitty-gfx--mpv-last-col col)))
+        ;; Overlay not visible — keep audio, hide video
+        (when kitty-gfx--mpv-last-row
+          (kitty-gfx--log "mpv: overlay hidden, keeping audio")
+          (setq kitty-gfx--mpv-last-row nil
+                kitty-gfx--mpv-last-col nil))))))
+
+(defun kitty-gfx--mpv-process-sentinel (proc event)
+  "Handle mpv process state changes.
+PROC is the mpv process, EVENT describes the state change."
+  (kitty-gfx--log "mpv: process event: %s" (string-trim event))
+  (when (memq (process-status proc) '(exit signal))
+    (dolist (b (buffer-list))
+      (with-current-buffer b
+        (when (eq kitty-gfx--mpv-process proc)
+          (kitty-gfx--mpv-cleanup))))))
+
+(defun kitty-gfx--mpv-cleanup ()
+  "Clean up mpv state in the current buffer."
+  (when kitty-gfx--mpv-ipc-connection
+    (ignore-errors (delete-process kitty-gfx--mpv-ipc-connection))
+    (setq kitty-gfx--mpv-ipc-connection nil))
+  (when kitty-gfx--mpv-process
+    (when (process-live-p kitty-gfx--mpv-process)
+      (ignore-errors (kill-process kitty-gfx--mpv-process)))
+    (setq kitty-gfx--mpv-process nil))
+  (when kitty-gfx--mpv-ipc-socket
+    (ignore-errors (delete-file kitty-gfx--mpv-ipc-socket))
+    (setq kitty-gfx--mpv-ipc-socket nil))
+  (when kitty-gfx--mpv-overlay
+    (ignore-errors (delete-overlay kitty-gfx--mpv-overlay))
+    (setq kitty-gfx--mpv-overlay nil))
+  (setq kitty-gfx--mpv-last-row nil
+        kitty-gfx--mpv-last-col nil))
+
+;;;###autoload
+(defun kitty-gfx-play-video (file)
+  "Play video FILE inline in the current buffer via mpv.
+Requires `kitty-gfx-enable-video' to be non-nil and mpv installed."
+  (interactive "fVideo file: ")
+  (unless kitty-gfx-enable-video
+    (user-error "Video playback disabled; set kitty-gfx-enable-video to t"))
+  (unless (kitty-gfx--mpv-available-p)
+    (user-error "mpv video requires Kitty backend and mpv installed"))
+  ;; Stop any existing video in this buffer
+  (when kitty-gfx--mpv-process
+    (kitty-gfx--mpv-cleanup))
+  (let* ((file (expand-file-name file))
+         (geom (kitty-gfx--mpv-compute-geometry))
+         (col (nth 0 geom))
+         (row (nth 1 geom))
+         (width-px (nth 2 geom))
+         (height-px (nth 3 geom))
+         (video-cols (nth 4 geom))
+         (video-rows (nth 5 geom))
+         (socket (make-temp-name "/tmp/kitty-gfx-mpv-"))
+         (socket-path (concat socket ".sock")))
+    ;; Create overlay to reserve space
+    (let* ((start (point))
+           (inhibit-read-only t))
+      ;; Insert blank lines for the overlay to cover
+      (insert (make-string video-rows ?\n))
+      (let ((end (point)))
+        (setq kitty-gfx--mpv-overlay
+              (make-overlay start end nil t nil))
+        (overlay-put kitty-gfx--mpv-overlay 'kitty-gfx t)
+        (overlay-put kitty-gfx--mpv-overlay 'kitty-gfx-mpv t)
+        (overlay-put kitty-gfx--mpv-overlay 'kitty-gfx-cols video-cols)
+        (overlay-put kitty-gfx--mpv-overlay 'kitty-gfx-rows video-rows)
+        (overlay-put kitty-gfx--mpv-overlay 'evaporate t)
+        (goto-char start)))
+    ;; Compute initial terminal position
+    (let ((pos (kitty-gfx--mpv-overlay-position)))
+      (when pos
+        (setq row (car pos) col (cdr pos))))
+    ;; Store socket path
+    (setq kitty-gfx--mpv-ipc-socket socket-path)
+    ;; Spawn mpv
+    (let ((proc (start-process
+                 "kitty-gfx-mpv" nil "mpv"
+                 "--vo=kitty"
+                 "--vo-kitty-use-shm=yes"
+                 (format "--vo-kitty-left=%d" col)
+                 (format "--vo-kitty-top=%d" row)
+                 (format "--vo-kitty-width=%d" width-px)
+                 (format "--vo-kitty-height=%d" height-px)
+                 "--vo-kitty-config-clear=no"
+                 "--vo-kitty-alt-screen=no"
+                 "--really-quiet"
+                 "--no-terminal"
+                 (format "--input-ipc-server=%s" socket-path)
+                 file)))
+      (setq kitty-gfx--mpv-process proc)
+      (set-process-sentinel proc #'kitty-gfx--mpv-process-sentinel)
+      (set-process-query-on-exit-flag proc nil)
+      (kitty-gfx--log "mpv: started pid=%s file=%s" (process-id proc) file)
+      ;; Connect IPC after mpv creates the socket
+      (kitty-gfx--mpv-ipc-connect socket-path nil))))
+
+(defun kitty-gfx-stop-video ()
+  "Stop the current buffer's inline video playback."
+  (interactive)
+  (if kitty-gfx--mpv-process
+      (progn
+        (kitty-gfx--mpv-cleanup)
+        (message "kitty-gfx: video stopped"))
+    (message "kitty-gfx: no video playing")))
+
+(defun kitty-gfx-toggle-video ()
+  "Toggle pause/resume of the current buffer's inline video."
+  (interactive)
+  (if (and kitty-gfx--mpv-process (process-live-p kitty-gfx--mpv-process))
+      (kitty-gfx--mpv-ipc-send '("cycle" "pause"))
+    (message "kitty-gfx: no video playing")))
+
 ;;;; Integration install/uninstall
 
 (defun kitty-gfx--install-integrations ()
@@ -2711,6 +2959,8 @@ Only deletes terminal-side image data (and cache entries) if no
 other buffer has overlays referencing the same image ID — this
 prevents breaking shared images (e.g., same file open in org-mode
 and image-mode simultaneously)."
+  (when kitty-gfx--mpv-process
+    (kitty-gfx--mpv-cleanup))
   (when (and kitty-graphics-mode kitty-gfx--overlays)
     (kitty-gfx--log "kill-buffer-hook: buf=%s overlays=%d" (buffer-name) (length kitty-gfx--overlays))
     (let ((deleted-ids nil))
