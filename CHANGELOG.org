@@ -1,0 +1,62 @@
+* Changelog
+
+** kitty-graphics 0.4.0 - HUGE updates
+
+*** Features
+
+- Full sixel support
+- Abstracted the library to support =kitty-gfx-protocol= and =sixel=
+- Support for agent-shell
+  Thanks to [[https://github.com/Lenbok][Lenbok]]
+- First implementation of the text sizing protocol
+
+**** Sixel support!
+
+Yes, you are reading it right! The library now supports displaying images in Terminals also to those, who support sixel, which opens up the support for almost the rest of the up to date terminals.
+
+Tested and confirmed working in =foot=, =xterm=, =Konsole=, =mlterm=, and =mintty=. Auto-detection probes for Sixel support via DA1 query. If your terminal supports it, kitty-graphics will use it automatically.
+
+#+begin_WARNING
+Performance wise, the kitty image protocol is superior in terms of speed and actual image quality (truecolor vs 256 colors). If your terminal supports it, prefer the kitty protocol.
+#+end_WARNING
+
+***** Showcase
+
+[[file:foot.gif]]
+
+**** Text sizing protocol
+
+Yes, we do even now support the text sizing protocol inside Emacs terminal mode! Nonetheless, take that feature with a grain of salt. This protocol is rather new compared to the others, and there are not many references which implement it.
+
+After many attempts, I was able to add something genuinely useful. Org Mode remains my highest priority, of course.
+
+We can render org headings at scaled sizes (=* Heading= at 2x, =** Sub= at 1.5x, =*** Deep= at 1.2x). A preview mode temporarily disables conflicting packages (org-modern, org-appear, olivetti, etc.) for clean rendering. Toggling images does also work, though currently not while the text protocol is active at the same time.
+
+I will keep on improving this feature. I think it is actually great eyecandy, and something I had never seen before and had not even known about until somebody mentioned it under one of my threads on Reddit. If you, /anon/, feel mentioned, a big thanks to you!
+
+*Requires Kitty >= 0.40.0* (the only terminal currently implementing OSC 66 with scale support).
+
+***** Showcase
+
+[[file:kitty.gif]]
+
+*** Bug fixes & polish
+
+- Text sizing: added column guard to prevent out-of-bounds rendering, CPU optimization (reduced redundant redraws), improved preview mode stability
+- Sixel backend parity improvements: better interop with the kitty protocol path
+- Heading rendering: skip overlay emission when a heading is folded to the same visual line (prevents ghost glyphs)
+- Erase strategy: switched to ECH erase + pre-erase pattern (credit: mdfried) for cleaner column clearing
+
+*** What comes next?
+
+**** tmux support
+
+tmux support is next. It already supports sixel, so the sixel backend will work there out of the box.
+
+There is also an in-progress branch adding [[https://github.com/tmux/tmux/tree/ta/kitty-img][kitty image protocol support to tmux]]. If you already use Kitty directly, though, I would stick with it. The kitty protocol gives you stateful image management, truecolor rendering, and a smoother overall experience.
+
+**** Package renaming?
+
+I was thinking about renaming the project into something like =terminal-gfx= as we do now cover not only one way of displaying images, but also take an approach to stabilize the =text-protocol=. This is my first project with people actually using and/or are interested in what I do =:D=. So if you have suggestions or feedback, I would love to hear your opinion!
+
+/In terms of actually renaming the package, I will do it in such a manner, that your current and future configurations are not going to break. Shoutouts to neovim and its stable ecosystem *hust hust*./

@@ -5,9 +5,13 @@ Display images in terminal Emacs (~emacs -nw~) using the [[https://sw.kovidgoyal
 
 * Demo
 
-[[file:demo-1.gif]]
+*Kitty backend (truecolor):*
 
-[[file:demo-2.gif]]
+[[file:kitty.gif]]
+
+*Sixel backend (foot):*
+
+[[file:foot.gif]]
 
 * Foreword
 
