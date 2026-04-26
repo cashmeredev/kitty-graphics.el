@@ -265,7 +265,10 @@ Key design differences from images:
 
 - **Required**: Emacs >= 27.1, a supported terminal (Kitty/WezTerm/Ghostty
   for Kitty backend; foot/Konsole/xterm/mlterm/mintty for Sixel)
-- **Required for Sixel**: ImageMagick (`magick`/`convert`) for encoding
+- **Required for Sixel**: a Sixel encoder on PATH -- `img2sixel`
+  (libsixel, recommended) or ImageMagick (`magick`/`convert`).
+  Override via `kitty-gfx-sixel-encoder-program'; bound by
+  `kitty-gfx-sixel-encoder-timeout' (default 5s).
 - **Optional for Kitty**: ImageMagick for non-PNG formats and pixel-accurate sizing
 - **Optional for typst preview**: `typst` CLI on PATH (used by
   `kitty-gfx-typst-preview`)
