@@ -2166,6 +2166,19 @@ The buffer should be writable (caller handles `inhibit-read-only')."
               (kitty-gfx--query-text-sizing-support))
             (kitty-gfx--install-hooks)
             (kitty-gfx--install-integrations)
+            ;; Sixel backend silently drops images when no encoder is on
+            ;; PATH.  Warn loudly so users notice before they wonder why
+            ;; nothing renders.
+            (when (and (eq kitty-gfx--active-backend 'sixel)
+                       (not (kitty-gfx--sixel-resolve-encoder)))
+              (kitty-gfx--log "mode: WARNING no Sixel encoder on PATH")
+              (display-warning
+               'kitty-graphics
+               "Sixel backend active but no encoder on PATH.
+Install `img2sixel' (libsixel; strongly recommended) or
+ImageMagick (`magick'/`convert').  Without an encoder, no images
+will render even though detection reports Sixel as supported."
+               :warning))
             (kitty-gfx--log "mode: enabled (backend=%s cell=%dx%d text-sizing=%s)"
                              kitty-gfx--active-backend
                              kitty-gfx--cell-pixel-width kitty-gfx--cell-pixel-height

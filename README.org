@@ -47,7 +47,11 @@ Integrations are provided for:
 - A supported terminal:
   - *Kitty backend*: [[https://sw.kovidgoyal.net/kitty/][Kitty]] >= 0.20.0, WezTerm, or Ghostty
   - *Sixel backend*: foot, Konsole, xterm (with ~+sixel~), mlterm, mintty, VS Code Terminal, and others with Sixel support
-- ImageMagick (~magick~ / ~convert~ / ~identify~) --- required for Sixel, and for non-PNG formats on Kitty
+- A Sixel encoder on ~PATH~ --- /required/ for the Sixel backend.
+  - *Strongly recommended*: ~img2sixel~ from [[https://github.com/saitoha/libsixel][libsixel]] (Nix: ~nixpkgs#libsixel~). Roughly =2.2x= smaller payloads and =~10x= faster than ImageMagick, which matters a lot in tmux where every refresh re-emits the full DCS payload.
+  - *Fallback*: ImageMagick 7 (~magick~) or 6 (~convert~). Works, but slower; on long sessions and in tmux you may notice flicker on redraw.
+  - Override the auto-detect order via ~kitty-gfx-sixel-encoder-program~. If neither is on ~PATH~ the Sixel backend logs ~no encoder found~ and silently produces no image, so make sure one is installed before launching Emacs.
+- ImageMagick (~magick~ / ~identify~) --- still needed for non-PNG formats on the Kitty backend (JPEG/WebP/SVG/TIFF/BMP -> PNG conversion) and for the dimension probe
 - For LaTeX preview: a TeX distribution with ~dvipng~ (e.g. ~texlive~)
 - For doc-view: ~ghostscript~ (for PDF), ~dvipng~ (for DVI) --- same tools as GUI Emacs
 - Launch Emacs with ~TERM=xterm-256color~ (Emacs often can't find the ~xterm-kitty~ terminfo)
@@ -146,7 +150,8 @@ TIFF, BMP) are converted to PNG via ImageMagick before transmission.
 - Partial tmux support: Sixel works inside tmux >= 3.4 (native sixel rendering, foot/Konsole/mintty/mlterm/WezTerm as outer terminal); set ~kitty-gfx-tmux-allow-sixel~ to ~nil~ to opt out. Images may stick to old positions after scrolling because tmux's cell buffer is not pixel-aware (upstream tmux limitation). Kitty graphics passthrough inside tmux is still unimplemented
 - Animated GIFs display only the first frame
 - Sixel is limited to 256 colors (vs truecolor on Kitty) and is stateless --- images are re-emitted on every scroll, which may be slower on large images
-- Without ImageMagick, only PNG files work on the Kitty backend; the Sixel backend requires ImageMagick unconditionally
+- The Sixel backend needs a Sixel encoder on ~PATH~. ~img2sixel~ (libsixel) is strongly recommended; ~magick~ / ~convert~ work as fallback but are noticeably slower. With no encoder on ~PATH~, the backend silently produces no output and only logs ~no encoder found~ to ~/tmp/kitty-gfx.log~ when ~kitty-gfx-debug~ is non-nil
+- Without ImageMagick, only PNG files work on the Kitty backend
 - Doc-view page may briefly flash at wrong position before centering on initial load
 
 * License
