@@ -32,7 +32,7 @@ emacs -Q -batch -l kitty-graphics.el -f kill-emacs
 
 No automated test framework. All testing is manual/interactive and
 requires a supported terminal (Kitty, WezTerm, Ghostty for Kitty backend;
-foot, Konsole, xterm, mlterm, mintty for Sixel backend).
+foot, Konsole, xterm, mlterm, mintty, Windows Terminal for Sixel backend).
 The `tests/` directory contains `test-kitty-gfx.org`, `test-image.png`,
 and `test-document.pdf` for manual testing -- use these rather than
 creating new test files.
@@ -250,8 +250,8 @@ Key design differences from images:
   scrolling because tmux's cell buffer is not pixel-aware (upstream limit).
   Kitty graphics passthrough is still unimplemented -- tracked separately.
 - **Limitation**: Each mode needs explicit `:around` advice integration
-- **Limitation**: GIF files are not supported (multi-frame conversion issues,
-  no animation support in terminal)
+- **Limitation**: GIF files render only the first frame -- no animation
+  support in terminal (multi-frame conversion not implemented)
 - **Limitation**: Sixel is 256 colors (vs truecolor on Kitty), stateless (re-emits on scroll)
 - **Done**: LaTeX fragment preview in org-mode (#3)
 - **Done**: doc-view / pdf-view-mode integration (#4)

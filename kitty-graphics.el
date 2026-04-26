@@ -642,17 +642,24 @@ Sixel because they drop the DCS payload."
          (in-tmux (getenv "TMUX"))
          (tmux-ver (and in-tmux (kitty-gfx--tmux-version)))
          (tmux-ok (kitty-gfx--tmux-sixel-supported-p))
+         ;; Windows Terminal's TERM value is not stable enough to rely on
+         ;; alone, so accept its session markers when present.
+         (windows-terminal (or (getenv "WT_SESSION")
+                               (getenv "WT_PROFILE_ID")
+                               (getenv "WT_WINDOWID")))
          (supported (and term
                          (or (not in-tmux) tmux-ok)
                          (or (string-match-p "xterm\\|vt[0-9]\\|foot\\|contour" term)
                              (member term-prog '("foot" "Konsole" "mintty" "mlterm"
-                                                 "contour" "WezTerm")))
+                                                 "contour" "WezTerm"))
+                             windows-terminal)
                          t)))
     (kitty-gfx--log
-     "sixel-detect: %s (TERM=%s TERM_PROGRAM=%s TMUX=%s tmux-ver=%s tmux-ok=%s)"
+     "sixel-detect: %s (TERM=%s TERM_PROGRAM=%s TMUX=%s tmux-ver=%s tmux-ok=%s WT=%s)"
      supported term term-prog (if in-tmux "yes" "no")
      (if tmux-ver (format "%d.%d" (car tmux-ver) (cadr tmux-ver)) "n/a")
-     (if tmux-ok "yes" "no"))
+     (if tmux-ok "yes" "no")
+     (if windows-terminal "yes" "no"))
     supported))
 
 (defun kitty-gfx--sixel-cache-path (file cols rows)
@@ -2289,11 +2296,13 @@ then let the refresh cycle re-emit the visible ones."
     (kitty-gfx--schedule-refresh)))
 
 (defun kitty-gfx--image-file-p (file)
-  "Return non-nil if FILE has an image extension."
+  "Return non-nil if FILE has an image extension.
+GIF files are detected so they get routed through the image pipeline,
+but only the first frame is rendered (no animation in terminal)."
   (let ((ext (file-name-extension file)))
     (and ext (member (downcase ext)
                      '("png" "jpg" "jpeg" "bmp" "svg"
-                       "webp" "tiff" "tif")))))
+                       "webp" "tiff" "tif" "gif")))))
 
 (defun kitty-gfx--org-display-inline-images-tty (&optional _include-linked beg end)
   "Display inline images in org buffer via Kitty graphics.
