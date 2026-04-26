@@ -244,7 +244,11 @@ Key design differences from images:
 ## Known Issues & Planned Work
 
 - **Fixed**: Overlays remain visible when org headings are collapsed (#1)
-- **Limitation**: Does not work inside tmux (neither Kitty passthrough nor Sixel) (#2)
+- **Partial**: tmux support (#2) -- Sixel works inside tmux >= 3.4 (native
+  rendering, foot/Konsole/etc as outer terminal); guarded by
+  `kitty-gfx-tmux-allow-sixel'.  Known caveat: images may persist after
+  scrolling because tmux's cell buffer is not pixel-aware (upstream limit).
+  Kitty graphics passthrough is still unimplemented -- tracked separately.
 - **Limitation**: Each mode needs explicit `:around` advice integration
 - **Limitation**: GIF files are not supported (multi-frame conversion issues,
   no animation support in terminal)

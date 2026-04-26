@@ -207,6 +207,17 @@ will otherwise block Emacs."
   :type '(choice (const :tag "No timeout" nil) number)
   :group 'kitty-graphics)
 
+(defcustom kitty-gfx-tmux-allow-sixel t
+  "When non-nil, allow the Sixel backend to engage inside tmux >= 3.4.
+tmux 3.4 (released 2024-02-13) ships native Sixel rendering, so this
+package no longer hard-disables Sixel under tmux.  Set to nil if your
+tmux is built without `--enable-sixel' or if you prefer to avoid the
+upstream scroll artifact: tmux's cell buffer is not pixel-aware, so
+images may persist after scrolling until the affected cells are
+overwritten."
+  :type 'boolean
+  :group 'kitty-graphics)
+
 (defcustom kitty-gfx-heading-scales '((1 . 2.0) (2 . 1.5) (3 . 1.2))
   "Alist mapping org heading level to visual scale factor.
 Headings at levels not listed use scale 1.0 (normal size).
@@ -588,19 +599,60 @@ OV is the overlay (unused by Kitty backend but part of the interface)."
 (defvar kitty-gfx--sixel-cache (make-hash-table :test 'equal)
   "Maps (file . dims-string) to temp sixel file paths.")
 
+(defvar kitty-gfx--tmux-version-cache 'unset
+  "Cached `kitty-gfx--tmux-version' result.
+Sentinel `unset' means the probe has not run yet; nil means tmux was
+absent or its version could not be parsed; otherwise a list (MAJOR MINOR).")
+
+(defun kitty-gfx--tmux-version ()
+  "Return tmux version as (MAJOR MINOR) integers, or nil when unavailable.
+Memoised in `kitty-gfx--tmux-version-cache'."
+  (when (eq kitty-gfx--tmux-version-cache 'unset)
+    (setq kitty-gfx--tmux-version-cache
+          (when (executable-find "tmux")
+            (with-temp-buffer
+              (when (zerop (ignore-errors
+                             (call-process "tmux" nil t nil "-V")))
+                (goto-char (point-min))
+                (when (re-search-forward
+                       "tmux\\(?:[[:space:]]+next-\\)?[[:space:]]+\\([0-9]+\\)\\.\\([0-9]+\\)"
+                       nil t)
+                  (list (string-to-number (match-string 1))
+                        (string-to-number (match-string 2)))))))))
+  kitty-gfx--tmux-version-cache)
+
+(defun kitty-gfx--tmux-sixel-supported-p ()
+  "Return non-nil when running under tmux >= 3.4 with Sixel allowed.
+Returns nil outside tmux, nil when `kitty-gfx-tmux-allow-sixel' is off,
+nil when tmux's version cannot be determined, and nil for tmux < 3.4."
+  (and (getenv "TMUX")
+       kitty-gfx-tmux-allow-sixel
+       (let ((ver (kitty-gfx--tmux-version)))
+         (and ver
+              (or (> (car ver) 3)
+                  (and (= (car ver) 3) (>= (cadr ver) 4)))))))
+
 (defun kitty-gfx--sixel-detect ()
-  "Return non-nil if the terminal likely supports Sixel protocol."
+  "Return non-nil if the terminal likely supports Sixel protocol.
+Inside tmux, requires tmux >= 3.4 (native Sixel rendering, 2024-02-13)
+and `kitty-gfx-tmux-allow-sixel'.  Older tmux versions still disable
+Sixel because they drop the DCS payload."
   (let* ((term (getenv "TERM"))
          (term-prog (getenv "TERM_PROGRAM"))
          (in-tmux (getenv "TMUX"))
+         (tmux-ver (and in-tmux (kitty-gfx--tmux-version)))
+         (tmux-ok (kitty-gfx--tmux-sixel-supported-p))
          (supported (and term
-                         (not in-tmux)  ; Sixel doesn't work in tmux
+                         (or (not in-tmux) tmux-ok)
                          (or (string-match-p "xterm\\|vt[0-9]\\|foot\\|contour" term)
                              (member term-prog '("foot" "Konsole" "mintty" "mlterm"
                                                  "contour" "WezTerm")))
                          t)))
-    (kitty-gfx--log "sixel-detect: %s (TERM=%s TERM_PROGRAM=%s TMUX=%s)"
-                     supported term term-prog (if in-tmux "yes" "no"))
+    (kitty-gfx--log
+     "sixel-detect: %s (TERM=%s TERM_PROGRAM=%s TMUX=%s tmux-ver=%s tmux-ok=%s)"
+     supported term term-prog (if in-tmux "yes" "no")
+     (if tmux-ver (format "%d.%d" (car tmux-ver) (cadr tmux-ver)) "n/a")
+     (if tmux-ok "yes" "no"))
     supported))
 
 (defun kitty-gfx--sixel-cache-path (file cols rows)

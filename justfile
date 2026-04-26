@@ -141,9 +141,19 @@ test-sixel-image encoder="":
     @echo ">> Run inside foot, Konsole, mintty, mlterm, or WezTerm."
     TERM={{TERM_}} {{EMACS}} -nw -Q -l {{SRC}} \
         --eval "(setq kitty-gfx-debug t kitty-gfx-preferred-protocol 'sixel)" \
-        $(if [ -n "{{encoder}}" ]; then echo "--eval (setq\\ kitty-gfx-sixel-encoder-program\\ \"{{encoder}}\")"; fi) \
+        --eval '(when (> (length "{{encoder}}") 0) (setq kitty-gfx-sixel-encoder-program "{{encoder}}"))' \
         --eval "(kitty-graphics-mode 1)" \
         tests/test-image.png
+
+# Open test-image.png inside `tmux new-session', sixel backend forced
+# (run on a sixel-capable outer terminal, requires tmux >= 3.4)
+test-sixel-tmux encoder="":
+    @echo ">> Outer terminal must be sixel-capable (foot, Konsole, mintty, ...)."
+    @echo ">> tmux >= 3.4 with --enable-sixel required."
+    tmux new-session -As kgfx-sixel-test "TERM={{TERM_}} {{EMACS}} -nw -Q -l {{SRC}} \
+        --eval '(setq kitty-gfx-debug t kitty-gfx-preferred-protocol (quote sixel))' \
+        --eval '(when (> (length \"{{encoder}}\") 0) (setq kitty-gfx-sixel-encoder-program \"{{encoder}}\"))' \
+        --eval '(kitty-graphics-mode 1)' tests/test-image.png"
 
 # --- Logs -------------------------------------------------------------------
 

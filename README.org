@@ -143,7 +143,7 @@ TIFF, BMP) are converted to PNG via ImageMagick before transmission.
 
 * Known Limitations
 
-- No tmux support (neither Kitty passthrough nor Sixel)
+- Partial tmux support: Sixel works inside tmux >= 3.4 (native sixel rendering, foot/Konsole/mintty/mlterm/WezTerm as outer terminal); set ~kitty-gfx-tmux-allow-sixel~ to ~nil~ to opt out. Images may stick to old positions after scrolling because tmux's cell buffer is not pixel-aware (upstream tmux limitation). Kitty graphics passthrough inside tmux is still unimplemented
 - Animated GIFs display only the first frame
 - Sixel is limited to 256 colors (vs truecolor on Kitty) and is stateless --- images are re-emitted on every scroll, which may be slower on large images
 - Without ImageMagick, only PNG files work on the Kitty backend; the Sixel backend requires ImageMagick unconditionally
