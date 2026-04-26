@@ -2289,6 +2289,157 @@ image via Kitty graphics instead of an Emacs image spec."
                  (eq (overlay-get ov 'org-overlay-type) 'org-latex-overlay))
         (kitty-gfx--remove-overlay ov)))))
 
+;;;; Typst inline equation preview
+
+(defcustom kitty-gfx-typst-command "typst"
+  "Path to the typst executable used for inline math previews."
+  :type 'string
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-typst-ppi 300
+  "Pixels-per-inch passed to `typst compile' for math previews.
+Higher values give crisper images at the cost of compile time."
+  :type 'integer
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-typst-text-size 11
+  "Text size in points used when rendering typst math fragments."
+  :type 'integer
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-typst-preamble nil
+  "Extra typst code prepended to each math fragment before compilation.
+When nil, a default preamble is used that auto-sizes the page,
+disables the page fill, and applies `kitty-gfx-typst-text-size' with
+the current Emacs foreground color."
+  :type '(choice (const :tag "Default" nil) string)
+  :group 'kitty-graphics)
+
+(defvar kitty-gfx--typst-cache-dir nil
+  "Directory holding cached typst-rendered PNGs.")
+
+(defun kitty-gfx--typst-cache-dir ()
+  "Return the cache directory for typst PNGs, creating it if needed."
+  (unless (and kitty-gfx--typst-cache-dir
+               (file-directory-p kitty-gfx--typst-cache-dir))
+    (setq kitty-gfx--typst-cache-dir
+          (expand-file-name "kitty-gfx-typst" temporary-file-directory))
+    (make-directory kitty-gfx--typst-cache-dir t))
+  kitty-gfx--typst-cache-dir)
+
+(defun kitty-gfx--typst-color-hex (color)
+  "Convert COLOR (name or `#rrggbb') to a `#RRGGBB' string for typst.
+Returns `#000000' on failure."
+  (or (when (stringp color)
+        (let ((rgb (ignore-errors (color-name-to-rgb color))))
+          (when (and rgb (= (length rgb) 3))
+            (format "#%02x%02x%02x"
+                    (round (* 255 (nth 0 rgb)))
+                    (round (* 255 (nth 1 rgb)))
+                    (round (* 255 (nth 2 rgb)))))))
+      "#000000"))
+
+(defun kitty-gfx--typst-default-preamble ()
+  "Build the default typst preamble using current Emacs foreground color."
+  (let* ((raw (face-attribute 'default :foreground nil))
+         (fg (kitty-gfx--typst-color-hex
+              (and (stringp raw)
+                   (not (string-prefix-p "unspecified" raw))
+                   raw))))
+    (format "#set page(width: auto, height: auto, margin: 2pt, fill: none)
+#set text(size: %dpt, fill: rgb(\"%s\"))
+"
+            kitty-gfx-typst-text-size fg)))
+
+(defconst kitty-gfx--typst-math-regexp
+  "\\$\\(?:[^$\n\\\\]\\|\\\\.\\)+\\$"
+  "Regexp matching a single `$...$' typst math fragment on one line.
+Backslash-escaped characters within the fragment are allowed; newlines
+end the match.")
+
+(defun kitty-gfx--typst-render (fragment)
+  "Compile FRAGMENT (typst source including the surrounding `$') to PNG.
+Return the absolute path to the generated PNG, or nil on failure.
+Results are cached under `kitty-gfx--typst-cache-dir', keyed by SHA-1
+of the full preamble + fragment + ppi."
+  (unless (executable-find kitty-gfx-typst-command)
+    (user-error "typst executable not found: %s" kitty-gfx-typst-command))
+  (let* ((preamble (or kitty-gfx-typst-preamble
+                       (kitty-gfx--typst-default-preamble)))
+         (body (concat preamble fragment "\n"))
+         (key (sha1 (format "%s|%d" body kitty-gfx-typst-ppi)))
+         (dir (kitty-gfx--typst-cache-dir))
+         (typ (expand-file-name (concat key ".typ") dir))
+         (png (expand-file-name (concat key ".png") dir)))
+    (unless (file-exists-p png)
+      (with-temp-file typ (insert body))
+      (let* ((log-buf (get-buffer-create "*kitty-gfx-typst*"))
+             (ret (condition-case err
+                      (call-process kitty-gfx-typst-command nil log-buf nil
+                                    "compile"
+                                    "--format" "png"
+                                    "--ppi" (number-to-string kitty-gfx-typst-ppi)
+                                    typ png)
+                    (error
+                     (kitty-gfx--log "typst-render: call-process error: %S" err)
+                     -1))))
+        (unless (eq ret 0)
+          (kitty-gfx--log "typst-render: compile failed (exit=%s) for %s"
+                          ret typ)
+          (setq png nil))))
+    (and png (file-exists-p png) png)))
+
+;;;###autoload
+(defun kitty-gfx-typst-preview (&optional beg end)
+  "Render typst `$...$' math fragments as inline PNG images.
+With an active region, restrict to it; otherwise scan the whole buffer.
+Existing typst preview overlays in the range are replaced.
+Requires `kitty-graphics-mode' and a working `typst' executable."
+  (interactive (if (use-region-p)
+                   (list (region-beginning) (region-end))
+                 (list nil nil)))
+  (unless kitty-graphics-mode
+    (user-error "kitty-graphics-mode is not active"))
+  (unless kitty-gfx--active-backend
+    (user-error "Terminal does not support graphics"))
+  (let ((start (or beg (point-min)))
+        (stop (or end (point-max)))
+        (count 0))
+    (kitty-gfx-typst-clear-preview start stop)
+    (save-excursion
+      (goto-char start)
+      (while (re-search-forward kitty-gfx--typst-math-regexp stop t)
+        (let* ((m-beg (match-beginning 0))
+               (m-end (match-end 0))
+               (frag (match-string-no-properties 0))
+               (png (kitty-gfx--typst-render frag)))
+          (when png
+            (kitty-gfx-display-image png m-beg m-end)
+            (when-let* ((ov (car kitty-gfx--overlays)))
+              (overlay-put ov 'kitty-gfx-typst t)
+              (overlay-put ov 'modification-hooks
+                           (list (lambda (o after &rest _)
+                                   (when after
+                                     (kitty-gfx--remove-overlay o))))))
+            (cl-incf count)))))
+    (when (called-interactively-p 'any)
+      (message "kitty-gfx: rendered %d typst fragment%s"
+               count (if (= count 1) "" "s")))
+    count))
+
+;;;###autoload
+(defun kitty-gfx-typst-clear-preview (&optional beg end)
+  "Remove kitty-graphics typst preview overlays between BEG and END.
+With an active region, restrict to it; otherwise clear the whole buffer."
+  (interactive (if (use-region-p)
+                   (list (region-beginning) (region-end))
+                 (list nil nil)))
+  (let ((start (or beg (point-min)))
+        (stop (or end (point-max))))
+    (dolist (ov (overlays-in start stop))
+      (when (overlay-get ov 'kitty-gfx-typst)
+        (kitty-gfx--remove-overlay ov)))))
+
 ;;;; image-mode integration
 
 (defvar-local kitty-gfx--image-scale 1.0
