@@ -141,9 +141,32 @@ test-sixel-image encoder="":
     @echo ">> Run inside foot, Konsole, mintty, mlterm, or WezTerm."
     TERM={{TERM_}} {{EMACS}} -nw -Q -l {{SRC}} \
         --eval "(setq kitty-gfx-debug t kitty-gfx-preferred-protocol 'sixel)" \
-        $(if [ -n "{{encoder}}" ]; then echo "--eval (setq\\ kitty-gfx-sixel-encoder-program\\ \"{{encoder}}\")"; fi) \
+        --eval '(when (> (length "{{encoder}}") 0) (setq kitty-gfx-sixel-encoder-program "{{encoder}}"))' \
         --eval "(kitty-graphics-mode 1)" \
         tests/test-image.png
+
+# Open test-image.png inside tmux with sixel backend forced.
+# Outer terminal must be sixel-capable (foot, Konsole, mintty, mlterm, WezTerm).
+# Requires tmux >= 3.4 built with --enable-sixel.
+# When already inside tmux, runs emacs directly (no nesting).
+test-sixel-tmux encoder="":
+    #!/usr/bin/env bash
+    set -eu
+    if [ -n "${TMUX:-}" ]; then
+        echo ">> Already inside tmux -- running emacs directly in this pane."
+        exec env TERM={{TERM_}} {{EMACS}} -nw -Q -l {{SRC}} \
+            --eval '(setq kitty-gfx-debug t kitty-gfx-preferred-protocol (quote sixel))' \
+            --eval '(when (> (length "{{encoder}}") 0) (setq kitty-gfx-sixel-encoder-program "{{encoder}}"))' \
+            --eval '(kitty-graphics-mode 1)' \
+            tests/test-image.png
+    else
+        echo ">> Outer terminal must be sixel-capable; spawning fresh tmux session."
+        exec tmux new-session -As kgfx-sixel-test \
+            "TERM={{TERM_}} {{EMACS}} -nw -Q -l {{SRC}} \
+                --eval '(setq kitty-gfx-debug t kitty-gfx-preferred-protocol (quote sixel))' \
+                --eval '(when (> (length \"{{encoder}}\") 0) (setq kitty-gfx-sixel-encoder-program \"{{encoder}}\"))' \
+                --eval '(kitty-graphics-mode 1)' tests/test-image.png"
+    fi
 
 # --- Logs -------------------------------------------------------------------
 

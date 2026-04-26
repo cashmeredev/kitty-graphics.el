@@ -51,9 +51,11 @@ I will keep on improving this feature. I think it is actually great eyecandy, an
 
 **** tmux support
 
-tmux support is next. It already supports sixel, so the sixel backend will work there out of the box.
+The Sixel side is now unlocked: starting in =0.5.0=, =kitty-graphics= no longer hard-disables the Sixel backend when =$TMUX= is set. tmux 3.4 (released 2024-02-13) ships native Sixel rendering, so running Emacs inside =tmux new-session= under foot/Konsole/mintty/mlterm/WezTerm just works. The detector probes =tmux -V= once per session and only engages on tmux >= 3.4. A new option =kitty-gfx-tmux-allow-sixel= (default =t=) lets you opt out if your tmux build lacks =--enable-sixel=.
 
-There is also an in-progress branch adding [[https://github.com/tmux/tmux/tree/ta/kitty-img][kitty image protocol support to tmux]]. If you already use Kitty directly, though, I would stick with it. The kitty protocol gives you stateful image management, truecolor rendering, and a smoother overall experience.
+Caveat: tmux's cell buffer is not pixel-aware, so images may stick to their old position after scrolling until the affected cells are overwritten. That is an upstream tmux limitation, not something this package can fix.
+
+The Kitty graphics protocol still does not work inside tmux because we do not yet wrap APC sequences with the =\ePtmux;...\e\\= passthrough envelope. There is also an in-progress branch adding [[https://github.com/tmux/tmux/tree/ta/kitty-img][native Kitty image protocol support to tmux]]. Until either lands, if you already use Kitty directly I would stick with it -- the Kitty protocol gives you stateful image management, truecolor rendering, and a smoother overall experience.
 
 **** Package renaming?
 

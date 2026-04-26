@@ -244,7 +244,11 @@ Key design differences from images:
 ## Known Issues & Planned Work
 
 - **Fixed**: Overlays remain visible when org headings are collapsed (#1)
-- **Limitation**: Does not work inside tmux (neither Kitty passthrough nor Sixel) (#2)
+- **Partial**: tmux support (#2) -- Sixel works inside tmux >= 3.4 (native
+  rendering, foot/Konsole/etc as outer terminal); guarded by
+  `kitty-gfx-tmux-allow-sixel'.  Known caveat: images may persist after
+  scrolling because tmux's cell buffer is not pixel-aware (upstream limit).
+  Kitty graphics passthrough is still unimplemented -- tracked separately.
 - **Limitation**: Each mode needs explicit `:around` advice integration
 - **Limitation**: GIF files are not supported (multi-frame conversion issues,
   no animation support in terminal)
@@ -265,10 +269,20 @@ Key design differences from images:
 
 - **Required**: Emacs >= 27.1, a supported terminal (Kitty/WezTerm/Ghostty
   for Kitty backend; foot/Konsole/xterm/mlterm/mintty for Sixel)
-- **Required for Sixel**: a Sixel encoder on PATH -- `img2sixel`
-  (libsixel, recommended) or ImageMagick (`magick`/`convert`).
-  Override via `kitty-gfx-sixel-encoder-program'; bound by
-  `kitty-gfx-sixel-encoder-timeout' (default 5s).
+- **Required for Sixel**: a Sixel encoder on `PATH`.
+  - **Strongly recommended**: `img2sixel` from libsixel (~2.2x smaller
+    payload, ~10x faster than ImageMagick on the same input).  Critical
+    inside tmux, where every refresh re-emits the full DCS payload --
+    using ImageMagick there leads to visible flicker.
+  - **Fallback**: ImageMagick 7 (`magick`) or 6 (`convert`).  Works,
+    just slower.
+  - Auto-detect order: `img2sixel` > `magick` > `convert`.  Override
+    via `kitty-gfx-sixel-encoder-program' (nil = auto, string = pin).
+  - With **no** encoder on `PATH`, the Sixel backend silently produces
+    no output and logs `no encoder found` (set `kitty-gfx-debug' to
+    surface this).  Always verify with `just sixel-encoder' before
+    diagnosing rendering bugs.
+  - Bounded by `kitty-gfx-sixel-encoder-timeout' (default 5s).
 - **Optional for Kitty**: ImageMagick for non-PNG formats and pixel-accurate sizing
 - **Optional for typst preview**: `typst` CLI on PATH (used by
   `kitty-gfx-typst-preview`)
