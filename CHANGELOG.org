@@ -1,5 +1,136 @@
 * Changelog
 
+** kitty-graphics 0.5.0
+
+A feature-heavy follow-up to =0.4.0=: typst inline equations, a much
+more robust Sixel encoder pipeline, Sixel inside tmux, and inline mpv
+video playback.  =0.4.0= already shipped the Sixel backend and the
+text-sizing protocol; =0.5.0= builds on that foundation.
+
+*** Features
+
+**** Typst inline equation preview
+
+New autoloaded commands =kitty-gfx-typst-preview= and
+=kitty-gfx-typst-clear-preview= scan the current buffer (or active
+region) for ~$...$~ math fragments, compile each one via the =typst=
+CLI, and replace it with a rendered PNG using the existing
+kitty-graphics overlay pipeline.  Works on both the Kitty and Sixel
+backends.  Customs: =kitty-gfx-typst-command=, =kitty-gfx-typst-ppi=,
+=kitty-gfx-typst-text-size=, =kitty-gfx-typst-preamble=.  Default
+preamble auto-converts the current Emacs foreground colour to the hex
+form typst's =rgb()= requires.  Cached PNGs land under
+=/tmp/kitty-gfx-typst/= keyed by SHA-1 of the source.  Closes #5.
+
+**** Configurable Sixel encoder + per-invocation timeout
+
+The Sixel encoder pipeline used to be hard-wired to ImageMagick with
+no timeout, so a malformed image or a hung encoder could freeze
+Emacs.  Three new customs and two helpers fix that:
+
+- =kitty-gfx-sixel-encoder-program= (nil = auto-detect).  Auto-detect
+  order: =img2sixel= (libsixel) > =magick= (ImageMagick 7) > =convert=
+  (ImageMagick 6, deprecated).  Set to a string to pin a specific
+  binary.
+- =kitty-gfx-sixel-encoder-args= -- extra arguments slotted before
+  the per-invocation size flags.
+- =kitty-gfx-sixel-encoder-timeout= -- float seconds, default =5.0=,
+  =nil= for no timeout.
+
+Internally =kitty-gfx--sixel-resolve-encoder= returns a
+=(KIND . PATH)= cons so the encode pipeline can build the right
+argv (=-w/-h <px>= for img2sixel, =-geometry WxH sixel:-= for
+ImageMagick), and =kitty-gfx--sixel-run-encoder= drives the child via
+=make-process= with a separate stderr buffer and a =run-at-time=
+watchdog that kills the process on timeout.  Failures and timeouts
+surface as a logged =nil= instead of a frozen Emacs.
+
+#+begin_QUOTE
+*Bench*: =tests/test-image.png= encoded at 20×10 cells (160×160 px) on
+my workstation -- =img2sixel= produced =2631=-byte payloads in
+~5 ms, =magick= produced =5831=-byte payloads in ~58 ms.  About =2.2x=
+smaller payload and =~10x= faster.  This matters most inside tmux,
+where every refresh re-emits the full DCS payload.
+#+end_QUOTE
+
+Pattern adapted from [[https://github.com/timfel/sixel-graphics.el][@timfel's =sixel-graphics.el= fork]]; co-authored
+on the commit.  Refs #4.
+
+**** Sixel inside tmux >= 3.4
+
+The Sixel detector used to hard-disable the moment =$TMUX= was set --
+that comment in the code predated tmux =3.4= (released =2024-02-13=),
+which ships native Sixel rendering.  Drop the hard guard, gate on a
+parsed =tmux -V=, and let users opt out via
+=kitty-gfx-tmux-allow-sixel= (default =t=).  New helpers
+=kitty-gfx--tmux-version= (cached) and
+=kitty-gfx--tmux-sixel-supported-p= centralise the in-tmux + opt-in +
+version-check logic.  The =sixel-detect= debug log gained =tmux-ver==
+and =tmux-ok== fields.
+
+Caveat: tmux's cell buffer is not pixel-aware, so images may stick to
+their old position after scrolling until the affected cells are
+overwritten.  That's an upstream tmux limitation, not something this
+package can fix.  The Kitty graphics protocol still does not work
+inside tmux because we do not yet wrap APC sequences with the
+=\ePtmux;...\e\\= passthrough envelope -- separate piece of work.
+Refs #2.
+
+**** Inline mpv video playback (Kitty backend)
+
+The Kitty backend grew video support via mpv IPC.  New commands:
+=kitty-gfx-play-video=, =kitty-gfx-stop-video=,
+=kitty-gfx-toggle-video=, =kitty-gfx-seek-video=.  Limited to the
+Kitty backend (Sixel re-emit cost makes video impractical there).
+
+**** Loud warning on missing Sixel encoder
+
+When the Sixel backend is selected but no encoder is on =PATH=, the
+mode-enable now fires a =display-warning= pointing at
+img2sixel/ImageMagick instead of silently dropping every image.
+
+**** Windows Terminal detection + GIF routing
+
+Windows Terminal does not advertise a stable =TERM= value, so the old
+detector missed it.  Accept the =WT_SESSION=, =WT_PROFILE_ID= and
+=WT_WINDOWID= environment markers it injects and the Sixel backend
+engages correctly.  =gif= is also now routed through the image
+pipeline (still first-frame only -- no animation support in the
+terminal -- but no longer silently dropped).  Closes #6.
+
+Thanks again to [[https://github.com/timfel][Tim Felgentreff]] for the patch and the Windows-side
+testing.
+
+*** Fixes
+
+- ECH-erase + pre-erase pattern for cleaner column clearing.  Credit
+  to [[https://github.com/mdfried][mdfried]] for the approach.
+- Skip heading rendering when folded to the same visual line.
+- Sixel backend parity with the Kitty backend across the refresh
+  cycle.
+- Text sizing rendering: column guard, CPU optimisation, preview-mode
+  behaviour.
+
+*** Tooling
+
+- New top-level =justfile= task runner with byte-compile, load, and
+  per-feature interactive recipes (=test-org=, =test-typst=,
+  =test-image=, =test-sixel-image=, =test-sixel-tmux=, ...) plus
+  headless probes (=sixel-encoder=, =sixel-encode [ENCODER]=,
+  =sixel-timeout-test=, =typst-render=).
+
+*** Documentation
+
+- =README.org= and =AGENTS.md= now hard-state img2sixel as the
+  recommended Sixel encoder, with the bench numbers above and a
+  pointer to =just sixel-encoder= as the first step when diagnosing
+  Sixel rendering bugs.
+
+*** Credits
+
+Thanks to [[https://github.com/timfel][Tim Felgentreff]] for the encoder + timeout pattern and the
+ongoing collaboration on the Sixel side via his fork.
+
 ** kitty-graphics 0.4.0 - HUGE updates
 
 *** Features
@@ -51,11 +182,14 @@ I will keep on improving this feature. I think it is actually great eyecandy, an
 
 **** tmux support
 
-The Sixel side is now unlocked: starting in =0.5.0=, =kitty-graphics= no longer hard-disables the Sixel backend when =$TMUX= is set. tmux 3.4 (released 2024-02-13) ships native Sixel rendering, so running Emacs inside =tmux new-session= under foot/Konsole/mintty/mlterm/WezTerm just works. The detector probes =tmux -V= once per session and only engages on tmux >= 3.4. A new option =kitty-gfx-tmux-allow-sixel= (default =t=) lets you opt out if your tmux build lacks =--enable-sixel=.
-
-Caveat: tmux's cell buffer is not pixel-aware, so images may stick to their old position after scrolling until the affected cells are overwritten. That is an upstream tmux limitation, not something this package can fix.
-
-The Kitty graphics protocol still does not work inside tmux because we do not yet wrap APC sequences with the =\ePtmux;...\e\\= passthrough envelope. There is also an in-progress branch adding [[https://github.com/tmux/tmux/tree/ta/kitty-img][native Kitty image protocol support to tmux]]. Until either lands, if you already use Kitty directly I would stick with it -- the Kitty protocol gives you stateful image management, truecolor rendering, and a smoother overall experience.
+tmux support is in progress.  The Sixel side is unlocked in =0.5.0= --
+see the entry above.  Native Kitty graphics passthrough inside tmux is
+still pending: we do not yet wrap APC sequences with the
+=\ePtmux;...\e\\= envelope, and there's also an in-progress branch
+adding [[https://github.com/tmux/tmux/tree/ta/kitty-img][native Kitty image protocol support to tmux]].  Until either
+lands, if you already use Kitty directly I would stick with it --
+the Kitty protocol gives you stateful image management, truecolor
+rendering, and a smoother overall experience.
 
 **** Package renaming?
 
