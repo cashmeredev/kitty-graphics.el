@@ -48,6 +48,16 @@ TERM=xterm-256color emacs -nw -Q -l kitty-graphics.el \
 # Then: C-c C-x C-v (org-toggle-inline-images)
 ```
 
+### Test typst inline equations
+
+```sh
+TERM=xterm-256color emacs -nw -Q -l kitty-graphics.el \
+  --eval "(kitty-graphics-mode 1)" tests/test-typst.typ
+# Then: M-x kitty-gfx-typst-preview
+# To clear: M-x kitty-gfx-typst-clear-preview
+# Requires the `typst` CLI on PATH.
+```
+
 ### Test text sizing (org heading scales)
 
 ```sh
@@ -241,6 +251,10 @@ Key design differences from images:
 - **Limitation**: Sixel is 256 colors (vs truecolor on Kitty), stateless (re-emits on scroll)
 - **Done**: LaTeX fragment preview in org-mode (#3)
 - **Done**: doc-view / pdf-view-mode integration (#4)
+- **Done**: Typst inline equation preview (#5) -- `kitty-gfx-typst-preview`
+  scans `$...$' fragments in the current buffer or region, compiles each
+  via the `typst' CLI, and displays the resulting PNG inline. No advice
+  hooks; bind to a key or invoke via `M-x'.
 - **Done**: Text sizing protocol for org heading sizes (OSC 66, Kitty >= 0.40.0)
 - **Done**: Sixel backend with auto-detection (v0.3.0)
 - **WIP**: Sixel image misplacement in org-mode (reported in foot terminal)
@@ -253,6 +267,8 @@ Key design differences from images:
   for Kitty backend; foot/Konsole/xterm/mlterm/mintty for Sixel)
 - **Required for Sixel**: ImageMagick (`magick`/`convert`) for encoding
 - **Optional for Kitty**: ImageMagick for non-PNG formats and pixel-accurate sizing
+- **Optional for typst preview**: `typst` CLI on PATH (used by
+  `kitty-gfx-typst-preview`)
 - **No external Elisp deps** beyond built-in `cl-lib`
 
 ## Versioning
