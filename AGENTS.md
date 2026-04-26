@@ -8,8 +8,8 @@ Sixel, with automatic protocol detection. Also renders org-mode headings
 at scaled font sizes using the Kitty text sizing protocol (OSC 66).
 Integrates with org-mode, image-mode, shr/eww/mu4e/gnus, dired, and dirvish.
 
-Language: **Emacs Lisp** (`lexical-binding: t`). Single source file (~1876 lines).
-Current version: **0.3.0** (see Versioning section).
+Language: **Emacs Lisp** (`lexical-binding: t`). Single source file (~3300 lines).
+Current version: **0.5.0** (see Versioning section).
 
 ## Build / Validate
 
