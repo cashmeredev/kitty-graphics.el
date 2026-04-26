@@ -185,6 +185,28 @@ Default is `auto'."
                  (const :tag "Sixel protocol" sixel))
   :group 'kitty-graphics)
 
+(defcustom kitty-gfx-sixel-encoder-program nil
+  "Program used to encode raster images to Sixel.
+When nil, auto-detect: prefer `img2sixel' (libsixel), then
+`magick' (ImageMagick 7), then `convert' (ImageMagick 6, deprecated).
+When set to a string, use that program and treat it as `img2sixel'-style
+unless the basename is `magick' or `convert'."
+  :type '(choice (const :tag "Auto-detect" nil) string)
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-sixel-encoder-args nil
+  "Extra arguments passed to `kitty-gfx-sixel-encoder-program'.
+These come before the per-invocation size flags and the input file."
+  :type '(repeat string)
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-sixel-encoder-timeout 5.0
+  "Maximum time in seconds to wait for a single Sixel encoder run.
+When nil, wait indefinitely.  Encoders that hang on a malformed image
+will otherwise block Emacs."
+  :type '(choice (const :tag "No timeout" nil) number)
+  :group 'kitty-graphics)
+
 (defcustom kitty-gfx-heading-scales '((1 . 2.0) (2 . 1.5) (3 . 1.2))
   "Alist mapping org heading level to visual scale factor.
 Headings at levels not listed use scale 1.0 (normal size).
@@ -587,35 +609,119 @@ OV is the overlay (unused by Kitty backend but part of the interface)."
          (hash (md5 key)))
     (expand-file-name (concat "kitty-gfx-sixel-" hash ".six") temporary-file-directory)))
 
+(defun kitty-gfx--sixel-resolve-encoder ()
+  "Resolve the Sixel encoder program.
+Return a cons (KIND . ABS-PATH) where KIND is `img2sixel' or `imagemagick'
+and ABS-PATH is the resolved executable path, or nil when no encoder
+is available."
+  (let* ((user kitty-gfx-sixel-encoder-program)
+         (path (cond
+                (user (executable-find user))
+                (t (or (executable-find "img2sixel")
+                       (executable-find "magick")
+                       (executable-find "convert"))))))
+    (when path
+      (let ((base (downcase (file-name-nondirectory path))))
+        (cons (cond
+               ((string-prefix-p "img2sixel" base) 'img2sixel)
+               ((or (string-prefix-p "magick" base)
+                    (string-prefix-p "convert" base)) 'imagemagick)
+               ;; User-specified non-standard binary: assume img2sixel-style
+               (t 'img2sixel))
+              path)))))
+
+(defun kitty-gfx--sixel-run-encoder (program timeout dest-buffer args)
+  "Run PROGRAM with ARGS, writing stdout into DEST-BUFFER.
+TIMEOUT, when a positive number, terminates the process after that many
+seconds and signals an error.  Errors include captured stderr.
+Returns t on success, nil on failure (failures are logged, not signalled)."
+  (let* ((stderr-buf (generate-new-buffer " *kitty-gfx-sixel-stderr*"))
+         (process-connection-type nil)
+         (proc (make-process :name "kitty-gfx-sixel-encoder"
+                             :buffer dest-buffer
+                             :command (cons program args)
+                             :coding 'binary
+                             :connection-type 'pipe
+                             :stderr stderr-buf
+                             :noquery t))
+         (timer (and (numberp timeout)
+                     (> timeout 0)
+                     (run-at-time
+                      timeout nil
+                      (lambda (p)
+                        (when (process-live-p p)
+                          (process-put p 'kitty-gfx-timed-out t)
+                          (delete-process p)))
+                      proc))))
+    (set-process-sentinel proc #'ignore)
+    (unwind-protect
+        (progn
+          (while (process-live-p proc)
+            (accept-process-output proc 0.1))
+          (let* ((timed-out (process-get proc 'kitty-gfx-timed-out))
+                 (exit (process-exit-status proc))
+                 (stderr (string-trim
+                          (with-current-buffer stderr-buf (buffer-string)))))
+            (cond
+             (timed-out
+              (kitty-gfx--log
+               "sixel-encode: TIMEOUT after %.1fs (%s killed)"
+               (float timeout) program)
+              nil)
+             ((eq exit 0) t)
+             (t
+              (kitty-gfx--log "sixel-encode: %s exit=%s%s"
+                              program exit
+                              (if (string-empty-p stderr)
+                                  ""
+                                (concat ": " stderr)))
+              nil))))
+      (when timer (cancel-timer timer))
+      (when (buffer-live-p stderr-buf) (kill-buffer stderr-buf)))))
+
 (defun kitty-gfx--sixel-encode (png-file cols rows)
   "Encode PNG-FILE as Sixel data for COLS x ROWS cells.
 Returns Sixel data string or nil on failure.
-Computes pixel dimensions from cell size."
+Computes pixel dimensions from cell size.  The encoder is selected via
+`kitty-gfx-sixel-encoder-program' (auto-detected when nil) and bounded
+by `kitty-gfx-sixel-encoder-timeout'."
   (let* ((cw (or kitty-gfx--cell-pixel-width 8))
          (ch (or kitty-gfx--cell-pixel-height 16))
          (pixel-w (* cols cw))
          (pixel-h (* rows ch))
-         (convert (or (executable-find "magick") (executable-find "convert"))))
-    (if (not convert)
+         (resolved (kitty-gfx--sixel-resolve-encoder)))
+    (if (not resolved)
         (progn
-          (kitty-gfx--log "sixel-encode: no ImageMagick, cannot encode")
-          (message "kitty-gfx: Sixel backend requires ImageMagick")
+          (kitty-gfx--log "sixel-encode: no encoder found (img2sixel/magick/convert)")
+          (message "kitty-gfx: Sixel backend requires img2sixel or ImageMagick")
           nil)
-      (when (string-suffix-p "convert" convert)
-        (kitty-gfx--log "sixel-encode: WARNING deprecated `convert' binary resolved: %s (use `magick' instead)" convert))
-      (kitty-gfx--log "sixel-encode: %s -> %dx%d pixels via %s"
-                       png-file pixel-w pixel-h convert)
-      (with-temp-buffer
-        (set-buffer-multibyte nil)
-        (let* ((args (list convert nil '(t nil) nil
-                           png-file "-geometry" (format "%dx%d" pixel-w pixel-h)
-                           "sixel:-"))
-               (exit-code (apply #'call-process args)))
-          (if (zerop exit-code)
+      (let* ((kind (car resolved))
+             (path (cdr resolved))
+             (base (file-name-nondirectory path))
+             (args (pcase kind
+                     ('img2sixel
+                      (append kitty-gfx-sixel-encoder-args
+                              (list "-w" (number-to-string pixel-w)
+                                    "-h" (number-to-string pixel-h))
+                              (list png-file)))
+                     ('imagemagick
+                      (append (list png-file)
+                              kitty-gfx-sixel-encoder-args
+                              (list "-geometry"
+                                    (format "%dx%d" pixel-w pixel-h))
+                              (list "sixel:-"))))))
+        (when (string-prefix-p "convert" (downcase base))
+          (kitty-gfx--log "sixel-encode: WARNING deprecated `convert' resolved (%s); install `magick' or `img2sixel'" path))
+        (kitty-gfx--log "sixel-encode: %s -> %dx%d pixels via %s (%s)"
+                        png-file pixel-w pixel-h base kind)
+        (with-temp-buffer
+          (set-buffer-multibyte nil)
+          (if (kitty-gfx--sixel-run-encoder
+               path kitty-gfx-sixel-encoder-timeout
+               (current-buffer) args)
               (let ((data (buffer-string)))
                 (kitty-gfx--log "sixel-encode: success (%d bytes)" (length data))
                 data)
-            (kitty-gfx--log "sixel-encode: FAILED exit=%d" exit-code)
             nil))))))
 
 (defun kitty-gfx--sixel-prepare (file _image-id)
