@@ -545,14 +545,31 @@ Uses direct placement: move cursor, then `a=p' with `c' and `r' params."
 
 ;;;; Kitty backend
 
+(defun kitty-gfx--frame-getenv (var &optional frame)
+  "Return env VAR for FRAME, preferring frame env over process env.
+Daemon Emacs (`emacs --daemon' / `emacsclient -t') sets the attached
+client's TERM, TERM_PROGRAM, TMUX, etc. on the frame's `environment'
+parameter, while the daemon process inherits whatever shell launched
+it (often `TERM=dumb' from a non-tty service unit).  Plain
+`getenv VAR FRAME' looks ONLY at the frame env, so it returns nil
+for vars the client did not forward; plain `getenv VAR' looks at
+process env first and never sees the client's value.  This helper
+returns the frame env when present and falls back to the process
+env otherwise."
+  (let ((f (or frame (selected-frame))))
+    (or (getenv var f) (getenv var))))
+
 (defun kitty-gfx--kitty-detect ()
-  "Return non-nil if the terminal supports Kitty graphics protocol."
-  (let ((supported (or (getenv "KITTY_PID")
-                       (equal (getenv "TERM_PROGRAM") "kitty")
-                       (equal (getenv "TERM_PROGRAM") "WezTerm")
-                       (equal (getenv "TERM_PROGRAM") "ghostty"))))
+  "Return non-nil if the terminal supports Kitty graphics protocol.
+Reads env vars via `kitty-gfx--frame-getenv' so emacs --daemon
+clients see the attached terminal's environment."
+  (let* ((frame (selected-frame))
+         (kitty-pid (kitty-gfx--frame-getenv "KITTY_PID" frame))
+         (term-prog (kitty-gfx--frame-getenv "TERM_PROGRAM" frame))
+         (supported (or kitty-pid
+                        (member term-prog '("kitty" "WezTerm" "ghostty")))))
     (kitty-gfx--log "kitty-detect: %s (KITTY_PID=%s TERM_PROGRAM=%s)"
-                     supported (getenv "KITTY_PID") (getenv "TERM_PROGRAM"))
+                     supported kitty-pid term-prog)
     supported))
 
 (defun kitty-gfx--kitty-prepare (file image-id)
@@ -621,11 +638,13 @@ Memoised in `kitty-gfx--tmux-version-cache'."
                         (string-to-number (match-string 2)))))))))
   kitty-gfx--tmux-version-cache)
 
-(defun kitty-gfx--tmux-sixel-supported-p ()
+(defun kitty-gfx--tmux-sixel-supported-p (&optional frame)
   "Return non-nil when running under tmux >= 3.4 with Sixel allowed.
 Returns nil outside tmux, nil when `kitty-gfx-tmux-allow-sixel' is off,
-nil when tmux's version cannot be determined, and nil for tmux < 3.4."
-  (and (getenv "TMUX")
+nil when tmux's version cannot be determined, and nil for tmux < 3.4.
+TMUX is read via `kitty-gfx--frame-getenv' so this works under
+emacs --daemon clients; FRAME defaults to the selected frame."
+  (and (kitty-gfx--frame-getenv "TMUX" frame)
        kitty-gfx-tmux-allow-sixel
        (let ((ver (kitty-gfx--tmux-version)))
          (and ver
@@ -636,17 +655,27 @@ nil when tmux's version cannot be determined, and nil for tmux < 3.4."
   "Return non-nil if the terminal likely supports Sixel protocol.
 Inside tmux, requires tmux >= 3.4 (native Sixel rendering, 2024-02-13)
 and `kitty-gfx-tmux-allow-sixel'.  Older tmux versions still disable
-Sixel because they drop the DCS payload."
-  (let* ((term (getenv "TERM"))
-         (term-prog (getenv "TERM_PROGRAM"))
-         (in-tmux (getenv "TMUX"))
+Sixel because they drop the DCS payload.
+
+Reads env vars via `kitty-gfx--frame-getenv' so emacs --daemon
+clients see the attached terminal's environment.  Falls back to the
+frame's `tty-type' parameter when TERM is missing or `dumb', which
+is typical for daemons launched from a non-tty service unit."
+  (let* ((frame (selected-frame))
+         (frame-term (frame-parameter frame 'tty-type))
+         (env-term (kitty-gfx--frame-getenv "TERM" frame))
+         (term (cond ((and frame-term (not (equal frame-term "dumb"))) frame-term)
+                     ((and env-term (not (equal env-term "dumb"))) env-term)
+                     (t (or frame-term env-term))))
+         (term-prog (kitty-gfx--frame-getenv "TERM_PROGRAM" frame))
+         (in-tmux (kitty-gfx--frame-getenv "TMUX" frame))
          (tmux-ver (and in-tmux (kitty-gfx--tmux-version)))
-         (tmux-ok (kitty-gfx--tmux-sixel-supported-p))
+         (tmux-ok (kitty-gfx--tmux-sixel-supported-p frame))
          ;; Windows Terminal's TERM value is not stable enough to rely on
          ;; alone, so accept its session markers when present.
-         (windows-terminal (or (getenv "WT_SESSION")
-                               (getenv "WT_PROFILE_ID")
-                               (getenv "WT_WINDOWID")))
+         (windows-terminal (or (kitty-gfx--frame-getenv "WT_SESSION" frame)
+                               (kitty-gfx--frame-getenv "WT_PROFILE_ID" frame)
+                               (kitty-gfx--frame-getenv "WT_WINDOWID" frame)))
          (supported (and term
                          (or (not in-tmux) tmux-ok)
                          (or (string-match-p "xterm\\|vt[0-9]\\|foot\\|contour" term)
