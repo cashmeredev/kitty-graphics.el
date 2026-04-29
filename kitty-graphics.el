@@ -2971,17 +2971,34 @@ image spec.  FILE is the path to the page PNG."
           (when kitty-gfx--doc-view-overlay
             (kitty-gfx--remove-overlay kitty-gfx--doc-view-overlay old-pid)
             (setq kitty-gfx--doc-view-overlay nil))
-          ;; Clear the buffer (removes "Welcome to DocView!" text)
-          (let* ((inhibit-read-only t)
-                 (win-w (- (window-body-width) 1))
-                 (win-h (- (window-body-height) 1)))
-            (erase-buffer)
+          ;; Display the rendered page using only an overlay.  Do not erase
+          ;; or insert text here: doc-view buffers visit the original PDF, so
+          ;; mutating buffer text can corrupt the document if it is saved.
+          (let* ((win-w (- (window-body-width) 1))
+                 (win-h (- (window-body-height) 1))
+                 (abs-file (expand-file-name file))
+                 (px (kitty-gfx--image-pixel-size abs-file))
+                 (base-dims (if px
+                                (kitty-gfx--compute-cell-dims
+                                 (car px) (cdr px) win-w win-h)
+                              (cons (min 40 win-w) (min 15 win-h))))
+                 (img-cols (max 1 (round (* kitty-gfx--doc-view-scale
+                                             (car base-dims)))))
+                 (img-rows (max 1 (round (* kitty-gfx--doc-view-scale
+                                             (cdr base-dims)))))
+                 (cached-id (kitty-gfx--cache-get abs-file))
+                 (image-id (or cached-id (kitty-gfx--alloc-id))))
             (set-window-hscroll (selected-window) 0)
             (set-window-vscroll (selected-window) 0 t)
-            (kitty-gfx--display-image-centered
-             file win-w win-h win-w win-h
-             kitty-gfx--doc-view-scale old-pid)
-            (setq kitty-gfx--doc-view-overlay (car kitty-gfx--overlays))))
+            (unless cached-id
+              (when (funcall (kitty-gfx--backend-fn 'prepare) abs-file image-id)
+                (kitty-gfx--cache-put abs-file image-id)))
+            (when (or cached-id (gethash abs-file kitty-gfx--image-cache))
+              (setq kitty-gfx--doc-view-overlay
+                    (kitty-gfx--make-overlay (point-min) (point-max)
+                                             image-id img-cols img-rows
+                                             abs-file old-pid))
+              (kitty-gfx--schedule-refresh))))
         (goto-char (point-min)))
     (apply orig-fn file args)))
 
