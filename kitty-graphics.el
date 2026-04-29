@@ -1694,27 +1694,45 @@ then invalidates position caches and schedules a refresh."
 
 (defun kitty-gfx--on-window-change (_frame)
   "Handle window configuration change for image refresh.
-Invalidates position caches and cell pixel size so the refresh
-cycle re-places images correctly.  Does NOT delete all placements
-— that causes visible flicker.  Uses a longer debounce than normal
-refresh to let Emacs finish window layout transitions (e.g., when
-closing a split, Emacs briefly shows two windows for the same
-buffer before settling to one)."
-  (kitty-gfx--log "on-window-change: invalidating positions and cell size")
+Invalidates cell pixel size, deletes stale image placements, then
+clears image position caches so the refresh cycle re-places images
+at their new positions.  Uses a longer debounce than normal refresh
+to let Emacs finish window layout transitions (e.g., when closing a
+split, Emacs briefly shows two windows for the same buffer before
+settling to one)."
+  (kitty-gfx--log "on-window-change: deleting stale placements and invalidating cell size")
   (setq kitty-gfx--cell-pixel-width nil
         kitty-gfx--cell-pixel-height nil)
-  ;; Reset position cache so images get re-placed at correct positions.
+  ;; Delete image placements before clearing their cached positions.
+  ;; Window splits/resizes can move an image from the middle of the old
+  ;; window to the center of the new pane(s).  Some terminals do not
+  ;; reliably erase the old direct placement when it is re-placed at a
+  ;; different geometry, and Sixel is stateless and must be explicitly
+  ;; overwritten.  If we clear the cache first, the backend no longer
+  ;; knows where to delete/erase the old placement, leaving artifacts
+  ;; over newly-created window separators.
+  ;;
   ;; Heading overlays PRESERVE their cache — the refresh cycle needs
   ;; old→new position comparison to erase multicell blocks properly.
-  ;; Images can clear cache because re-placing with the same PID is
-  ;; idempotent (the terminal replaces the old placement).
-  (dolist (buf (buffer-list))
-    (with-current-buffer buf
-      (dolist (ov kitty-gfx--overlays)
-        (when (and (overlay-buffer ov)
-                   (not (overlay-get ov 'kitty-gfx-heading)))
-          (overlay-put ov 'kitty-gfx-last-row nil)
-          (overlay-put ov 'kitty-gfx-last-col nil)))))
+  (kitty-gfx--sync-begin)
+  (unwind-protect
+      (dolist (buf (buffer-list))
+        (with-current-buffer buf
+          (dolist (ov kitty-gfx--overlays)
+            (when (and (overlay-buffer ov)
+                       (not (overlay-get ov 'kitty-gfx-heading)))
+              (let ((id (overlay-get ov 'kitty-gfx-id))
+                    (pid (overlay-get ov 'kitty-gfx-pid)))
+                (when (and id pid kitty-gfx--active-backend
+                           (overlay-get ov 'kitty-gfx-last-row))
+                  (condition-case err
+                      (funcall (kitty-gfx--backend-fn 'delete) ov id pid)
+                    (error
+                     (kitty-gfx--log "on-window-change: error deleting placement: %s"
+                                      (error-message-string err))))))
+              (overlay-put ov 'kitty-gfx-last-row nil)
+              (overlay-put ov 'kitty-gfx-last-col nil)))))
+    (kitty-gfx--sync-end))
   ;; Longer debounce: cancel any fast leading-edge cooldown and
   ;; schedule a 0.1s delayed refresh to let window layout settle.
   (when kitty-gfx--render-timer
@@ -2647,8 +2665,13 @@ With an active region, restrict to it; otherwise clear the whole buffer."
   "Zoom scale factor for image-mode display.
 Values > 1.0 zoom in, < 1.0 zoom out.")
 
-(defun kitty-gfx--image-mode-render ()
-  "Render the current image file centered at current scale."
+(defun kitty-gfx--image-mode-render (&optional reuse-placement)
+  "Render the current image file centered at current scale.
+When REUSE-PLACEMENT is non-nil, reuse the old terminal placement
+ID instead of deleting it first.  This is useful for zoom commands
+where the new placement immediately replaces the old one, but it is
+intentionally not used for window size changes because stale pixels
+can otherwise remain over newly-created window separators."
   (when-let* ((file (buffer-file-name)))
     (when (kitty-gfx--image-file-p file)
       (let* ((inhibit-read-only t)
@@ -2656,15 +2679,18 @@ Values > 1.0 zoom in, < 1.0 zoom out.")
              (win-h (- (window-body-height) 2))
              (max-cols (min win-w kitty-gfx-max-width))
              (max-rows (min win-h kitty-gfx-max-height))
-             ;; Save the old placement ID before removing overlays.
-             ;; Reusing it avoids delete+re-place glitches (WezTerm #5892).
-             (old-pid (when (car kitty-gfx--overlays)
+             ;; Save the old placement ID only when the caller explicitly
+             ;; wants to reuse it.  Reusing avoids delete+re-place glitches
+             ;; for zoom commands (WezTerm #5892), but window splits/resizes
+             ;; must delete first so stale terminal pixels are cleared.
+             (old-pid (when (and reuse-placement (car kitty-gfx--overlays))
                         (overlay-get (car kitty-gfx--overlays) 'kitty-gfx-pid))))
         (kitty-gfx--log "image-mode-render: file=%s scale=%.2f win=%dx%d max=%dx%d reuse-pid=%s"
                          (file-name-nondirectory file) kitty-gfx--image-scale
                          win-w win-h max-cols max-rows old-pid)
-        ;; Remove overlays but skip terminal-side delete when we have
-        ;; a PID to reuse (the new placement will atomically replace it).
+        ;; Remove overlays.  When OLD-PID is non-nil, skip terminal-side
+        ;; delete so the new placement atomically replaces it; otherwise
+        ;; delete/erase the old placement before changing the buffer text.
         (dolist (ov (overlays-in (point-min) (point-max)))
           (when (overlay-get ov 'kitty-gfx)
             (kitty-gfx--remove-overlay ov old-pid)))
@@ -2679,19 +2705,19 @@ Values > 1.0 zoom in, < 1.0 zoom out.")
   "Zoom in on the image in image-mode."
   (interactive)
   (setq kitty-gfx--image-scale (* kitty-gfx--image-scale 1.25))
-  (kitty-gfx--image-mode-render))
+  (kitty-gfx--image-mode-render t))
 
 (defun kitty-gfx-image-decrease-size ()
   "Zoom out on the image in image-mode."
   (interactive)
   (setq kitty-gfx--image-scale (max 0.1 (* kitty-gfx--image-scale 0.8)))
-  (kitty-gfx--image-mode-render))
+  (kitty-gfx--image-mode-render t))
 
 (defun kitty-gfx-image-reset-size ()
   "Reset image zoom to default in image-mode."
   (interactive)
   (setq kitty-gfx--image-scale 1.0)
-  (kitty-gfx--image-mode-render))
+  (kitty-gfx--image-mode-render t))
 
 (defun kitty-gfx--image-mode-advice (orig-fn &rest args)
   "Around advice for `image-mode'."
