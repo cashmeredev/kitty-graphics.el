@@ -2801,6 +2801,160 @@ Values > 1.0 zoom in, < 1.0 zoom out.")
   "Path to the current doc-view page image file.
 Stored so zoom commands can re-render without querying `doc-view-current-image'.")
 
+(defun kitty-gfx--doc-view-terminal-p ()
+  "Non-nil when Kitty graphics is handling a doc-view buffer in a terminal."
+  (and kitty-graphics-mode
+       (not (display-graphic-p))
+       (eq major-mode 'doc-view-mode)))
+
+(defun kitty-gfx--doc-view-image-cell-size ()
+  "Return the current doc-view Kitty image size as (COLS . ROWS), or nil."
+  (when (overlayp kitty-gfx--doc-view-overlay)
+    (let ((cols (overlay-get kitty-gfx--doc-view-overlay 'kitty-gfx-cols))
+          (rows (overlay-get kitty-gfx--doc-view-overlay 'kitty-gfx-rows)))
+      (when (and cols rows)
+        (cons cols rows)))))
+
+(defun kitty-gfx--doc-view-max-hscroll ()
+  "Return the maximum horizontal scroll for the current Kitty doc-view page."
+  (let ((size (kitty-gfx--doc-view-image-cell-size)))
+    (max 0 (- (or (car size) 0) (window-body-width)))))
+
+(defun kitty-gfx--doc-view-max-vscroll ()
+  "Return the maximum vertical pixel scroll for the current Kitty doc-view page."
+  (let ((size (kitty-gfx--doc-view-image-cell-size)))
+    (max 0 (- (* (or (cdr size) 0) (frame-char-height))
+              (window-body-height nil t)))))
+
+(defun kitty-gfx--doc-view-set-hscroll (ncols)
+  "Set horizontal scroll to NCOLS for Kitty doc-view and refresh the page."
+  (let ((new (max 0 (min ncols (kitty-gfx--doc-view-max-hscroll)))))
+    (set-window-hscroll (selected-window) new)
+    (kitty-gfx--schedule-refresh)
+    new))
+
+(defun kitty-gfx--doc-view-set-vscroll (pixels)
+  "Set vertical pixel scroll to PIXELS for Kitty doc-view and refresh the page."
+  (let ((new (max 0 (min pixels (kitty-gfx--doc-view-max-vscroll)))))
+    (set-window-vscroll (selected-window) new t)
+    (kitty-gfx--schedule-refresh)
+    new))
+
+(defun kitty-gfx--doc-view-forward-hscroll (&optional n)
+  "Scroll the current Kitty doc-view page left by N columns."
+  (kitty-gfx--doc-view-set-hscroll (+ (window-hscroll) (or n 1))))
+
+(defun kitty-gfx--doc-view-next-line (&optional n)
+  "Scroll the current Kitty doc-view page upward by N terminal rows."
+  (kitty-gfx--doc-view-set-vscroll
+   (+ (window-vscroll nil t) (* (or n 1) (frame-char-height)))))
+
+(defun kitty-gfx--doc-view-scroll-left (&optional n)
+  "Scroll the current Kitty doc-view page leftward by N columns."
+  (kitty-gfx--doc-view-forward-hscroll
+   (cond
+    ((null n) (max 0 (- (window-body-width) 2)))
+    ((eq n '-) (min 0 (- 2 (window-body-width))))
+    (t (prefix-numeric-value n)))))
+
+(defun kitty-gfx--doc-view-scroll-up (&optional n)
+  "Scroll the current Kitty doc-view page upward by N rows."
+  (kitty-gfx--doc-view-next-line
+   (cond
+    ((null n) (max 0 (- (window-body-height) next-screen-context-lines)))
+    ((eq n '-) (min 0 (- next-screen-context-lines (window-body-height))))
+    (t (prefix-numeric-value n)))))
+
+(defun kitty-gfx--doc-view-image-forward-hscroll-advice (orig-fn &optional n)
+  "Around advice for `image-forward-hscroll' in Kitty doc-view buffers."
+  (if (kitty-gfx--doc-view-terminal-p)
+      (kitty-gfx--doc-view-forward-hscroll n)
+    (funcall orig-fn n)))
+
+(defun kitty-gfx--doc-view-image-backward-hscroll-advice (orig-fn &optional n)
+  "Around advice for `image-backward-hscroll' in Kitty doc-view buffers."
+  (if (kitty-gfx--doc-view-terminal-p)
+      (kitty-gfx--doc-view-forward-hscroll (- (or n 1)))
+    (funcall orig-fn n)))
+
+(defun kitty-gfx--doc-view-image-next-line-advice (orig-fn &optional n)
+  "Around advice for `image-next-line' in Kitty doc-view buffers."
+  (if (kitty-gfx--doc-view-terminal-p)
+      (kitty-gfx--doc-view-next-line n)
+    (funcall orig-fn n)))
+
+(defun kitty-gfx--doc-view-image-previous-line-advice (orig-fn &optional n)
+  "Around advice for `image-previous-line' in Kitty doc-view buffers."
+  (if (kitty-gfx--doc-view-terminal-p)
+      (kitty-gfx--doc-view-next-line (- (or n 1)))
+    (funcall orig-fn n)))
+
+(defun kitty-gfx--doc-view-image-scroll-left-advice (orig-fn &optional n)
+  "Around advice for `image-scroll-left' in Kitty doc-view buffers."
+  (if (kitty-gfx--doc-view-terminal-p)
+      (kitty-gfx--doc-view-scroll-left n)
+    (funcall orig-fn n)))
+
+(defun kitty-gfx--doc-view-image-scroll-right-advice (orig-fn &optional n)
+  "Around advice for `image-scroll-right' in Kitty doc-view buffers."
+  (if (kitty-gfx--doc-view-terminal-p)
+      (kitty-gfx--doc-view-scroll-left
+       (cond
+        ((null n) (min 0 (- 2 (window-body-width))))
+        ((eq n '-) (max 0 (- (window-body-width) 2)))
+        (t (- (prefix-numeric-value n)))))
+    (funcall orig-fn n)))
+
+(defun kitty-gfx--doc-view-image-scroll-up-advice (orig-fn &optional n)
+  "Around advice for `image-scroll-up' in Kitty doc-view buffers."
+  (if (kitty-gfx--doc-view-terminal-p)
+      (kitty-gfx--doc-view-scroll-up n)
+    (funcall orig-fn n)))
+
+(defun kitty-gfx--doc-view-image-scroll-down-advice (orig-fn &optional n)
+  "Around advice for `image-scroll-down' in Kitty doc-view buffers."
+  (if (kitty-gfx--doc-view-terminal-p)
+      (kitty-gfx--doc-view-scroll-up
+       (cond
+        ((null n) (min 0 (- next-screen-context-lines (window-body-height))))
+        ((eq n '-) (max 0 (- (window-body-height) next-screen-context-lines)))
+        (t (- (prefix-numeric-value n)))))
+    (funcall orig-fn n)))
+
+(defun kitty-gfx--doc-view-image-bol-advice (orig-fn &optional arg)
+  "Around advice for `image-bol' in Kitty doc-view buffers."
+  (if (kitty-gfx--doc-view-terminal-p)
+      (progn
+        (when (and arg (/= (prefix-numeric-value arg) 1))
+          (kitty-gfx--doc-view-next-line (- (prefix-numeric-value arg) 1)))
+        (kitty-gfx--doc-view-set-hscroll 0))
+    (funcall orig-fn arg)))
+
+(defun kitty-gfx--doc-view-image-eol-advice (orig-fn &optional arg)
+  "Around advice for `image-eol' in Kitty doc-view buffers."
+  (if (kitty-gfx--doc-view-terminal-p)
+      (progn
+        (when (and arg (/= (prefix-numeric-value arg) 1))
+          (kitty-gfx--doc-view-next-line (- (prefix-numeric-value arg) 1)))
+        (kitty-gfx--doc-view-set-hscroll (kitty-gfx--doc-view-max-hscroll)))
+    (funcall orig-fn arg)))
+
+(defun kitty-gfx--doc-view-image-bob-advice (orig-fn)
+  "Around advice for `image-bob' in Kitty doc-view buffers."
+  (if (kitty-gfx--doc-view-terminal-p)
+      (progn
+        (kitty-gfx--doc-view-set-hscroll 0)
+        (kitty-gfx--doc-view-set-vscroll 0))
+    (funcall orig-fn)))
+
+(defun kitty-gfx--doc-view-image-eob-advice (orig-fn)
+  "Around advice for `image-eob' in Kitty doc-view buffers."
+  (if (kitty-gfx--doc-view-terminal-p)
+      (progn
+        (kitty-gfx--doc-view-set-hscroll (kitty-gfx--doc-view-max-hscroll))
+        (kitty-gfx--doc-view-set-vscroll (kitty-gfx--doc-view-max-vscroll)))
+    (funcall orig-fn)))
+
 (defun kitty-gfx--doc-view-insert-image-advice (orig-fn file &rest args)
   "Around advice for `doc-view-insert-image'.
 Displays the page image via Kitty graphics instead of an Emacs
@@ -2822,6 +2976,8 @@ image spec.  FILE is the path to the page PNG."
                  (win-w (- (window-body-width) 1))
                  (win-h (- (window-body-height) 1)))
             (erase-buffer)
+            (set-window-hscroll (selected-window) 0)
+            (set-window-vscroll (selected-window) 0 t)
             (kitty-gfx--display-image-centered
              file win-w win-h win-w win-h
              kitty-gfx--doc-view-scale old-pid)
@@ -3256,7 +3412,31 @@ Requires `kitty-gfx-enable-video' to be non-nil and mpv installed."
     (advice-add 'doc-view-enlarge :around
                 #'kitty-gfx--doc-view-enlarge-advice)
     (advice-add 'doc-view-scale-reset :around
-                #'kitty-gfx--doc-view-scale-reset-advice))
+                #'kitty-gfx--doc-view-scale-reset-advice)
+    (advice-add 'image-forward-hscroll :around
+                #'kitty-gfx--doc-view-image-forward-hscroll-advice)
+    (advice-add 'image-backward-hscroll :around
+                #'kitty-gfx--doc-view-image-backward-hscroll-advice)
+    (advice-add 'image-next-line :around
+                #'kitty-gfx--doc-view-image-next-line-advice)
+    (advice-add 'image-previous-line :around
+                #'kitty-gfx--doc-view-image-previous-line-advice)
+    (advice-add 'image-scroll-left :around
+                #'kitty-gfx--doc-view-image-scroll-left-advice)
+    (advice-add 'image-scroll-right :around
+                #'kitty-gfx--doc-view-image-scroll-right-advice)
+    (advice-add 'image-scroll-up :around
+                #'kitty-gfx--doc-view-image-scroll-up-advice)
+    (advice-add 'image-scroll-down :around
+                #'kitty-gfx--doc-view-image-scroll-down-advice)
+    (advice-add 'image-bol :around
+                #'kitty-gfx--doc-view-image-bol-advice)
+    (advice-add 'image-eol :around
+                #'kitty-gfx--doc-view-image-eol-advice)
+    (advice-add 'image-bob :around
+                #'kitty-gfx--doc-view-image-bob-advice)
+    (advice-add 'image-eob :around
+                #'kitty-gfx--doc-view-image-eob-advice))
   (with-eval-after-load 'markdown-overlays
     (advice-add 'markdown-overlays--fontify-image :around
                 #'kitty-gfx--markdown-overlays-fontify-image-advice)
@@ -3281,6 +3461,18 @@ Requires `kitty-gfx-enable-video' to be non-nil and mpv installed."
   (advice-remove 'doc-view-insert-image #'kitty-gfx--doc-view-insert-image-advice)
   (advice-remove 'doc-view-enlarge #'kitty-gfx--doc-view-enlarge-advice)
   (advice-remove 'doc-view-scale-reset #'kitty-gfx--doc-view-scale-reset-advice)
+  (advice-remove 'image-forward-hscroll #'kitty-gfx--doc-view-image-forward-hscroll-advice)
+  (advice-remove 'image-backward-hscroll #'kitty-gfx--doc-view-image-backward-hscroll-advice)
+  (advice-remove 'image-next-line #'kitty-gfx--doc-view-image-next-line-advice)
+  (advice-remove 'image-previous-line #'kitty-gfx--doc-view-image-previous-line-advice)
+  (advice-remove 'image-scroll-left #'kitty-gfx--doc-view-image-scroll-left-advice)
+  (advice-remove 'image-scroll-right #'kitty-gfx--doc-view-image-scroll-right-advice)
+  (advice-remove 'image-scroll-up #'kitty-gfx--doc-view-image-scroll-up-advice)
+  (advice-remove 'image-scroll-down #'kitty-gfx--doc-view-image-scroll-down-advice)
+  (advice-remove 'image-bol #'kitty-gfx--doc-view-image-bol-advice)
+  (advice-remove 'image-eol #'kitty-gfx--doc-view-image-eol-advice)
+  (advice-remove 'image-bob #'kitty-gfx--doc-view-image-bob-advice)
+  (advice-remove 'image-eob #'kitty-gfx--doc-view-image-eob-advice)
   (advice-remove 'image-mode #'kitty-gfx--image-mode-advice)
   (advice-remove 'shr-put-image #'kitty-gfx--shr-put-image-advice)
   (advice-remove 'markdown-overlays--fontify-image #'kitty-gfx--markdown-overlays-fontify-image-advice)
