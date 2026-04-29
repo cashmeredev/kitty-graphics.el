@@ -1369,14 +1369,19 @@ Ignores cosmetic invisibility like hidden link brackets (`org-link')."
       (kitty-gfx--log "in-folded-region: pos=%d folded=%s" pos folded))
     folded))
 
-(defun kitty-gfx--overlay-screen-pos (ov)
-  "Return (TERM-ROW . TERM-COL) for overlay OV, or nil if not visible.
-Coordinates are 1-indexed terminal positions.
+(defun kitty-gfx--overlay-screen-pos (ov &optional win)
+  "Return (TERM-ROW . TERM-COL) for overlay OV in WIN, or nil if hidden.
+Coordinates are 1-indexed terminal positions.  WIN defaults to a window
+showing OV's buffer, for interactive debug helpers.
 Returns nil when the overlay position is outside the visible window
 range, inside a folded region, or not visible on screen."
   (let* ((buf (overlay-buffer ov))
          (pos (overlay-start ov))
-         (win (and buf (get-buffer-window buf))))
+         (win (and buf
+                   (or (and (window-live-p win)
+                            (eq (window-buffer win) buf)
+                            win)
+                       (get-buffer-window buf)))))
     ;; Fast path: skip entirely if no window, no position, or
     ;; buffer position is outside the visible window range.
     ;; This avoids expensive posn-at-point and fold checks.
@@ -1399,13 +1404,25 @@ range, inside a folded region, or not visible on screen."
           (let* ((col-row (posn-col-row win-pos))
                  (row (cdr col-row))
                  (posn-col (car col-row))
-                 (posn-xy (posn-x-y win-pos)))
-            (kitty-gfx--log "screen-pos-detail: pid=%s posn-col=%d posn-row=%d posn-xy=%S body-left=%d body-top=%d"
-                            (overlay-get ov 'kitty-gfx-pid) posn-col row posn-xy body-left body-top)
+                 (posn-xy (posn-x-y win-pos))
+                 ;; `posn-col-row' is derived from pixel coordinates and can
+                 ;; report the position after an overlay's `display' string
+                 ;; rather than the overlay's logical start.  That is exactly
+                 ;; the wrong edge for Sixel placement: the terminal graphic
+                 ;; must be emitted at the top-left of the reserved cells.
+                 ;; In terminal Emacs text cells are fixed-width, so the
+                 ;; buffer column at POS is the reliable horizontal anchor.
+                 (buffer-col (save-excursion
+                               (goto-char pos)
+                               (current-column)))
+                 (visual-col (max 0 (- buffer-col (window-hscroll win)))))
+            (kitty-gfx--log "screen-pos-detail: pid=%s posn-col=%d buffer-col=%d visual-col=%d posn-row=%d posn-xy=%S body-left=%d body-top=%d"
+                            (overlay-get ov 'kitty-gfx-pid) posn-col buffer-col
+                            visual-col row posn-xy body-left body-top)
             (when col-row
-              (let ((result (cons (+ body-top row 1) (+ body-left posn-col 1))))
-                (kitty-gfx--log "screen-pos: pid=%s pos=%d -> row=%d col=%d"
-                                (overlay-get ov 'kitty-gfx-pid) pos
+              (let ((result (cons (+ body-top row 1) (+ body-left visual-col 1))))
+                (kitty-gfx--log "screen-pos: pid=%s pos=%d win=%s -> row=%d col=%d"
+                                (overlay-get ov 'kitty-gfx-pid) pos win
                                 (car result) (cdr result))
                 result))))))))
 
@@ -1492,7 +1509,7 @@ to prevent flicker."
                                    win (buffer-name) (length kitty-gfx--overlays) win-bottom)
                    (dolist (ov kitty-gfx--overlays)
                      (cl-incf total-overlays)
-                     (kitty-gfx--refresh-overlay ov win-bottom)
+                     (kitty-gfx--refresh-overlay ov win win-bottom)
                      (if (overlay-get ov 'kitty-gfx-last-row)
                          (cl-incf placed)
                        (cl-incf hidden)))))
@@ -1508,15 +1525,16 @@ to prevent flicker."
       (kitty-gfx--log "refresh: done total=%d placed=%d hidden=%d pruned=%d"
                        total-overlays placed hidden pruned))))
 
-(defun kitty-gfx--refresh-overlay (ov win-bottom)
-  "Refresh a single overlay OV.  WIN-BOTTOM is the window's bottom edge.
-Dispatches to heading or image refresh based on overlay type."
+(defun kitty-gfx--refresh-overlay (ov win win-bottom)
+  "Refresh a single overlay OV in WIN.
+WIN-BOTTOM is WIN's bottom edge.  Dispatches to heading or image
+refresh based on overlay type."
   (if (overlay-get ov 'kitty-gfx-heading)
       ;; Heading overlay — phase 1: compute position + erase if moved.
       ;; OSC 66 emission happens in phase 2 (kitty-gfx--emit-heading-overlays).
-      (kitty-gfx--refresh-heading-overlay ov win-bottom)
+      (kitty-gfx--refresh-heading-overlay ov win win-bottom)
   ;; Image overlay refresh
-  (let ((pos (kitty-gfx--overlay-screen-pos ov))
+  (let ((pos (kitty-gfx--overlay-screen-pos ov win))
         (rows (overlay-get ov 'kitty-gfx-rows))
         (last-row (overlay-get ov 'kitty-gfx-last-row))
         (last-col (overlay-get ov 'kitty-gfx-last-col)))
@@ -1552,14 +1570,15 @@ Dispatches to heading or image refresh based on overlay type."
           (overlay-put ov 'kitty-gfx-last-col nil)
           (funcall (kitty-gfx--backend-fn 'delete) ov id pid)))))))
 
-(defun kitty-gfx--refresh-heading-overlay (ov win-bottom)
-  "Refresh heading overlay OV.  WIN-BOTTOM is the window's bottom edge.
-Phase 1 of two-phase heading refresh: computes screen position,
-erases old multicell block if heading moved or became hidden,
-and caches the new position.  Does NOT emit OSC 66 — that
-happens in phase 2 (`kitty-gfx--emit-heading-overlays') to
-avoid posn-at-point redraws destroying freshly-placed blocks."
-  (let ((pos (kitty-gfx--overlay-screen-pos ov))
+(defun kitty-gfx--refresh-heading-overlay (ov win win-bottom)
+  "Refresh heading overlay OV in WIN.
+WIN-BOTTOM is WIN's bottom edge.  Phase 1 of two-phase heading
+refresh: computes screen position, erases old multicell block if
+heading moved or became hidden, and caches the new position.  Does
+NOT emit OSC 66 — that happens in phase 2
+(`kitty-gfx--emit-heading-overlays') to avoid posn-at-point redraws
+destroying freshly-placed blocks."
+  (let ((pos (kitty-gfx--overlay-screen-pos ov win))
         (rows (overlay-get ov 'kitty-gfx-rows))
         (last-row (overlay-get ov 'kitty-gfx-last-row))
         (last-col (overlay-get ov 'kitty-gfx-last-col)))
@@ -1995,9 +2014,10 @@ The buffer should be writable (caller handles `inhibit-read-only')."
       (unless cached-id
         (when (funcall (kitty-gfx--backend-fn 'prepare) abs-file image-id)
           (kitty-gfx--cache-put abs-file image-id)))
-      ;; Create overlay at the scaled dimensions
+      ;; Create overlay at the scaled dimensions.
       (when (or cached-id (gethash abs-file kitty-gfx--image-cache))
-        (kitty-gfx--make-overlay img-start (point) image-id img-cols img-rows abs-file reuse-pid)
+        (kitty-gfx--make-overlay img-start (point) image-id
+                                  img-cols img-rows abs-file reuse-pid)
         (kitty-gfx--schedule-refresh)))))
 
 (defun kitty-gfx-remove-images (&optional beg end)
