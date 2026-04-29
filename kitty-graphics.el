@@ -650,6 +650,12 @@ Sixel because they drop the DCS payload."
          (supported (and term
                          (or (not in-tmux) tmux-ok)
                          (or (string-match-p "xterm\\|vt[0-9]\\|foot\\|contour" term)
+                             ;; Once `tmux-ok' is true, tmux >= 3.4 itself
+                             ;; renders Sixel, so the outer TERM regex is
+                             ;; irrelevant -- accept the canonical
+                             ;; tmux-* / screen-* TERMs that tmux assigns.
+                             (and tmux-ok
+                                  (string-match-p "\\`\\(tmux\\|screen\\)\\b" term))
                              (member term-prog '("foot" "Konsole" "mintty" "mlterm"
                                                  "contour" "WezTerm"))
                              windows-terminal)
