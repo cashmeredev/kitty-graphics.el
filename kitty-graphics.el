@@ -860,13 +860,14 @@ Sixel has no placement IDs — erase by writing spaces over the region."
 
 (defun kitty-gfx--sixel-cleanup (file _image-id)
   "Cleanup Sixel resources for FILE."
-  (remhash file kitty-gfx--sixel-cache)
-  ;; Remove cached sixel encodings for this file
-  (dolist (temp-file kitty-gfx--sixel-temp-files)
-    (when (string-match-p (regexp-quote (md5 file)) temp-file)
-      (kitty-gfx--log "sixel-cleanup: deleting %s" temp-file)
-      (ignore-errors (delete-file temp-file))
-      (setq kitty-gfx--sixel-temp-files (delete temp-file kitty-gfx--sixel-temp-files)))))
+  (when file
+    (remhash file kitty-gfx--sixel-cache)
+    ;; Remove cached sixel encodings for this file
+    (dolist (temp-file kitty-gfx--sixel-temp-files)
+      (when (string-match-p (regexp-quote (md5 file)) temp-file)
+        (kitty-gfx--log "sixel-cleanup: deleting %s" temp-file)
+        (ignore-errors (delete-file temp-file))
+        (setq kitty-gfx--sixel-temp-files (delete temp-file kitty-gfx--sixel-temp-files))))))
 
 (defun kitty-gfx--sixel-cleanup-all ()
   "Cleanup all Sixel resources.
