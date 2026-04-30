@@ -168,6 +168,59 @@ test-sixel-tmux encoder="":
                 --eval '(kitty-graphics-mode 1)' tests/test-image.png"
     fi
 
+# --- Dirvish preview test ---------------------------------------------------
+
+# Open dirvish on tests/ with kitty-graphics + debug logging.
+# Bootstraps dirvish into /tmp/kgfx-dirvish-elpa on first run.
+# Run inside foot/ghostty/kitty to repro per-terminal preview behavior.
+test-dirvish:
+    #!/usr/bin/env bash
+    set -eu
+    ELPA=/tmp/kgfx-dirvish-elpa
+    mkdir -p "$ELPA"
+    TERM={{TERM_}} {{EMACS}} -nw -Q \
+        --eval "(setq package-user-dir \"$ELPA\")" \
+        --eval "(require 'package)" \
+        --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+        --eval "(package-initialize)" \
+        --eval "(unless (package-installed-p 'dirvish) (package-refresh-contents) (package-install 'dirvish))" \
+        --eval "(require 'dirvish)" \
+        -l {{SRC}} \
+        --eval "(setq kitty-gfx-debug t)" \
+        --eval "(kitty-graphics-mode 1)" \
+        --eval "(dirvish-override-dired-mode 1)" \
+        --eval "(dired \"tests\")" \
+        --eval "(dirvish-layout-toggle)"
+
+# --- Dashboard preview test -------------------------------------------------
+
+# Open emacs-dashboard with banner image rendered via kitty-graphics.
+# Bootstraps dashboard into /tmp/kgfx-dashboard-elpa on first run.
+# Run inside kitty/ghostty/foot/wezterm.
+test-dashboard:
+    #!/usr/bin/env bash
+    set -eu
+    ELPA=/tmp/kgfx-dashboard-elpa
+    BANNER="$(pwd)/tests/test-image.png"
+    mkdir -p "$ELPA"
+    TERM={{TERM_}} {{EMACS}} -nw -Q \
+        --eval "(setq package-user-dir \"$ELPA\")" \
+        --eval "(require 'package)" \
+        --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+        --eval "(package-initialize)" \
+        --eval "(unless (package-installed-p 'dashboard) (package-refresh-contents) (package-install 'dashboard))" \
+        --eval "(require 'dashboard)" \
+        -l {{SRC}} \
+        --eval "(setq kitty-gfx-debug t)" \
+        --eval "(setq dashboard-startup-banner \"$BANNER\")" \
+        --eval "(setq dashboard-image-banner-max-width 256)" \
+        --eval "(setq dashboard-image-banner-max-height 256)" \
+        --eval "(setq dashboard-center-content t)" \
+        --eval "(setq dashboard-items '((recents . 5) (bookmarks . 5)))" \
+        --eval "(kitty-graphics-mode 1)" \
+        --eval "(dashboard-setup-startup-hook)" \
+        --eval "(dashboard-open)"
+
 # --- Logs -------------------------------------------------------------------
 
 # Tail the kitty-gfx debug log (set kitty-gfx-debug to t to populate)

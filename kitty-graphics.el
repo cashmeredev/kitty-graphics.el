@@ -2873,6 +2873,88 @@ can otherwise remain over newly-created window separators."
         (set-buffer-modified-p nil))
     (apply orig-fn args)))
 
+;;;; dashboard integration
+
+(defun kitty-gfx--dashboard-banner-image-path ()
+  "Resolve dashboard banner image to a file path, or nil.
+Walks `dashboard-startup-banner' similar to `dashboard-choose-banner',
+but tolerant of TTY where `image-type-available-p' may reject formats."
+  (let ((b (bound-and-true-p dashboard-startup-banner)))
+    (cond
+     ((and (stringp b) (file-exists-p b)
+           (not (string-suffix-p ".txt" b))
+           (member (downcase (or (file-name-extension b) ""))
+                   '("png" "jpg" "jpeg" "gif" "bmp" "webp" "svg" "xpm")))
+      b)
+     ((eq b 'official)
+      (and (boundp 'dashboard-banner-official-png)
+           (file-exists-p dashboard-banner-official-png)
+           dashboard-banner-official-png))
+     ((eq b 'logo)
+      (and (boundp 'dashboard-banner-logo-png)
+           (file-exists-p dashboard-banner-logo-png)
+           dashboard-banner-logo-png))
+     ((and (consp b) (stringp (car b)) (file-exists-p (car b)))
+      (car b)))))
+
+(defun kitty-gfx--dashboard-render-image (file)
+  "Render dashboard banner FILE via active backend, horizontally centered."
+  (kitty-gfx--query-cell-size)
+  (let* ((cw (or kitty-gfx--cell-pixel-width 8))
+         (ch (or kitty-gfx--cell-pixel-height 16))
+         (px-w (bound-and-true-p dashboard-image-banner-max-width))
+         (px-h (bound-and-true-p dashboard-image-banner-max-height))
+         (max-cols (if (and (numberp px-w) (> px-w 0))
+                       (max 1 (ceiling (/ (float px-w) cw)))
+                     kitty-gfx-max-width))
+         (max-rows (if (and (numberp px-h) (> px-h 0))
+                       (max 1 (ceiling (/ (float px-h) ch)))
+                     kitty-gfx-max-height))
+         (win-cols (or (window-body-width) max-cols))
+         (inhibit-read-only t))
+    (kitty-gfx--log "dashboard: render file=%s max=%dx%d win-cols=%d"
+                    file max-cols max-rows win-cols)
+    (goto-char (point-max))
+    (insert "\n")
+    (kitty-gfx--display-image-centered file max-cols max-rows
+                                       win-cols max-rows)
+    (goto-char (point-max))
+    (insert "\n")))
+
+(defun kitty-gfx--dashboard-restore-overlays ()
+  "Re-track kitty-gfx overlays after `dashboard-mode' wipes buffer-locals.
+`dashboard-mode' (a major-mode) calls `kill-all-local-variables', which
+resets `kitty-gfx--overlays' to nil even though the overlay objects
+themselves remain on the buffer.  Walk the buffer's overlay list and
+re-push any kitty-gfx overlay back into the tracker, then refresh."
+  (let ((restored 0))
+    (dolist (ov (overlays-in (point-min) (point-max)))
+      (when (and (overlay-get ov 'kitty-gfx)
+                 (not (memq ov kitty-gfx--overlays)))
+        (push ov kitty-gfx--overlays)
+        (cl-incf restored)))
+    (kitty-gfx--log "dashboard: restored %d overlay(s) in %s"
+                    restored (buffer-name))
+    (when (> restored 0)
+      (kitty-gfx--schedule-refresh))))
+
+(defun kitty-gfx--dashboard-insert-banner-advice (orig-fn &rest args)
+  "Around advice for `dashboard-insert-banner'.
+In TTY with active backend, render the banner image via kitty-gfx."
+  (kitty-gfx--log "dashboard: advice mode=%s gfx-p=%s backend=%s banner=%S"
+                  kitty-graphics-mode (display-graphic-p)
+                  kitty-gfx--active-backend
+                  (bound-and-true-p dashboard-startup-banner))
+  (if (and kitty-graphics-mode
+           (not (display-graphic-p))
+           kitty-gfx--active-backend)
+      (let ((img (kitty-gfx--dashboard-banner-image-path)))
+        (kitty-gfx--log "dashboard: resolved img=%s" img)
+        (if img
+            (kitty-gfx--dashboard-render-image img)
+          (apply orig-fn args)))
+    (apply orig-fn args)))
+
 ;;;; shr integration (eww, mu4e, gnus)
 
 (defun kitty-gfx--shr-put-image-advice (orig-fn spec alt &rest args)
@@ -3599,6 +3681,12 @@ Requires `kitty-gfx-enable-video' to be non-nil and mpv installed."
                 #'kitty-gfx--markdown-overlays-fontify-image-advice)
     (advice-add 'markdown-overlays--fontify-image-file-path :around
                 #'kitty-gfx--markdown-overlays-fontify-image-file-path-advice))
+  (with-eval-after-load 'dashboard-widgets
+    (advice-add 'dashboard-insert-banner :around
+                #'kitty-gfx--dashboard-insert-banner-advice))
+  (with-eval-after-load 'dashboard
+    (add-hook 'dashboard-mode-hook
+              #'kitty-gfx--dashboard-restore-overlays))
   (kitty-gfx--install-dirvish))
 
 (defun kitty-gfx--uninstall-integrations ()
@@ -3634,6 +3722,8 @@ Requires `kitty-gfx-enable-video' to be non-nil and mpv installed."
   (advice-remove 'shr-put-image #'kitty-gfx--shr-put-image-advice)
   (advice-remove 'markdown-overlays--fontify-image #'kitty-gfx--markdown-overlays-fontify-image-advice)
   (advice-remove 'markdown-overlays--fontify-image-file-path #'kitty-gfx--markdown-overlays-fontify-image-file-path-advice)
+  (advice-remove 'dashboard-insert-banner #'kitty-gfx--dashboard-insert-banner-advice)
+  (remove-hook 'dashboard-mode-hook #'kitty-gfx--dashboard-restore-overlays)
   (kitty-gfx--uninstall-dirvish))
 
 ;;;; Buffer cleanup
