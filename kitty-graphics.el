@@ -895,13 +895,14 @@ Sixel has no placement IDs — erase by writing spaces over the region."
 
 (defun kitty-gfx--sixel-cleanup (file _image-id)
   "Cleanup Sixel resources for FILE."
-  (remhash file kitty-gfx--sixel-cache)
-  ;; Remove cached sixel encodings for this file
-  (dolist (temp-file kitty-gfx--sixel-temp-files)
-    (when (string-match-p (regexp-quote (md5 file)) temp-file)
-      (kitty-gfx--log "sixel-cleanup: deleting %s" temp-file)
-      (ignore-errors (delete-file temp-file))
-      (setq kitty-gfx--sixel-temp-files (delete temp-file kitty-gfx--sixel-temp-files)))))
+  (when file
+    (remhash file kitty-gfx--sixel-cache)
+    ;; Remove cached sixel encodings for this file
+    (dolist (temp-file kitty-gfx--sixel-temp-files)
+      (when (string-match-p (regexp-quote (md5 file)) temp-file)
+        (kitty-gfx--log "sixel-cleanup: deleting %s" temp-file)
+        (ignore-errors (delete-file temp-file))
+        (setq kitty-gfx--sixel-temp-files (delete temp-file kitty-gfx--sixel-temp-files))))))
 
 (defun kitty-gfx--sixel-cleanup-all ()
   "Cleanup all Sixel resources.
@@ -1403,14 +1404,19 @@ Ignores cosmetic invisibility like hidden link brackets (`org-link')."
       (kitty-gfx--log "in-folded-region: pos=%d folded=%s" pos folded))
     folded))
 
-(defun kitty-gfx--overlay-screen-pos (ov)
-  "Return (TERM-ROW . TERM-COL) for overlay OV, or nil if not visible.
-Coordinates are 1-indexed terminal positions.
+(defun kitty-gfx--overlay-screen-pos (ov &optional win)
+  "Return (TERM-ROW . TERM-COL) for overlay OV in WIN, or nil if hidden.
+Coordinates are 1-indexed terminal positions.  WIN defaults to a window
+showing OV's buffer, for interactive debug helpers.
 Returns nil when the overlay position is outside the visible window
 range, inside a folded region, or not visible on screen."
   (let* ((buf (overlay-buffer ov))
          (pos (overlay-start ov))
-         (win (and buf (get-buffer-window buf))))
+         (win (and buf
+                   (or (and (window-live-p win)
+                            (eq (window-buffer win) buf)
+                            win)
+                       (get-buffer-window buf)))))
     ;; Fast path: skip entirely if no window, no position, or
     ;; buffer position is outside the visible window range.
     ;; This avoids expensive posn-at-point and fold checks.
@@ -1433,13 +1439,25 @@ range, inside a folded region, or not visible on screen."
           (let* ((col-row (posn-col-row win-pos))
                  (row (cdr col-row))
                  (posn-col (car col-row))
-                 (posn-xy (posn-x-y win-pos)))
-            (kitty-gfx--log "screen-pos-detail: pid=%s posn-col=%d posn-row=%d posn-xy=%S body-left=%d body-top=%d"
-                            (overlay-get ov 'kitty-gfx-pid) posn-col row posn-xy body-left body-top)
+                 (posn-xy (posn-x-y win-pos))
+                 ;; `posn-col-row' is derived from pixel coordinates and can
+                 ;; report the position after an overlay's `display' string
+                 ;; rather than the overlay's logical start.  That is exactly
+                 ;; the wrong edge for Sixel placement: the terminal graphic
+                 ;; must be emitted at the top-left of the reserved cells.
+                 ;; In terminal Emacs text cells are fixed-width, so the
+                 ;; buffer column at POS is the reliable horizontal anchor.
+                 (buffer-col (save-excursion
+                               (goto-char pos)
+                               (current-column)))
+                 (visual-col (max 0 (- buffer-col (window-hscroll win)))))
+            (kitty-gfx--log "screen-pos-detail: pid=%s posn-col=%d buffer-col=%d visual-col=%d posn-row=%d posn-xy=%S body-left=%d body-top=%d"
+                            (overlay-get ov 'kitty-gfx-pid) posn-col buffer-col
+                            visual-col row posn-xy body-left body-top)
             (when col-row
-              (let ((result (cons (+ body-top row 1) (+ body-left posn-col 1))))
-                (kitty-gfx--log "screen-pos: pid=%s pos=%d -> row=%d col=%d"
-                                (overlay-get ov 'kitty-gfx-pid) pos
+              (let ((result (cons (+ body-top row 1) (+ body-left visual-col 1))))
+                (kitty-gfx--log "screen-pos: pid=%s pos=%d win=%s -> row=%d col=%d"
+                                (overlay-get ov 'kitty-gfx-pid) pos win
                                 (car result) (cdr result))
                 result))))))))
 
@@ -1511,6 +1529,19 @@ to prevent flicker."
            (lambda (win)
              (with-current-buffer (window-buffer win)
                (when kitty-gfx--overlays
+                 ;; A single overlay can be visible in multiple windows showing
+                 ;; the same buffer.  Its legacy last-row/last-col properties
+                 ;; mirror the placement for the window currently being
+                 ;; refreshed; per-window placement tracking below keeps the
+                 ;; individual terminal regions deletable when one window later
+                 ;; disappears.
+                 (dolist (ov kitty-gfx--overlays)
+                   (let ((placement (kitty-gfx--image-placement ov win)))
+                     (unless (overlay-get ov 'kitty-gfx-heading)
+                       (overlay-put ov 'kitty-gfx-last-row
+                                    (plist-get (cdr placement) :row))
+                       (overlay-put ov 'kitty-gfx-last-col
+                                    (plist-get (cdr placement) :col)))))
                  ;; Prune dead overlays (overlay-buffer returns nil)
                  (let ((before (length kitty-gfx--overlays)))
                    (setq kitty-gfx--overlays
@@ -1526,7 +1557,7 @@ to prevent flicker."
                                    win (buffer-name) (length kitty-gfx--overlays) win-bottom)
                    (dolist (ov kitty-gfx--overlays)
                      (cl-incf total-overlays)
-                     (kitty-gfx--refresh-overlay ov win-bottom)
+                     (kitty-gfx--refresh-overlay ov win win-bottom)
                      (if (overlay-get ov 'kitty-gfx-last-row)
                          (cl-incf placed)
                        (cl-incf hidden)))))
@@ -1542,18 +1573,22 @@ to prevent flicker."
       (kitty-gfx--log "refresh: done total=%d placed=%d hidden=%d pruned=%d"
                        total-overlays placed hidden pruned))))
 
-(defun kitty-gfx--refresh-overlay (ov win-bottom)
-  "Refresh a single overlay OV.  WIN-BOTTOM is the window's bottom edge.
-Dispatches to heading or image refresh based on overlay type."
+(defun kitty-gfx--refresh-overlay (ov win win-bottom)
+  "Refresh a single overlay OV in WIN.
+WIN-BOTTOM is WIN's bottom edge.  Dispatches to heading or image
+refresh based on overlay type."
   (if (overlay-get ov 'kitty-gfx-heading)
       ;; Heading overlay — phase 1: compute position + erase if moved.
       ;; OSC 66 emission happens in phase 2 (kitty-gfx--emit-heading-overlays).
-      (kitty-gfx--refresh-heading-overlay ov win-bottom)
+      (kitty-gfx--refresh-heading-overlay ov win win-bottom)
   ;; Image overlay refresh
-  (let ((pos (kitty-gfx--overlay-screen-pos ov))
-        (rows (overlay-get ov 'kitty-gfx-rows))
-        (last-row (overlay-get ov 'kitty-gfx-last-row))
-        (last-col (overlay-get ov 'kitty-gfx-last-col)))
+  (let* ((pos (kitty-gfx--overlay-screen-pos ov win))
+         (rows (overlay-get ov 'kitty-gfx-rows))
+         (cols (overlay-get ov 'kitty-gfx-cols))
+         (placement (kitty-gfx--image-placement ov win))
+         (placement-data (cdr placement))
+         (last-row (plist-get placement-data :row))
+         (last-col (plist-get placement-data :col)))
     (let ((pid (overlay-get ov 'kitty-gfx-pid))
           (id (overlay-get ov 'kitty-gfx-id)))
       (if (and pos
@@ -1576,24 +1611,29 @@ Dispatches to heading or image refresh based on overlay type."
                               new-row new-col)
               (overlay-put ov 'kitty-gfx-last-row new-row)
               (overlay-put ov 'kitty-gfx-last-col new-col)
+              (kitty-gfx--record-image-placement ov win new-row new-col cols rows pid)
+              (setq placement (kitty-gfx--image-placement ov win)
+                    pid (plist-get (cdr placement) :pid))
               (funcall (kitty-gfx--backend-fn 'place)
-                       ov id pid (overlay-get ov 'kitty-gfx-cols) rows new-row new-col)))
-        ;; Not visible or overflows — delete if was placed
-        (when last-row
-          (kitty-gfx--log "refresh-ov: pid=%d hiding (was row=%d col=%d)"
-                          pid last-row last-col)
+                       ov id pid cols rows new-row new-col)))
+        ;; Not visible or overflows — delete if was placed in this window
+        (when placement
+          (kitty-gfx--log "refresh-ov: pid=%d hiding in win=%s (was row=%d col=%d)"
+                          pid win last-row last-col)
+          (kitty-gfx--delete-image-placement ov placement)
+          (kitty-gfx--forget-image-placement ov win)
           (overlay-put ov 'kitty-gfx-last-row nil)
-          (overlay-put ov 'kitty-gfx-last-col nil)
-          (funcall (kitty-gfx--backend-fn 'delete) ov id pid)))))))
+          (overlay-put ov 'kitty-gfx-last-col nil)))))))
 
-(defun kitty-gfx--refresh-heading-overlay (ov win-bottom)
-  "Refresh heading overlay OV.  WIN-BOTTOM is the window's bottom edge.
-Phase 1 of two-phase heading refresh: computes screen position,
-erases old multicell block if heading moved or became hidden,
-and caches the new position.  Does NOT emit OSC 66 — that
-happens in phase 2 (`kitty-gfx--emit-heading-overlays') to
-avoid posn-at-point redraws destroying freshly-placed blocks."
-  (let ((pos (kitty-gfx--overlay-screen-pos ov))
+(defun kitty-gfx--refresh-heading-overlay (ov win win-bottom)
+  "Refresh heading overlay OV in WIN.
+WIN-BOTTOM is WIN's bottom edge.  Phase 1 of two-phase heading
+refresh: computes screen position, erases old multicell block if
+heading moved or became hidden, and caches the new position.  Does
+NOT emit OSC 66 — that happens in phase 2
+(`kitty-gfx--emit-heading-overlays') to avoid posn-at-point redraws
+destroying freshly-placed blocks."
+  (let ((pos (kitty-gfx--overlay-screen-pos ov win))
         (rows (overlay-get ov 'kitty-gfx-rows))
         (last-row (overlay-get ov 'kitty-gfx-last-row))
         (last-col (overlay-get ov 'kitty-gfx-last-col)))
@@ -1678,15 +1718,9 @@ then invalidates position caches and schedules a refresh."
                     (kitty-gfx--erase-heading ov)
                     (overlay-put ov 'kitty-gfx-last-row nil)
                     (overlay-put ov 'kitty-gfx-last-col nil))
-                ;; Image overlay — delete terminal placement
-                (let ((id (overlay-get ov 'kitty-gfx-id))
-                      (pid (overlay-get ov 'kitty-gfx-pid)))
-                  (if (overlay-get ov 'kitty-gfx-last-row)
-                      (when (and id pid)
-                        (kitty-gfx--delete-placement id pid))
-                    (kitty-gfx--log "on-buffer-change: ov pid=%s has no last-row (never placed or already cleaned)" pid)))
-                (overlay-put ov 'kitty-gfx-last-row nil)
-                (overlay-put ov 'kitty-gfx-last-col nil))))))))
+                ;; Image overlay — delete all terminal placements, including
+                ;; multiple windows that were showing this buffer.
+                (kitty-gfx--delete-image-placements ov))))))))
   ;; Reset cache for visible buffers so they re-place correctly.
   ;; Heading overlays preserve cache (same rationale as on-window-change).
   (dolist (buf (buffer-list))
@@ -1694,6 +1728,7 @@ then invalidates position caches and schedules a refresh."
       (dolist (ov kitty-gfx--overlays)
         (when (and (overlay-buffer ov)
                    (not (overlay-get ov 'kitty-gfx-heading)))
+          (overlay-put ov 'kitty-gfx-placements nil)
           (overlay-put ov 'kitty-gfx-last-row nil)
           (overlay-put ov 'kitty-gfx-last-col nil)))))
   ;; Longer debounce: cancel any fast leading-edge cooldown and
@@ -1709,27 +1744,36 @@ then invalidates position caches and schedules a refresh."
 
 (defun kitty-gfx--on-window-change (_frame)
   "Handle window configuration change for image refresh.
-Invalidates position caches and cell pixel size so the refresh
-cycle re-places images correctly.  Does NOT delete all placements
-— that causes visible flicker.  Uses a longer debounce than normal
-refresh to let Emacs finish window layout transitions (e.g., when
-closing a split, Emacs briefly shows two windows for the same
-buffer before settling to one)."
-  (kitty-gfx--log "on-window-change: invalidating positions and cell size")
+Invalidates cell pixel size, deletes stale image placements, then
+clears image position caches so the refresh cycle re-places images
+at their new positions.  Uses a longer debounce than normal refresh
+to let Emacs finish window layout transitions (e.g., when closing a
+split, Emacs briefly shows two windows for the same buffer before
+settling to one)."
+  (kitty-gfx--log "on-window-change: deleting stale placements and invalidating cell size")
   (setq kitty-gfx--cell-pixel-width nil
         kitty-gfx--cell-pixel-height nil)
-  ;; Reset position cache so images get re-placed at correct positions.
+  ;; Delete image placements before clearing their cached positions.
+  ;; Window splits/resizes can move an image from the middle of the old
+  ;; window to the center of the new pane(s).  A buffer can also be shown
+  ;; in multiple windows, and closing one of those windows leaves terminal
+  ;; pixels that no remaining window can discover from `posn-at-point'.
+  ;; Therefore image placements are tracked and deleted per window before
+  ;; the cache is reset.  Some terminals do not reliably erase an old
+  ;; direct placement when it is re-placed at a different geometry, and
+  ;; Sixel is stateless and must be explicitly overwritten.
+  ;;
   ;; Heading overlays PRESERVE their cache — the refresh cycle needs
   ;; old→new position comparison to erase multicell blocks properly.
-  ;; Images can clear cache because re-placing with the same PID is
-  ;; idempotent (the terminal replaces the old placement).
-  (dolist (buf (buffer-list))
-    (with-current-buffer buf
-      (dolist (ov kitty-gfx--overlays)
-        (when (and (overlay-buffer ov)
-                   (not (overlay-get ov 'kitty-gfx-heading)))
-          (overlay-put ov 'kitty-gfx-last-row nil)
-          (overlay-put ov 'kitty-gfx-last-col nil)))))
+  (kitty-gfx--sync-begin)
+  (unwind-protect
+      (dolist (buf (buffer-list))
+        (with-current-buffer buf
+          (dolist (ov kitty-gfx--overlays)
+            (when (and (overlay-buffer ov)
+                       (not (overlay-get ov 'kitty-gfx-heading)))
+              (kitty-gfx--delete-image-placements ov)))))
+    (kitty-gfx--sync-end))
   ;; Longer debounce: cancel any fast leading-edge cooldown and
   ;; schedule a 0.1s delayed refresh to let window layout settle.
   (when kitty-gfx--render-timer
@@ -1921,6 +1965,82 @@ delete step, avoiding visual glitches in some terminals."
                      image-id pid cols rows beg end (buffer-name) (length kitty-gfx--overlays))
     ov))
 
+(defun kitty-gfx--image-placement (ov win)
+  "Return OV's recorded image placement for WIN, or nil."
+  (assq win (overlay-get ov 'kitty-gfx-placements)))
+
+(defun kitty-gfx--record-image-placement (ov win row col cols rows pid)
+  "Record that OV is placed in WIN at ROW COL with COLS ROWS and PID."
+  (unless (kitty-gfx--image-placement ov win)
+    (setq pid (kitty-gfx--alloc-placement-id)))
+  (let ((placements (assq-delete-all win (copy-sequence
+                                          (overlay-get ov 'kitty-gfx-placements)))))
+    (overlay-put ov 'kitty-gfx-placements
+                 (cons (cons win (list :row row :col col
+                                       :cols cols :rows rows
+                                       :pid pid))
+                       placements))))
+
+(defun kitty-gfx--forget-image-placement (ov win)
+  "Forget OV's recorded image placement for WIN."
+  (overlay-put ov 'kitty-gfx-placements
+               (assq-delete-all win (copy-sequence
+                                     (overlay-get ov 'kitty-gfx-placements)))))
+
+(defun kitty-gfx--delete-image-placement (ov placement)
+  "Delete one recorded image PLACEMENT for OV."
+  (let* ((data (cdr placement))
+         (id (overlay-get ov 'kitty-gfx-id))
+         (pid (plist-get data :pid))
+         (row (plist-get data :row))
+         (col (plist-get data :col))
+         (cols (plist-get data :cols))
+         (rows (plist-get data :rows))
+         (old-row (overlay-get ov 'kitty-gfx-last-row))
+         (old-col (overlay-get ov 'kitty-gfx-last-col))
+         (old-cols (overlay-get ov 'kitty-gfx-cols))
+         (old-rows (overlay-get ov 'kitty-gfx-rows)))
+    (when (and id pid row col cols rows kitty-gfx--active-backend)
+      ;; Sixel deletion is position-based and reads these properties from OV;
+      ;; Kitty deletion ignores them and deletes by PID.  Temporarily bind the
+      ;; recorded geometry so both backends can share the same helper.
+      (unwind-protect
+          (progn
+            (overlay-put ov 'kitty-gfx-last-row row)
+            (overlay-put ov 'kitty-gfx-last-col col)
+            (overlay-put ov 'kitty-gfx-cols cols)
+            (overlay-put ov 'kitty-gfx-rows rows)
+            (funcall (kitty-gfx--backend-fn 'delete) ov id pid))
+        (overlay-put ov 'kitty-gfx-last-row old-row)
+        (overlay-put ov 'kitty-gfx-last-col old-col)
+        (overlay-put ov 'kitty-gfx-cols old-cols)
+        (overlay-put ov 'kitty-gfx-rows old-rows)))))
+
+(defun kitty-gfx--delete-image-placements (ov)
+  "Delete all recorded terminal placements for image overlay OV."
+  (let ((placements (overlay-get ov 'kitty-gfx-placements)))
+    (if placements
+        (dolist (placement placements)
+          (condition-case err
+              (kitty-gfx--delete-image-placement ov placement)
+            (error
+             (kitty-gfx--log "delete-image-placements: error: %s"
+                              (error-message-string err)))))
+      ;; Backward-compatible fallback for overlays created before per-window
+      ;; placement tracking or for callers that only populated last-row/col.
+      (let ((id (overlay-get ov 'kitty-gfx-id))
+            (pid (overlay-get ov 'kitty-gfx-pid)))
+        (when (and id pid kitty-gfx--active-backend
+                   (overlay-get ov 'kitty-gfx-last-row))
+          (condition-case err
+              (funcall (kitty-gfx--backend-fn 'delete) ov id pid)
+            (error
+             (kitty-gfx--log "delete-image-placements: fallback error: %s"
+                              (error-message-string err))))))))
+  (overlay-put ov 'kitty-gfx-placements nil)
+  (overlay-put ov 'kitty-gfx-last-row nil)
+  (overlay-put ov 'kitty-gfx-last-col nil))
+
 (defun kitty-gfx--delete-placement (id pid)
   "Delete a specific placement PID of image ID from terminal.
 Uses d=i (lowercase) to remove the placement but keep stored image
@@ -1936,17 +2056,14 @@ the placement ID can be reused by a subsequent overlay (avoids
 visual glitches from delete+re-place sequences in some terminals)."
   (let ((id (overlay-get ov 'kitty-gfx-id))
         (pid (overlay-get ov 'kitty-gfx-pid)))
+    (when keep-placement
+      (overlay-put ov 'kitty-gfx-placements nil))
     (kitty-gfx--log "remove-overlay: id=%s pid=%s keep=%s buf=%s"
                      id pid keep-placement
                      (when (overlay-buffer ov) (buffer-name (overlay-buffer ov))))
     (when (overlay-buffer ov)
       (unless keep-placement
-        (condition-case err
-            (when (and id pid kitty-gfx--active-backend)
-              (funcall (kitty-gfx--backend-fn 'delete) ov id pid))
-          (error
-           (kitty-gfx--log "remove-overlay: error deleting placement: %s"
-                            (error-message-string err)))))
+        (kitty-gfx--delete-image-placements ov))
       (delete-overlay ov))
     (setq kitty-gfx--overlays (delq ov kitty-gfx--overlays))
     (kitty-gfx--log "remove-overlay: done (remaining=%d)" (length kitty-gfx--overlays))))
@@ -2029,9 +2146,10 @@ The buffer should be writable (caller handles `inhibit-read-only')."
       (unless cached-id
         (when (funcall (kitty-gfx--backend-fn 'prepare) abs-file image-id)
           (kitty-gfx--cache-put abs-file image-id)))
-      ;; Create overlay at the scaled dimensions
+      ;; Create overlay at the scaled dimensions.
       (when (or cached-id (gethash abs-file kitty-gfx--image-cache))
-        (kitty-gfx--make-overlay img-start (point) image-id img-cols img-rows abs-file reuse-pid)
+        (kitty-gfx--make-overlay img-start (point) image-id
+                                  img-cols img-rows abs-file reuse-pid)
         (kitty-gfx--schedule-refresh)))))
 
 (defun kitty-gfx-remove-images (&optional beg end)
@@ -2661,8 +2779,13 @@ With an active region, restrict to it; otherwise clear the whole buffer."
   "Zoom scale factor for image-mode display.
 Values > 1.0 zoom in, < 1.0 zoom out.")
 
-(defun kitty-gfx--image-mode-render ()
-  "Render the current image file centered at current scale."
+(defun kitty-gfx--image-mode-render (&optional reuse-placement)
+  "Render the current image file centered at current scale.
+When REUSE-PLACEMENT is non-nil, reuse the old terminal placement
+ID instead of deleting it first.  This is useful for zoom commands
+where the new placement immediately replaces the old one, but it is
+intentionally not used for window size changes because stale pixels
+can otherwise remain over newly-created window separators."
   (when-let* ((file (buffer-file-name)))
     (when (kitty-gfx--image-file-p file)
       (let* ((inhibit-read-only t)
@@ -2670,15 +2793,18 @@ Values > 1.0 zoom in, < 1.0 zoom out.")
              (win-h (- (window-body-height) 2))
              (max-cols (min win-w kitty-gfx-max-width))
              (max-rows (min win-h kitty-gfx-max-height))
-             ;; Save the old placement ID before removing overlays.
-             ;; Reusing it avoids delete+re-place glitches (WezTerm #5892).
-             (old-pid (when (car kitty-gfx--overlays)
+             ;; Save the old placement ID only when the caller explicitly
+             ;; wants to reuse it.  Reusing avoids delete+re-place glitches
+             ;; for zoom commands (WezTerm #5892), but window splits/resizes
+             ;; must delete first so stale terminal pixels are cleared.
+             (old-pid (when (and reuse-placement (car kitty-gfx--overlays))
                         (overlay-get (car kitty-gfx--overlays) 'kitty-gfx-pid))))
         (kitty-gfx--log "image-mode-render: file=%s scale=%.2f win=%dx%d max=%dx%d reuse-pid=%s"
                          (file-name-nondirectory file) kitty-gfx--image-scale
                          win-w win-h max-cols max-rows old-pid)
-        ;; Remove overlays but skip terminal-side delete when we have
-        ;; a PID to reuse (the new placement will atomically replace it).
+        ;; Remove overlays.  When OLD-PID is non-nil, skip terminal-side
+        ;; delete so the new placement atomically replaces it; otherwise
+        ;; delete/erase the old placement before changing the buffer text.
         (dolist (ov (overlays-in (point-min) (point-max)))
           (when (overlay-get ov 'kitty-gfx)
             (kitty-gfx--remove-overlay ov old-pid)))
@@ -2693,19 +2819,19 @@ Values > 1.0 zoom in, < 1.0 zoom out.")
   "Zoom in on the image in image-mode."
   (interactive)
   (setq kitty-gfx--image-scale (* kitty-gfx--image-scale 1.25))
-  (kitty-gfx--image-mode-render))
+  (kitty-gfx--image-mode-render t))
 
 (defun kitty-gfx-image-decrease-size ()
   "Zoom out on the image in image-mode."
   (interactive)
   (setq kitty-gfx--image-scale (max 0.1 (* kitty-gfx--image-scale 0.8)))
-  (kitty-gfx--image-mode-render))
+  (kitty-gfx--image-mode-render t))
 
 (defun kitty-gfx-image-reset-size ()
   "Reset image zoom to default in image-mode."
   (interactive)
   (setq kitty-gfx--image-scale 1.0)
-  (kitty-gfx--image-mode-render))
+  (kitty-gfx--image-mode-render t))
 
 (defun kitty-gfx--image-mode-advice (orig-fn &rest args)
   "Around advice for `image-mode'."
@@ -2815,6 +2941,160 @@ Values > 1.0 zoom in, < 1.0 zoom out.")
   "Path to the current doc-view page image file.
 Stored so zoom commands can re-render without querying `doc-view-current-image'.")
 
+(defun kitty-gfx--doc-view-terminal-p ()
+  "Non-nil when Kitty graphics is handling a doc-view buffer in a terminal."
+  (and kitty-graphics-mode
+       (not (display-graphic-p))
+       (eq major-mode 'doc-view-mode)))
+
+(defun kitty-gfx--doc-view-image-cell-size ()
+  "Return the current doc-view Kitty image size as (COLS . ROWS), or nil."
+  (when (overlayp kitty-gfx--doc-view-overlay)
+    (let ((cols (overlay-get kitty-gfx--doc-view-overlay 'kitty-gfx-cols))
+          (rows (overlay-get kitty-gfx--doc-view-overlay 'kitty-gfx-rows)))
+      (when (and cols rows)
+        (cons cols rows)))))
+
+(defun kitty-gfx--doc-view-max-hscroll ()
+  "Return the maximum horizontal scroll for the current Kitty doc-view page."
+  (let ((size (kitty-gfx--doc-view-image-cell-size)))
+    (max 0 (- (or (car size) 0) (window-body-width)))))
+
+(defun kitty-gfx--doc-view-max-vscroll ()
+  "Return the maximum vertical pixel scroll for the current Kitty doc-view page."
+  (let ((size (kitty-gfx--doc-view-image-cell-size)))
+    (max 0 (- (* (or (cdr size) 0) (frame-char-height))
+              (window-body-height nil t)))))
+
+(defun kitty-gfx--doc-view-set-hscroll (ncols)
+  "Set horizontal scroll to NCOLS for Kitty doc-view and refresh the page."
+  (let ((new (max 0 (min ncols (kitty-gfx--doc-view-max-hscroll)))))
+    (set-window-hscroll (selected-window) new)
+    (kitty-gfx--schedule-refresh)
+    new))
+
+(defun kitty-gfx--doc-view-set-vscroll (pixels)
+  "Set vertical pixel scroll to PIXELS for Kitty doc-view and refresh the page."
+  (let ((new (max 0 (min pixels (kitty-gfx--doc-view-max-vscroll)))))
+    (set-window-vscroll (selected-window) new t)
+    (kitty-gfx--schedule-refresh)
+    new))
+
+(defun kitty-gfx--doc-view-forward-hscroll (&optional n)
+  "Scroll the current Kitty doc-view page left by N columns."
+  (kitty-gfx--doc-view-set-hscroll (+ (window-hscroll) (or n 1))))
+
+(defun kitty-gfx--doc-view-next-line (&optional n)
+  "Scroll the current Kitty doc-view page upward by N terminal rows."
+  (kitty-gfx--doc-view-set-vscroll
+   (+ (window-vscroll nil t) (* (or n 1) (frame-char-height)))))
+
+(defun kitty-gfx--doc-view-scroll-left (&optional n)
+  "Scroll the current Kitty doc-view page leftward by N columns."
+  (kitty-gfx--doc-view-forward-hscroll
+   (cond
+    ((null n) (max 0 (- (window-body-width) 2)))
+    ((eq n '-) (min 0 (- 2 (window-body-width))))
+    (t (prefix-numeric-value n)))))
+
+(defun kitty-gfx--doc-view-scroll-up (&optional n)
+  "Scroll the current Kitty doc-view page upward by N rows."
+  (kitty-gfx--doc-view-next-line
+   (cond
+    ((null n) (max 0 (- (window-body-height) next-screen-context-lines)))
+    ((eq n '-) (min 0 (- next-screen-context-lines (window-body-height))))
+    (t (prefix-numeric-value n)))))
+
+(defun kitty-gfx--doc-view-image-forward-hscroll-advice (orig-fn &optional n)
+  "Around advice for `image-forward-hscroll' in Kitty doc-view buffers."
+  (if (kitty-gfx--doc-view-terminal-p)
+      (kitty-gfx--doc-view-forward-hscroll n)
+    (funcall orig-fn n)))
+
+(defun kitty-gfx--doc-view-image-backward-hscroll-advice (orig-fn &optional n)
+  "Around advice for `image-backward-hscroll' in Kitty doc-view buffers."
+  (if (kitty-gfx--doc-view-terminal-p)
+      (kitty-gfx--doc-view-forward-hscroll (- (or n 1)))
+    (funcall orig-fn n)))
+
+(defun kitty-gfx--doc-view-image-next-line-advice (orig-fn &optional n)
+  "Around advice for `image-next-line' in Kitty doc-view buffers."
+  (if (kitty-gfx--doc-view-terminal-p)
+      (kitty-gfx--doc-view-next-line n)
+    (funcall orig-fn n)))
+
+(defun kitty-gfx--doc-view-image-previous-line-advice (orig-fn &optional n)
+  "Around advice for `image-previous-line' in Kitty doc-view buffers."
+  (if (kitty-gfx--doc-view-terminal-p)
+      (kitty-gfx--doc-view-next-line (- (or n 1)))
+    (funcall orig-fn n)))
+
+(defun kitty-gfx--doc-view-image-scroll-left-advice (orig-fn &optional n)
+  "Around advice for `image-scroll-left' in Kitty doc-view buffers."
+  (if (kitty-gfx--doc-view-terminal-p)
+      (kitty-gfx--doc-view-scroll-left n)
+    (funcall orig-fn n)))
+
+(defun kitty-gfx--doc-view-image-scroll-right-advice (orig-fn &optional n)
+  "Around advice for `image-scroll-right' in Kitty doc-view buffers."
+  (if (kitty-gfx--doc-view-terminal-p)
+      (kitty-gfx--doc-view-scroll-left
+       (cond
+        ((null n) (min 0 (- 2 (window-body-width))))
+        ((eq n '-) (max 0 (- (window-body-width) 2)))
+        (t (- (prefix-numeric-value n)))))
+    (funcall orig-fn n)))
+
+(defun kitty-gfx--doc-view-image-scroll-up-advice (orig-fn &optional n)
+  "Around advice for `image-scroll-up' in Kitty doc-view buffers."
+  (if (kitty-gfx--doc-view-terminal-p)
+      (kitty-gfx--doc-view-scroll-up n)
+    (funcall orig-fn n)))
+
+(defun kitty-gfx--doc-view-image-scroll-down-advice (orig-fn &optional n)
+  "Around advice for `image-scroll-down' in Kitty doc-view buffers."
+  (if (kitty-gfx--doc-view-terminal-p)
+      (kitty-gfx--doc-view-scroll-up
+       (cond
+        ((null n) (min 0 (- next-screen-context-lines (window-body-height))))
+        ((eq n '-) (max 0 (- (window-body-height) next-screen-context-lines)))
+        (t (- (prefix-numeric-value n)))))
+    (funcall orig-fn n)))
+
+(defun kitty-gfx--doc-view-image-bol-advice (orig-fn &optional arg)
+  "Around advice for `image-bol' in Kitty doc-view buffers."
+  (if (kitty-gfx--doc-view-terminal-p)
+      (progn
+        (when (and arg (/= (prefix-numeric-value arg) 1))
+          (kitty-gfx--doc-view-next-line (- (prefix-numeric-value arg) 1)))
+        (kitty-gfx--doc-view-set-hscroll 0))
+    (funcall orig-fn arg)))
+
+(defun kitty-gfx--doc-view-image-eol-advice (orig-fn &optional arg)
+  "Around advice for `image-eol' in Kitty doc-view buffers."
+  (if (kitty-gfx--doc-view-terminal-p)
+      (progn
+        (when (and arg (/= (prefix-numeric-value arg) 1))
+          (kitty-gfx--doc-view-next-line (- (prefix-numeric-value arg) 1)))
+        (kitty-gfx--doc-view-set-hscroll (kitty-gfx--doc-view-max-hscroll)))
+    (funcall orig-fn arg)))
+
+(defun kitty-gfx--doc-view-image-bob-advice (orig-fn)
+  "Around advice for `image-bob' in Kitty doc-view buffers."
+  (if (kitty-gfx--doc-view-terminal-p)
+      (progn
+        (kitty-gfx--doc-view-set-hscroll 0)
+        (kitty-gfx--doc-view-set-vscroll 0))
+    (funcall orig-fn)))
+
+(defun kitty-gfx--doc-view-image-eob-advice (orig-fn)
+  "Around advice for `image-eob' in Kitty doc-view buffers."
+  (if (kitty-gfx--doc-view-terminal-p)
+      (progn
+        (kitty-gfx--doc-view-set-hscroll (kitty-gfx--doc-view-max-hscroll))
+        (kitty-gfx--doc-view-set-vscroll (kitty-gfx--doc-view-max-vscroll)))
+    (funcall orig-fn)))
+
 (defun kitty-gfx--doc-view-insert-image-advice (orig-fn file &rest args)
   "Around advice for `doc-view-insert-image'.
 Displays the page image via Kitty graphics instead of an Emacs
@@ -2831,15 +3111,34 @@ image spec.  FILE is the path to the page PNG."
           (when kitty-gfx--doc-view-overlay
             (kitty-gfx--remove-overlay kitty-gfx--doc-view-overlay old-pid)
             (setq kitty-gfx--doc-view-overlay nil))
-          ;; Clear the buffer (removes "Welcome to DocView!" text)
-          (let* ((inhibit-read-only t)
-                 (win-w (- (window-body-width) 1))
-                 (win-h (- (window-body-height) 1)))
-            (erase-buffer)
-            (kitty-gfx--display-image-centered
-             file win-w win-h win-w win-h
-             kitty-gfx--doc-view-scale old-pid)
-            (setq kitty-gfx--doc-view-overlay (car kitty-gfx--overlays))))
+          ;; Display the rendered page using only an overlay.  Do not erase
+          ;; or insert text here: doc-view buffers visit the original PDF, so
+          ;; mutating buffer text can corrupt the document if it is saved.
+          (let* ((win-w (- (window-body-width) 1))
+                 (win-h (- (window-body-height) 1))
+                 (abs-file (expand-file-name file))
+                 (px (kitty-gfx--image-pixel-size abs-file))
+                 (base-dims (if px
+                                (kitty-gfx--compute-cell-dims
+                                 (car px) (cdr px) win-w win-h)
+                              (cons (min 40 win-w) (min 15 win-h))))
+                 (img-cols (max 1 (round (* kitty-gfx--doc-view-scale
+                                             (car base-dims)))))
+                 (img-rows (max 1 (round (* kitty-gfx--doc-view-scale
+                                             (cdr base-dims)))))
+                 (cached-id (kitty-gfx--cache-get abs-file))
+                 (image-id (or cached-id (kitty-gfx--alloc-id))))
+            (set-window-hscroll (selected-window) 0)
+            (set-window-vscroll (selected-window) 0 t)
+            (unless cached-id
+              (when (funcall (kitty-gfx--backend-fn 'prepare) abs-file image-id)
+                (kitty-gfx--cache-put abs-file image-id)))
+            (when (or cached-id (gethash abs-file kitty-gfx--image-cache))
+              (setq kitty-gfx--doc-view-overlay
+                    (kitty-gfx--make-overlay (point-min) (point-max)
+                                             image-id img-cols img-rows
+                                             abs-file old-pid))
+              (kitty-gfx--schedule-refresh))))
         (goto-char (point-min)))
     (apply orig-fn file args)))
 
@@ -3270,7 +3569,31 @@ Requires `kitty-gfx-enable-video' to be non-nil and mpv installed."
     (advice-add 'doc-view-enlarge :around
                 #'kitty-gfx--doc-view-enlarge-advice)
     (advice-add 'doc-view-scale-reset :around
-                #'kitty-gfx--doc-view-scale-reset-advice))
+                #'kitty-gfx--doc-view-scale-reset-advice)
+    (advice-add 'image-forward-hscroll :around
+                #'kitty-gfx--doc-view-image-forward-hscroll-advice)
+    (advice-add 'image-backward-hscroll :around
+                #'kitty-gfx--doc-view-image-backward-hscroll-advice)
+    (advice-add 'image-next-line :around
+                #'kitty-gfx--doc-view-image-next-line-advice)
+    (advice-add 'image-previous-line :around
+                #'kitty-gfx--doc-view-image-previous-line-advice)
+    (advice-add 'image-scroll-left :around
+                #'kitty-gfx--doc-view-image-scroll-left-advice)
+    (advice-add 'image-scroll-right :around
+                #'kitty-gfx--doc-view-image-scroll-right-advice)
+    (advice-add 'image-scroll-up :around
+                #'kitty-gfx--doc-view-image-scroll-up-advice)
+    (advice-add 'image-scroll-down :around
+                #'kitty-gfx--doc-view-image-scroll-down-advice)
+    (advice-add 'image-bol :around
+                #'kitty-gfx--doc-view-image-bol-advice)
+    (advice-add 'image-eol :around
+                #'kitty-gfx--doc-view-image-eol-advice)
+    (advice-add 'image-bob :around
+                #'kitty-gfx--doc-view-image-bob-advice)
+    (advice-add 'image-eob :around
+                #'kitty-gfx--doc-view-image-eob-advice))
   (with-eval-after-load 'markdown-overlays
     (advice-add 'markdown-overlays--fontify-image :around
                 #'kitty-gfx--markdown-overlays-fontify-image-advice)
@@ -3295,6 +3618,18 @@ Requires `kitty-gfx-enable-video' to be non-nil and mpv installed."
   (advice-remove 'doc-view-insert-image #'kitty-gfx--doc-view-insert-image-advice)
   (advice-remove 'doc-view-enlarge #'kitty-gfx--doc-view-enlarge-advice)
   (advice-remove 'doc-view-scale-reset #'kitty-gfx--doc-view-scale-reset-advice)
+  (advice-remove 'image-forward-hscroll #'kitty-gfx--doc-view-image-forward-hscroll-advice)
+  (advice-remove 'image-backward-hscroll #'kitty-gfx--doc-view-image-backward-hscroll-advice)
+  (advice-remove 'image-next-line #'kitty-gfx--doc-view-image-next-line-advice)
+  (advice-remove 'image-previous-line #'kitty-gfx--doc-view-image-previous-line-advice)
+  (advice-remove 'image-scroll-left #'kitty-gfx--doc-view-image-scroll-left-advice)
+  (advice-remove 'image-scroll-right #'kitty-gfx--doc-view-image-scroll-right-advice)
+  (advice-remove 'image-scroll-up #'kitty-gfx--doc-view-image-scroll-up-advice)
+  (advice-remove 'image-scroll-down #'kitty-gfx--doc-view-image-scroll-down-advice)
+  (advice-remove 'image-bol #'kitty-gfx--doc-view-image-bol-advice)
+  (advice-remove 'image-eol #'kitty-gfx--doc-view-image-eol-advice)
+  (advice-remove 'image-bob #'kitty-gfx--doc-view-image-bob-advice)
+  (advice-remove 'image-eob #'kitty-gfx--doc-view-image-eob-advice)
   (advice-remove 'image-mode #'kitty-gfx--image-mode-advice)
   (advice-remove 'shr-put-image #'kitty-gfx--shr-put-image-advice)
   (advice-remove 'markdown-overlays--fontify-image #'kitty-gfx--markdown-overlays-fontify-image-advice)
