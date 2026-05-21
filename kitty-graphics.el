@@ -1897,6 +1897,14 @@ refresh based on overlay type."
                               pid
                               (if last-row (format "row=%d,col=%d" last-row last-col) "nil")
                               new-row new-col)
+              ;; Sixel has no placement IDs — re-placing at a new position
+              ;; or size leaves the old pixel block on screen unless we
+              ;; explicitly erase it first.  `sixel-delete' reads OLD
+              ;; last-row/last-col/cols/rows from the overlay, so erase
+              ;; BEFORE updating the cache below (issue #13).
+              (when (and last-row
+                         (eq kitty-gfx--active-backend 'sixel))
+                (funcall (kitty-gfx--backend-fn 'delete) ov id pid))
               (overlay-put ov 'kitty-gfx-last-row new-row)
               (overlay-put ov 'kitty-gfx-last-col new-col)
               (kitty-gfx--record-image-placement ov win new-row new-col cols rows pid)
@@ -2351,17 +2359,29 @@ data so the image can be re-placed without retransmitting."
   "Remove overlay OV and delete its placement from terminal.
 When KEEP-PLACEMENT is non-nil, skip the terminal-side delete so
 the placement ID can be reused by a subsequent overlay (avoids
-visual glitches from delete+re-place sequences in some terminals)."
-  (let ((id (overlay-get ov 'kitty-gfx-id))
-        (pid (overlay-get ov 'kitty-gfx-pid))
-        (temp-file (overlay-get ov 'kitty-gfx-delete-file)))
-    (when keep-placement
+visual glitches from delete+re-place sequences in some terminals).
+
+KEEP-PLACEMENT is ignored for backends without placement IDs
+\(Sixel): they have no atomic-replace semantics, so skipping the
+delete would leave the old pixel block on screen as a ghost when
+the next placement lands at a different position or size
+\(issue #13)."
+  (let* ((id (overlay-get ov 'kitty-gfx-id))
+         (pid (overlay-get ov 'kitty-gfx-pid))
+         (temp-file (overlay-get ov 'kitty-gfx-delete-file))
+         (placement-id-backend (memq kitty-gfx--active-backend '(kitty)))
+         (must-delete (or (not keep-placement)
+                          (not placement-id-backend))))
+    (when (and keep-placement placement-id-backend)
+      ;; Kitty: drop the per-window placement records so the next
+      ;; placement starts fresh with the reused PID.  Sixel needs the
+      ;; records intact below so the backend `delete' can erase pixels.
       (overlay-put ov 'kitty-gfx-placements nil))
     (kitty-gfx--log "remove-overlay: id=%s pid=%s keep=%s buf=%s"
                      id pid keep-placement
                      (when (overlay-buffer ov) (buffer-name (overlay-buffer ov))))
     (when (overlay-buffer ov)
-      (unless keep-placement
+      (when must-delete
         (kitty-gfx--delete-image-placements ov))
       (delete-overlay ov))
     (when temp-file
