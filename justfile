@@ -168,6 +168,56 @@ test-sixel-tmux encoder="":
                 --eval '(kitty-graphics-mode 1)' tests/test-image.png"
     fi
 
+# --- SSH latency test (issue #19) -------------------------------------------
+
+# Push source to a remote host and open it in terminal Emacs over SSH so you
+# can feel the keystroke latency for real.  Defaults to `moneyspread`; pass
+# any host:  `just test-ssh somehost`.  Emacs comes from `nix shell nixpkgs#emacs`
+# on the remote (NixOS) — no system install needed.
+#
+# Profiler is pre-armed — once Emacs is open:
+#   1. switch to *scratch*  (C-x b RET)
+#   2. mash keys for ~10s
+#   3. M-x profiler-report  — look for kitty-gfx--on-redisplay et al.
+#   4. M-x profiler-stop
+test-ssh host="moneyspread":
+    #!/usr/bin/env bash
+    set -eu
+    REMOTE_DIR="/tmp/kitty-graphics-ssh-test"
+    echo ">> rsync source + tests to {{host}}:$REMOTE_DIR"
+    ssh {{host}} "mkdir -p $REMOTE_DIR/tests"
+    rsync -az {{SRC}} {{host}}:$REMOTE_DIR/
+    rsync -az tests/ {{host}}:$REMOTE_DIR/tests/
+    echo ">> launching emacs via nix shell on {{host}} (TERM={{TERM_}})"
+    echo ">> profiler is pre-armed; M-x profiler-report after typing test"
+    ssh -t {{host}} "cd $REMOTE_DIR && nix shell nixpkgs#emacs nixpkgs#imagemagick nixpkgs#libsixel --command \
+        env TERM={{TERM_}} TERM_PROGRAM=kitty KITTY_PID=ssh emacs -nw -Q \
+        -l $REMOTE_DIR/{{SRC}} \
+        --eval '(setq kitty-gfx-debug t kitty-gfx-preferred-protocol (quote kitty))' \
+        --eval '(kitty-graphics-mode 1)' \
+        --eval '(profiler-start (quote cpu))'"
+
+# Same as test-ssh but baseline: checks out origin/master into a worktree,
+# pushes THAT version to the remote.  Use to A/B against the fix branch.
+test-ssh-baseline host="moneyspread":
+    #!/usr/bin/env bash
+    set -eu
+    WT=$(mktemp -d /tmp/kgfx-baseline.XXXXXX)
+    trap "git worktree remove --force $WT >/dev/null 2>&1 || true" EXIT
+    git worktree add --detach $WT origin/master >/dev/null
+    REMOTE_DIR="/tmp/kitty-graphics-ssh-baseline"
+    echo ">> rsync ORIGIN/MASTER source to {{host}}:$REMOTE_DIR"
+    ssh {{host}} "mkdir -p $REMOTE_DIR/tests"
+    rsync -az $WT/{{SRC}} {{host}}:$REMOTE_DIR/
+    rsync -az $WT/tests/ {{host}}:$REMOTE_DIR/tests/
+    echo ">> launching emacs via nix shell on {{host}} with BASELINE code"
+    ssh -t {{host}} "cd $REMOTE_DIR && nix shell nixpkgs#emacs nixpkgs#imagemagick nixpkgs#libsixel --command \
+        env TERM={{TERM_}} TERM_PROGRAM=kitty KITTY_PID=ssh emacs -nw -Q \
+        -l $REMOTE_DIR/{{SRC}} \
+        --eval '(setq kitty-gfx-debug t kitty-gfx-preferred-protocol (quote kitty))' \
+        --eval '(kitty-graphics-mode 1)' \
+        --eval '(profiler-start (quote cpu))'"
+
 # --- Logs -------------------------------------------------------------------
 
 # Tail the kitty-gfx debug log (set kitty-gfx-debug to t to populate)
