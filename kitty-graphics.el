@@ -1897,6 +1897,14 @@ refresh based on overlay type."
                               pid
                               (if last-row (format "row=%d,col=%d" last-row last-col) "nil")
                               new-row new-col)
+              ;; Sixel has no placement IDs — re-placing at a new position
+              ;; or size leaves the old pixel block on screen unless we
+              ;; explicitly erase it first.  `sixel-delete' reads OLD
+              ;; last-row/last-col/cols/rows from the overlay, so erase
+              ;; BEFORE updating the cache below (issue #13).
+              (when (and last-row
+                         (eq kitty-gfx--active-backend 'sixel))
+                (funcall (kitty-gfx--backend-fn 'delete) ov id pid))
               (overlay-put ov 'kitty-gfx-last-row new-row)
               (overlay-put ov 'kitty-gfx-last-col new-col)
               (kitty-gfx--record-image-placement ov win new-row new-col cols rows pid)
@@ -2351,17 +2359,29 @@ data so the image can be re-placed without retransmitting."
   "Remove overlay OV and delete its placement from terminal.
 When KEEP-PLACEMENT is non-nil, skip the terminal-side delete so
 the placement ID can be reused by a subsequent overlay (avoids
-visual glitches from delete+re-place sequences in some terminals)."
-  (let ((id (overlay-get ov 'kitty-gfx-id))
-        (pid (overlay-get ov 'kitty-gfx-pid))
-        (temp-file (overlay-get ov 'kitty-gfx-delete-file)))
-    (when keep-placement
+visual glitches from delete+re-place sequences in some terminals).
+
+KEEP-PLACEMENT is ignored for backends without placement IDs
+\(Sixel): they have no atomic-replace semantics, so skipping the
+delete would leave the old pixel block on screen as a ghost when
+the next placement lands at a different position or size
+\(issue #13)."
+  (let* ((id (overlay-get ov 'kitty-gfx-id))
+         (pid (overlay-get ov 'kitty-gfx-pid))
+         (temp-file (overlay-get ov 'kitty-gfx-delete-file))
+         (placement-id-backend (memq kitty-gfx--active-backend '(kitty)))
+         (must-delete (or (not keep-placement)
+                          (not placement-id-backend))))
+    (when (and keep-placement placement-id-backend)
+      ;; Kitty: drop the per-window placement records so the next
+      ;; placement starts fresh with the reused PID.  Sixel needs the
+      ;; records intact below so the backend `delete' can erase pixels.
       (overlay-put ov 'kitty-gfx-placements nil))
     (kitty-gfx--log "remove-overlay: id=%s pid=%s keep=%s buf=%s"
                      id pid keep-placement
                      (when (overlay-buffer ov) (buffer-name (overlay-buffer ov))))
     (when (overlay-buffer ov)
-      (unless keep-placement
+      (when must-delete
         (kitty-gfx--delete-image-placements ov))
       (delete-overlay ov))
     (when temp-file
@@ -3104,16 +3124,36 @@ can otherwise remain over newly-created window separators."
         (kitty-gfx--log "image-mode-render: file=%s scale=%.2f win=%dx%d max=%dx%d reuse-pid=%s"
                          (file-name-nondirectory file) kitty-gfx--image-scale
                          win-w win-h max-cols max-rows old-pid)
-        ;; Remove overlays.  When OLD-PID is non-nil, skip terminal-side
-        ;; delete so the new placement atomically replaces it; otherwise
-        ;; delete/erase the old placement before changing the buffer text.
-        (dolist (ov (overlays-in (point-min) (point-max)))
-          (when (overlay-get ov 'kitty-gfx)
-            (kitty-gfx--remove-overlay ov old-pid)))
-        (erase-buffer)
-        (kitty-gfx--display-image-centered
-         file max-cols max-rows win-w win-h
-         kitty-gfx--image-scale old-pid)
+        ;; Snapshot the old overlay's per-window placement records so we
+        ;; can transplant them onto the new overlay.  Without this, the
+        ;; new overlay starts with no recorded placement, the refresh
+        ;; allocates a fresh per-window PID, and Kitty draws the
+        ;; resized image at a NEW placement while the old placement
+        ;; (which we deliberately did not delete to allow atomic
+        ;; replacement) remains on screen as a ghost (issue #13).
+        (let ((old-placements
+               (when reuse-placement
+                 (let ((ov (car kitty-gfx--overlays)))
+                   (and ov (copy-sequence
+                            (overlay-get ov 'kitty-gfx-placements)))))))
+          ;; Remove overlays.  When OLD-PID is non-nil, skip terminal-side
+          ;; delete so the new placement atomically replaces it; otherwise
+          ;; delete/erase the old placement before changing the buffer text.
+          (dolist (ov (overlays-in (point-min) (point-max)))
+            (when (overlay-get ov 'kitty-gfx)
+              (kitty-gfx--remove-overlay ov old-pid)))
+          (erase-buffer)
+          (kitty-gfx--display-image-centered
+           file max-cols max-rows win-w win-h
+           kitty-gfx--image-scale old-pid)
+          ;; Transplant old placements onto the freshly-made overlay so the
+          ;; next refresh re-uses the recorded per-window PIDs.  Recorded
+          ;; row/col/cols/rows are intentionally OLD — refresh-overlay sees
+          ;; them as the "moved" baseline and re-places at the same PID
+          ;; (Kitty atomic-replace) at the new position.
+          (when old-placements
+            (when-let* ((new-ov (car kitty-gfx--overlays)))
+              (overlay-put new-ov 'kitty-gfx-placements old-placements))))
         (goto-char (point-min))
         (set-buffer-modified-p nil)))))
 
@@ -3417,8 +3457,14 @@ image spec.  FILE is the path to the page PNG."
         (setq kitty-gfx--doc-view-current-file file)
         ;; Save old PID and remove overlay without terminal-side delete
         ;; so the new placement atomically replaces it (WezTerm #5892).
+        ;; Also snapshot per-window placements for transplant onto the
+        ;; new overlay below (see image-mode-render rationale, issue #13).
         (let ((old-pid (when kitty-gfx--doc-view-overlay
-                         (overlay-get kitty-gfx--doc-view-overlay 'kitty-gfx-pid))))
+                         (overlay-get kitty-gfx--doc-view-overlay 'kitty-gfx-pid)))
+              (old-placements (when kitty-gfx--doc-view-overlay
+                                (copy-sequence
+                                 (overlay-get kitty-gfx--doc-view-overlay
+                                              'kitty-gfx-placements)))))
           (when kitty-gfx--doc-view-overlay
             (kitty-gfx--remove-overlay kitty-gfx--doc-view-overlay old-pid)
             (setq kitty-gfx--doc-view-overlay nil))
@@ -3449,6 +3495,9 @@ image spec.  FILE is the path to the page PNG."
                     (kitty-gfx--make-overlay (point-min) (point-max)
                                              image-id img-cols img-rows
                                              abs-file old-pid))
+              (when (and old-placements kitty-gfx--doc-view-overlay)
+                (overlay-put kitty-gfx--doc-view-overlay
+                             'kitty-gfx-placements old-placements))
               (kitty-gfx--schedule-refresh))))
         (goto-char (point-min)))
     (apply orig-fn file args)))
