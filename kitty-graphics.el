@@ -435,6 +435,10 @@ Most recently used at the front.")
 (defvar kitty-gfx--render-timer nil
   "Timer for deferred re-rendering.")
 
+(defvar kitty-gfx--force-redisplay nil
+  "Non-nil when the next refresh must call `(redisplay t)' first.
+See full docstring near `kitty-gfx--schedule-refresh'.")
+
 (defvar kitty-gfx--cell-pixel-width nil
   "Terminal cell width in pixels (queried on startup).")
 
@@ -1603,7 +1607,7 @@ a kitty-gfx heading overlay."
                   (cl-incf count)))))))
       (kitty-gfx--log "apply-heading-sizes: created %d overlays" count)
       (when (> count 0)
-        (kitty-gfx--schedule-refresh)))))
+        (kitty-gfx--schedule-refresh t)))))
 
 (defun kitty-gfx--org-remove-heading-sizes ()
   "Remove all heading size overlays from the current buffer."
@@ -1794,10 +1798,13 @@ Deletes placements for overlays that scrolled out of view.
 All terminal output is wrapped in synchronized output (BSU/ESU)
 to prevent flicker."
   (when (and kitty-graphics-mode (not (display-graphic-p)))
-    ;; Force redisplay so posn-at-point sees up-to-date pixel positions
-    ;; after display property changes (e.g., org-toggle-inline-images
-    ;; creating multi-line blank overlays).
-    (redisplay t)
+    ;; Force redisplay only when a caller flagged that display properties
+    ;; were just mutated (overlay creation, window/buffer-change handlers)
+    ;; so `posn-at-point' would otherwise see stale pixel positions.
+    ;; Routine `post-command-hook' refreshes skip this — issue #19.
+    (when kitty-gfx--force-redisplay
+      (setq kitty-gfx--force-redisplay nil)
+      (redisplay t))
     ;; Re-query cell size if invalidated (e.g., after terminal resize)
     (unless (and kitty-gfx--cell-pixel-width kitty-gfx--cell-pixel-height)
       (kitty-gfx--query-cell-size))
@@ -1950,13 +1957,27 @@ destroying freshly-placed blocks."
 (defvar kitty-gfx--refresh-pending nil
   "Non-nil if a refresh was requested during the cooldown period.")
 
-(defun kitty-gfx--schedule-refresh ()
+;; `kitty-gfx--force-redisplay' is declared near top of file alongside
+;; `kitty-gfx--render-timer'.  It is set by paths that just mutated
+;; display properties (overlay creation, window/buffer-change handlers)
+;; and consumed/cleared by `kitty-gfx--refresh'.  Routine
+;; `post-command-hook' refreshes leave it nil so we don't pay the
+;; forced-redisplay cost every keystroke — issue #19.
+
+(defun kitty-gfx--schedule-refresh (&optional force-redisplay)
   "Schedule an image refresh using leading-edge debounce.
 On the first call, refresh is scheduled via `run-at-time' 0 (fires
 after the current redisplay completes) and a cooldown timer starts
 \(duration `kitty-gfx-render-delay').  Calls during cooldown are
 suppressed but flagged; when the cooldown expires a single trailing
-refresh fires to capture the final state."
+refresh fires to capture the final state.
+
+When FORCE-REDISPLAY is non-nil, the next refresh will call
+`(redisplay t)' before measuring positions — needed when the caller
+just mutated display properties and `posn-at-point' would otherwise
+return stale coordinates."
+  (when force-redisplay
+    (setq kitty-gfx--force-redisplay t))
   (if kitty-gfx--render-timer
       ;; Cooldown active — flag that another refresh is wanted.
       (setq kitty-gfx--refresh-pending t)
@@ -2027,7 +2048,8 @@ then invalidates position caches and schedules a refresh."
         kitty-gfx--render-timer
         (run-at-time 0.1 nil
                      (lambda ()
-                       (setq kitty-gfx--render-timer nil)
+                       (setq kitty-gfx--render-timer nil
+                             kitty-gfx--force-redisplay t)
                        (kitty-gfx--refresh)))))
 
 (defun kitty-gfx--on-window-change (_frame)
@@ -2070,12 +2092,29 @@ settling to one)."
         kitty-gfx--render-timer
         (run-at-time 0.1 nil
                      (lambda ()
-                       (setq kitty-gfx--render-timer nil)
+                       (setq kitty-gfx--render-timer nil
+                             kitty-gfx--force-redisplay t)
                        (kitty-gfx--refresh)))))
 
+(defun kitty-gfx--any-visible-overlays-p ()
+  "Return non-nil when any visible window's buffer holds kitty-gfx overlays.
+Cheap O(n_windows) check used by `kitty-gfx--on-redisplay' to avoid
+scheduling timers in unrelated buffers — issue #19."
+  (catch 'found
+    (walk-windows
+     (lambda (w)
+       (when (buffer-local-value 'kitty-gfx--overlays (window-buffer w))
+         (throw 'found t)))
+     nil 'visible)
+    nil))
+
 (defun kitty-gfx--on-redisplay ()
-  "Post-command hook to schedule image refresh."
-  (kitty-gfx--schedule-refresh))
+  "Post-command hook to schedule image refresh.
+Early-exits when no visible window has any kitty-gfx overlays so
+unrelated buffers (dired, magit, scratch, …) pay no timer or
+redisplay cost — issue #19."
+  (when (kitty-gfx--any-visible-overlays-p)
+    (kitty-gfx--schedule-refresh)))
 
 ;;;; Image processing
 
@@ -2403,8 +2442,9 @@ BEG/END span the overlay region.  MAX-COLS/MAX-ROWS limit size."
     ;; Create overlay with blank space (even for cached images, dims are fresh)
     (when (or cached-id (gethash abs-file kitty-gfx--image-cache))
       (let ((ov (kitty-gfx--make-overlay start stop image-id cols rows abs-file)))
-        ;; Schedule initial render
-        (kitty-gfx--schedule-refresh)
+        ;; Schedule initial render (force-redisplay: new overlay's display
+        ;; property must be processed before `posn-at-point' measurement).
+        (kitty-gfx--schedule-refresh t)
         ov))))
 
 (defun kitty-gfx--display-image-centered (file max-cols max-rows
@@ -2452,7 +2492,7 @@ The buffer should be writable (caller handles `inhibit-read-only')."
       (when (or cached-id (gethash abs-file kitty-gfx--image-cache))
         (kitty-gfx--make-overlay img-start (point) image-id
                                   img-cols img-rows abs-file reuse-pid)
-        (kitty-gfx--schedule-refresh)))))
+        (kitty-gfx--schedule-refresh t)))))
 
 (defun kitty-gfx-remove-images (&optional beg end)
   "Remove all kitty-gfx overlays in region BEG..END (defaults to whole buffer)."
@@ -2748,7 +2788,8 @@ then let the refresh cycle re-emit the visible ones."
               (overlay-put ov 'kitty-gfx-last-row nil)
               (overlay-put ov 'kitty-gfx-last-col nil))))
       (kitty-gfx--sync-end))
-    (kitty-gfx--schedule-refresh)))
+    ;; Force-redisplay: folds change visibility, posn-at-point must re-measure.
+    (kitty-gfx--schedule-refresh t)))
 
 (defun kitty-gfx--image-file-p (file)
   "Return non-nil if FILE has an image extension.
