@@ -111,6 +111,35 @@ Requires mpv with --vo=kitty support (mpv 0.36.0+)."
   :type 'boolean
   :group 'kitty-graphics)
 
+(defcustom kitty-gfx-video-file-extensions
+  '("mp4" "mkv" "webm" "mov" "m4v" "avi")
+  "File extensions handled by inline mpv preview in dired / dirvish.
+Compared lowercase against `file-name-extension'."
+  :type '(repeat string)
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-video-thumbnail-seek "0.5"
+  "Seconds offset into a video at which thumbnails are extracted.
+Passed verbatim as `-ss' to ffmpeg.  A small positive offset
+avoids the all-black title frame some encoders produce at t=0."
+  :type 'string
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-dired-preview-debounce 0.3
+  "Idle seconds before `kitty-gfx-dired-auto-preview-mode' previews
+the file at point after the cursor moves."
+  :type 'number
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-dirvish-video-inline-preview nil
+  "Where to play a video opened with RET inside a dirvish session.
+When nil (the default), tear down the dirvish layout and play the
+video full-frame, matching dirvish's behaviour for regular files
+and images.  When non-nil, keep the dirvish layout and play the
+video inside the existing preview side window."
+  :type 'boolean
+  :group 'kitty-graphics)
+
 (defvar kitty-gfx--log-file "/tmp/kitty-gfx.log"
   "File path for debug log output.")
 
@@ -477,6 +506,28 @@ calls when multiple characters are typed rapidly.")
 
 (defvar-local kitty-gfx--mpv-last-col nil
   "Last known terminal column of the video overlay.")
+
+(defvar-local kitty-gfx--mpv-paused nil
+  "Local pause state mirror for the current buffer's mpv process.
+Flipped by `kitty-gfx-toggle-video' so the user gets immediate
+echo-area feedback without round-tripping through mpv IPC.")
+
+(defvar-local kitty-gfx--mpv-auto-paused nil
+  "Non-nil when the refresh cycle auto-paused mpv because the buffer
+was no longer shown in any window.  Distinct from
+`kitty-gfx--mpv-paused' so the user-driven pause state is preserved
+across window hide/show.")
+
+(defvar kitty-gfx-video-overlay-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "SPC") #'kitty-gfx-toggle-video)
+    (define-key map (kbd "q")   #'kitty-gfx-stop-video-and-back)
+    (define-key map (kbd "?")   #'kitty-gfx-video-help)
+    map)
+  "Keymap active when point is inside the inline mpv video region.
+Attached as the `keymap' property of the mpv overlay so the
+bindings only shadow normal editing while the cursor is on the
+blank lines covered by the video frame.")
 
 ;;;; Terminal detection
 
@@ -1843,10 +1894,17 @@ to prevent flicker."
                      (kitty-gfx--refresh-overlay ov win win-bottom)
                      (if (overlay-get ov 'kitty-gfx-last-row)
                          (cl-incf placed)
-                       (cl-incf hidden)))))
-               ;; Refresh mpv video overlay position
-               (kitty-gfx--refresh-mpv-overlay)))
+                       (cl-incf hidden)))))))
            nil 'visible)
+        ;; Refresh mpv video overlay position.  This runs after the
+        ;; per-window image loop because the mpv refresh picks its own
+        ;; canonical window via `kitty-gfx--mpv-canonical-window' and
+        ;; should fire at most once per refresh cycle (regardless of
+        ;; how many windows show the buffer).
+        (dolist (buf (buffer-list))
+          (with-current-buffer buf
+            (when kitty-gfx--mpv-overlay
+              (kitty-gfx--refresh-mpv-overlay))))
         ;; Phase 2: emit OSC 66 for all visible heading overlays.
         ;; This runs AFTER all posn-at-point queries (phase 1) to
         ;; prevent Emacs mini-redraws from destroying freshly-placed
@@ -1997,6 +2055,22 @@ then invalidates position caches and schedules a refresh."
                   nil 'visible)
     (kitty-gfx--log "on-buffer-change: visible-bufs=(%s)"
                     (mapconcat #'buffer-name visible-bufs ", "))
+    ;; Drop per-window records on any mpv overlay whose buffer is no
+    ;; longer visible OR whose recorded window now shows a different
+    ;; buffer.  Prevents stale window entries from confusing
+    ;; `kitty-gfx--mpv-canonical-window'.
+    (dolist (buf (buffer-list))
+      (with-current-buffer buf
+        (when (and kitty-gfx--mpv-overlay
+                   (overlay-buffer kitty-gfx--mpv-overlay))
+          (let ((ov kitty-gfx--mpv-overlay))
+            (dolist (entry (copy-sequence
+                            (overlay-get ov 'kitty-gfx-placements)))
+              (let ((w (car entry)))
+                (unless (and (window-live-p w)
+                             (eq (window-buffer w)
+                                 (overlay-buffer ov)))
+                  (kitty-gfx--forget-image-placement ov w))))))))
     ;; Delete placements for buffers that are no longer in any window
     (dolist (buf (buffer-list))
       (with-current-buffer buf
@@ -2049,6 +2123,16 @@ settling to one)."
   (kitty-gfx--log "on-window-change: deleting stale placements and invalidating cell size")
   (setq kitty-gfx--cell-pixel-width nil
         kitty-gfx--cell-pixel-height nil)
+  ;; Clear stale per-window records on any mpv overlay so the next
+  ;; refresh recomputes coordinates against the new layout.  The mpv
+  ;; overlay is NEVER pushed onto `kitty-gfx--overlays' (mpv has no
+  ;; kitty placement ID), so the dolist below would not touch it; it
+  ;; lives only on the buffer-local `kitty-gfx--mpv-overlay'.
+  (dolist (buf (buffer-list))
+    (with-current-buffer buf
+      (when (and kitty-gfx--mpv-overlay
+                 (overlay-buffer kitty-gfx--mpv-overlay))
+        (overlay-put kitty-gfx--mpv-overlay 'kitty-gfx-placements nil))))
   ;; Delete image placements before clearing their cached positions.
   ;; Window splits/resizes can move an image from the middle of the old
   ;; window to the center of the new pane(s).  A buffer can also be shown
@@ -2778,6 +2862,51 @@ but only the first frame is rendered (no animation in terminal)."
     (and ext (member (downcase ext)
                      '("png" "jpg" "jpeg" "bmp" "svg"
                        "webp" "tiff" "tif" "gif")))))
+
+(defun kitty-gfx--video-file-p (file)
+  "Return non-nil if FILE is a video that the mpv preview can handle.
+Requires `kitty-gfx-enable-video' to be enabled, mpv on PATH, and
+the Kitty backend active -- the same gates as
+`kitty-gfx--mpv-available-p'."
+  (and (kitty-gfx--mpv-available-p)
+       (let ((ext (file-name-extension file)))
+         (and ext (member (downcase ext)
+                          kitty-gfx-video-file-extensions)))))
+
+(defvar kitty-gfx--video-thumbnail-cache-dir
+  (expand-file-name "kitty-gfx-thumbs/" temporary-file-directory)
+  "Directory holding cached video thumbnail PNGs.")
+
+(defun kitty-gfx--video-thumbnail (file)
+  "Return a PNG thumbnail path for video FILE.
+Extracts the frame at `kitty-gfx-video-thumbnail-seek' via ffmpeg
+and caches it under `kitty-gfx--video-thumbnail-cache-dir', keyed
+by file path + mtime so an edited video gets a fresh thumbnail.
+Returns nil if ffmpeg is missing or extraction fails."
+  (let ((ffmpeg (executable-find "ffmpeg")))
+    (when ffmpeg
+      (unless (file-directory-p kitty-gfx--video-thumbnail-cache-dir)
+        (make-directory kitty-gfx--video-thumbnail-cache-dir t))
+      (let* ((file (expand-file-name file))
+             (attrs (file-attributes file))
+             (mtime (format-time-string "%s" (nth 5 attrs)))
+             (key (sha1 (format "%s\0%s" file mtime)))
+             (out (expand-file-name (concat key ".png")
+                                    kitty-gfx--video-thumbnail-cache-dir)))
+        (if (file-exists-p out)
+            out
+          (with-temp-buffer
+            (let ((exit (call-process
+                         ffmpeg nil t nil
+                         "-y" "-loglevel" "error"
+                         "-ss" kitty-gfx-video-thumbnail-seek
+                         "-i" file
+                         "-frames:v" "1"
+                         "-vf" "scale=640:-1"
+                         out)))
+              (kitty-gfx--log "video-thumbnail: exit=%s file=%s out=%s"
+                              exit file out)
+              (when (and (eq exit 0) (file-exists-p out)) out))))))))
 
 (defun kitty-gfx--org-display-inline-images-tty (&optional _include-linked beg end)
   "Display inline images in org buffer via Kitty graphics.
@@ -3525,41 +3654,256 @@ Resets `kitty-gfx--doc-view-scale' to 1.0 and re-renders the page."
 
 ;;;; Dired integration
 
+(defun kitty-gfx--preview-quit ()
+  "Close the kitty-graphics preview window.
+Stops any inline mpv playback first so the mpv process does not
+outlive its preview buffer.  When the preview occupies the only
+window in the frame (full-frame dirvish RET path), keep the
+window alive and let `kill-buffer' surface the previous buffer."
+  (interactive)
+  (let ((win (get-buffer-window (current-buffer))))
+    (when (and (boundp 'kitty-gfx--mpv-process) kitty-gfx--mpv-process)
+      (kitty-gfx--mpv-cleanup))
+    (kitty-gfx-remove-images)
+    (kill-buffer (current-buffer))
+    (when (and (window-live-p win) (not (one-window-p t)))
+      (delete-window win))))
+
+(defun kitty-gfx--make-preview-buffer (file)
+  "Create the preview side-window buffer for FILE.
+Returns (BUF . WIN).  Sets up the standard `q'-to-close keymap
+shared by image and video previews."
+  (let* ((buf-name (format "*kitty-preview: %s*" (file-name-nondirectory file)))
+         (buf (get-buffer-create buf-name))
+         (win (display-buffer-in-side-window
+               buf '((side . right) (window-width . 0.5)))))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (format "  %s\n\n" (file-name-nondirectory file))))
+      (setq-local buffer-read-only t)
+      (let ((map (make-sparse-keymap)))
+        (define-key map (kbd "q") #'kitty-gfx--preview-quit)
+        (use-local-map map)))
+    (cons buf win)))
+
+(defun kitty-gfx--preview-display (image-path win buf)
+  "Place IMAGE-PATH into preview BUF shown in WIN, sized to WIN."
+  (with-current-buffer buf
+    (let ((inhibit-read-only t))
+      (kitty-gfx-remove-images)
+      (kitty-gfx-display-image
+       image-path (point-min) (point-max)
+       (min (- (window-width win) 2) kitty-gfx-max-width)
+       (min (- (window-height win) 3) kitty-gfx-max-height)))
+    (goto-char (point-min))))
+
 ;;;###autoload
 (defun kitty-gfx-dired-preview ()
-  "Preview the image file at point in dired.
-Opens a side window with the image displayed via Kitty graphics.
-Press `q' in the preview buffer to close it."
+  "Preview the file at point in dired.
+Images render via the Kitty graphics protocol; video files render
+as a single-frame thumbnail extracted by ffmpeg (cached under
+`kitty-gfx--video-thumbnail-cache-dir').  Press `q' in the preview
+buffer to close it."
   (interactive)
   (unless (derived-mode-p 'dired-mode)
     (user-error "Not in a dired buffer"))
   (let ((file (dired-get-file-for-visit)))
     (kitty-gfx--log "dired-preview: %s" file)
-    (unless (kitty-gfx--image-file-p file)
-      (user-error "Not an image file"))
-    (let* ((buf-name (format "*kitty-preview: %s*" (file-name-nondirectory file)))
-           (buf (get-buffer-create buf-name))
-           (win (display-buffer-in-side-window
-                 buf '((side . right) (window-width . 0.5)))))
+    (cond
+     ((kitty-gfx--image-file-p file)
+      (let* ((bw (kitty-gfx--make-preview-buffer file)))
+        (kitty-gfx--preview-display file (cdr bw) (car bw))))
+     ((kitty-gfx--video-file-p file)
+      (let ((thumb (kitty-gfx--video-thumbnail file)))
+        (if thumb
+            (let* ((bw (kitty-gfx--make-preview-buffer file)))
+              (kitty-gfx--preview-display thumb (cdr bw) (car bw)))
+          (user-error
+           "Could not extract video thumbnail (ffmpeg missing or failed)"))))
+     (t
+      (user-error "Not an image or video file")))))
+
+(defvar-local kitty-gfx--dired-auto-preview-timer nil
+  "Debounce timer for `kitty-gfx-dired-auto-preview-mode'.")
+
+(defun kitty-gfx--dired-auto-preview-now (buf)
+  "Run `kitty-gfx-dired-preview' in BUF if cursor is on a known file.
+When dirvish is managing BUF, dirvish's own preview pane handles
+the rendering -- skip so the cursor move does not spawn a second,
+redundant side window."
+  (when (buffer-live-p buf)
+    (with-current-buffer buf
+      (when (and (derived-mode-p 'dired-mode)
+                 (eq buf (window-buffer (selected-window)))
+                 ;; Skip when dirvish has its own preview running.
+                 (not (and (fboundp 'dirvish-curr) (dirvish-curr))))
+        (let ((file (ignore-errors (dired-get-file-for-visit))))
+          (when (and file
+                     (file-regular-p file)
+                     (or (kitty-gfx--image-file-p file)
+                         (kitty-gfx--video-file-p file)))
+            (condition-case err
+                (kitty-gfx-dired-preview)
+              (user-error
+               (kitty-gfx--log "dired-auto-preview: skip (%s)"
+                               (error-message-string err))))))))))
+
+(defun kitty-gfx--dired-auto-preview-hook ()
+  "Schedule a debounced auto-preview after a dired cursor move."
+  (when kitty-gfx--dired-auto-preview-timer
+    (cancel-timer kitty-gfx--dired-auto-preview-timer))
+  (setq kitty-gfx--dired-auto-preview-timer
+        (run-with-idle-timer
+         kitty-gfx-dired-preview-debounce nil
+         #'kitty-gfx--dired-auto-preview-now (current-buffer))))
+
+;;;###autoload
+(define-minor-mode kitty-gfx-dired-auto-preview-mode
+  "Auto-preview the file at point in dired in a side window.
+Idles `kitty-gfx-dired-preview-debounce' seconds, then calls
+`kitty-gfx-dired-preview'.  Videos render as a single-frame
+thumbnail; images render directly.  Closing the preview window
+(`q' in the preview buffer) re-opens on the next cursor move
+unless the mode is turned off."
+  :lighter " kPrev"
+  (if kitty-gfx-dired-auto-preview-mode
+      (add-hook 'post-command-hook
+                #'kitty-gfx--dired-auto-preview-hook nil t)
+    (remove-hook 'post-command-hook
+                 #'kitty-gfx--dired-auto-preview-hook t)
+    (when kitty-gfx--dired-auto-preview-timer
+      (cancel-timer kitty-gfx--dired-auto-preview-timer)
+      (setq kitty-gfx--dired-auto-preview-timer nil))))
+
+;;;###autoload
+(defun kitty-gfx-dired-play-video ()
+  "Play the video at point in dired inline via mpv.
+Distinct from `kitty-gfx-dired-preview', which shows only a
+single-frame thumbnail.  Useful when bound separately on a
+heavier shortcut for full playback."
+  (interactive)
+  (unless (derived-mode-p 'dired-mode)
+    (user-error "Not in a dired buffer"))
+  (let ((file (dired-get-file-for-visit)))
+    (unless (kitty-gfx--video-file-p file)
+      (user-error "Not a video file"))
+    ;; Single-video invariant: kill any other live playback first.
+    (let ((existing (kitty-gfx--mpv-buffer)))
+      (when existing (with-current-buffer existing (kitty-gfx--mpv-cleanup))))
+    (let* ((bw (kitty-gfx--make-preview-buffer file))
+           (buf (car bw))
+           (win (cdr bw)))
+      (with-selected-window win
+        (with-current-buffer buf
+          (let ((inhibit-read-only t))
+            (goto-char (point-max))
+            (kitty-gfx-play-video file)))))))
+
+(defun kitty-gfx--dired-find-file-advice (orig-fn &rest args)
+  "Around advice on `dired-find-file' that routes videos to mpv.
+Avoids Emacs's \"file too big\" prompt for multi-MB videos by
+delegating to `kitty-gfx-dired-play-video' when the file at point
+matches `kitty-gfx--video-file-p'.  Non-video files pass through.
+
+Inside an active dirvish session, pass through to ORIG-FN so
+`kitty-gfx--dirvish-find-entry-hook' can play the video in the
+existing preview window.  Going through
+`display-buffer-in-side-window' there would cause dirvish to
+rebuild its layout (transient `delete-other-windows'), which the
+user sees as the preview buffer briefly going full-frame before
+mpv starts."
+  (let ((file (ignore-errors (dired-get-file-for-visit))))
+    (cond
+     ((not (and file (kitty-gfx--video-file-p file)))
+      (apply orig-fn args))
+     ((and (featurep 'dirvish)
+           (fboundp 'dirvish-curr)
+           (dirvish-curr))
+      (apply orig-fn args))
+     (t (kitty-gfx-dired-play-video)))))
+
+(defun kitty-gfx--dired-find-file-other-window-advice (orig-fn &rest args)
+  "Around advice on `dired-find-file-other-window' that routes videos to mpv."
+  (let ((file (ignore-errors (dired-get-file-for-visit))))
+    (cond
+     ((not (and file (kitty-gfx--video-file-p file)))
+      (apply orig-fn args))
+     ((and (featurep 'dirvish)
+           (fboundp 'dirvish-curr)
+           (dirvish-curr))
+      (apply orig-fn args))
+     (t (kitty-gfx-dired-play-video)))))
+
+(declare-function dirvish-curr "dirvish" ())
+(declare-function dv-preview-window "dirvish" (dv))
+(declare-function dirvish--clear-session "dirvish" (dv &optional from-quit))
+
+(defun kitty-gfx--dirvish-find-entry-hook (entry find-fn)
+  "Hook on `dirvish-find-entry-hook' that intercepts video files.
+Default behaviour: tear down the dirvish layout and play ENTRY in
+a full-frame preview buffer, mirroring how dirvish opens regular
+files and images.  Set `kitty-gfx-dirvish-video-inline-preview'
+to non-nil to instead keep the layout and play ENTRY inside the
+existing dirvish preview side window."
+  (when (and (memq find-fn '(find-file find-alternate-file))
+             (stringp entry)
+             (kitty-gfx--video-file-p entry))
+    (let* ((dv (ignore-errors (dirvish-curr)))
+           (pwin (and dv (ignore-errors (dv-preview-window dv))))
+           (basename (file-name-nondirectory entry))
+           ;; Reuse the same buffer name the side-window preview path
+           ;; uses, so SPC/q/? bindings + cleanup hooks behave the same.
+           (buf (get-buffer-create (format "*kitty-preview: %s*" basename))))
+      ;; Stop any prior playback first.
+      (let ((existing (kitty-gfx--mpv-buffer)))
+        (when existing
+          (with-current-buffer existing (kitty-gfx--mpv-cleanup))))
+      ;; Drop dirvish's per-file thumbnail buffer for ENTRY.  Its
+      ;; placement is the dispatcher's stale image and would race
+      ;; the mpv overlay for the same cells otherwise.
+      (let ((thumb-buf (get-buffer
+                        (format " *kitty-dirvish: %s*" basename))))
+        (when thumb-buf
+          (with-current-buffer thumb-buf (kitty-gfx-remove-images))
+          (kill-buffer thumb-buf)))
       (with-current-buffer buf
         (let ((inhibit-read-only t))
+          (kitty-gfx-remove-images)
           (erase-buffer)
-          (insert (format "  %s\n\n" (file-name-nondirectory file))))
+          (insert (format "  %s\n\n" basename)))
         (setq-local buffer-read-only t)
         (let ((map (make-sparse-keymap)))
-          (define-key map (kbd "q")
-                      (lambda () (interactive)
-                        (let ((win (get-buffer-window (current-buffer))))
-                          (kitty-gfx-remove-images)
-                          (kill-buffer (current-buffer))
-                          (when (window-live-p win)
-                            (delete-window win)))))
-          (use-local-map map))
-        (kitty-gfx-display-image
-         file (point-min) (point-max)
-         (min (- (window-width win) 2) kitty-gfx-max-width)
-         (min (- (window-height win) 3) kitty-gfx-max-height))
-        (goto-char (point-min))))))
+          (define-key map (kbd "q") #'kitty-gfx--preview-quit)
+          (use-local-map map)))
+      (cond
+       ;; Opt-in: play inside the existing dirvish preview side window.
+       ((and kitty-gfx-dirvish-video-inline-preview
+             pwin (window-live-p pwin))
+        (set-window-buffer pwin buf)
+        (with-selected-window pwin
+          (with-current-buffer buf
+            (let ((inhibit-read-only t))
+              (goto-char (point-max))
+              (kitty-gfx-play-video entry)))))
+       ;; Default: tear down dirvish, play full-frame in selected window.
+       (dv
+        (when (fboundp 'dirvish--clear-session)
+          (dirvish--clear-session dv))
+        (let* ((w (selected-window))
+               (ded (and (window-live-p w) (window-dedicated-p w))))
+          (when (window-live-p w) (set-window-dedicated-p w nil))
+          (switch-to-buffer buf)
+          (when (and ded (window-live-p w))
+            (set-window-dedicated-p w ded)))
+        (with-current-buffer buf
+          (let ((inhibit-read-only t))
+            (goto-char (point-max))
+            (kitty-gfx-play-video entry))))
+       ;; No dirvish session at all (layout-less edge case): fall
+       ;; back to the side-window dired flow.
+       (t (kitty-gfx-dired-play-video))))
+    t))
 
 ;;;; Dirvish integration
 
@@ -3571,9 +3915,9 @@ Press `q' in the preview buffer to close it."
 (defvar dirvish--available-preview-dispatchers)
 
 (defun kitty-gfx--dirvish-preview (file _ext preview-window _dv)
-  "Dirvish preview dispatcher for images in terminal via Kitty graphics.
+  "Dirvish preview dispatcher for image / video files via Kitty + mpv.
 FILE is the file to preview, PREVIEW-WINDOW is the target window.
-Returns a buffer recipe, or nil if not in terminal or not an image."
+Returns a buffer recipe, or nil if neither image nor video."
   (when (and kitty-graphics-mode
              (not (display-graphic-p))
              kitty-gfx--active-backend)
@@ -3581,18 +3925,33 @@ Returns a buffer recipe, or nil if not in terminal or not an image."
     (let* ((buf-name (format " *kitty-dirvish: %s*" (file-name-nondirectory file)))
            (buf (get-buffer-create buf-name))
            (max-cols (min (- (window-width preview-window) 2) kitty-gfx-max-width))
-           (max-rows (min (- (window-height preview-window) 3) kitty-gfx-max-height)))
-      (with-current-buffer buf
-        ;; Clean up any previous images in this buffer
-        (let ((inhibit-read-only t))
-          (kitty-gfx-remove-images)
-          (erase-buffer)
-          (insert (format "\n  %s\n\n" (file-name-nondirectory file))))
-        (setq-local buffer-read-only t)
-        (kitty-gfx-display-image file (point-min) (point-max) max-cols max-rows)
-        (goto-char (point-min)))
-      ;; Return buffer recipe for dirvish dispatch
-      `(buffer . ,buf))))
+           (max-rows (min (- (window-height preview-window) 3) kitty-gfx-max-height))
+           (is-image (kitty-gfx--image-file-p file))
+           (is-video (and (not is-image) (kitty-gfx--video-file-p file))))
+      (cond
+       (is-image
+        (with-current-buffer buf
+          (let ((inhibit-read-only t))
+            (kitty-gfx-remove-images)
+            (erase-buffer)
+            (insert (format "\n  %s\n\n" (file-name-nondirectory file))))
+          (setq-local buffer-read-only t)
+          (kitty-gfx-display-image file (point-min) (point-max) max-cols max-rows)
+          (goto-char (point-min)))
+        `(buffer . ,buf))
+       (is-video
+        (let ((thumb (kitty-gfx--video-thumbnail file)))
+          (when thumb
+            (with-current-buffer buf
+              (let ((inhibit-read-only t))
+                (kitty-gfx-remove-images)
+                (erase-buffer)
+                (insert (format "\n  %s\n\n" (file-name-nondirectory file))))
+              (setq-local buffer-read-only t)
+              (kitty-gfx-display-image
+               thumb (point-min) (point-max) max-cols max-rows)
+              (goto-char (point-min)))
+            `(buffer . ,buf))))))))
 
 (defun kitty-gfx--install-dirvish ()
   "Install kitty-graphics as a dirvish preview dispatcher.
@@ -3608,11 +3967,15 @@ Registers `kitty-image' dispatcher and prepends it to the dispatcher list."
                    (list :doc "Preview images using Kitty graphics protocol"
                          :require nil))
             dirvish--available-preview-dispatchers))
-    ;; Create the dispatcher function that dirvish expects
+    ;; Create the dispatcher function that dirvish expects.  Trigger
+    ;; for image *and* video extensions; the dispatcher itself
+    ;; branches on file type.
     (defalias 'dirvish-kitty-image-dp
       (lambda (file ext preview-window dv)
-        (when (and (boundp 'dirvish-image-exts)
-                   (member ext dirvish-image-exts))
+        (when (or (and (boundp 'dirvish-image-exts)
+                       (member ext dirvish-image-exts))
+                  (member (and ext (downcase ext))
+                          kitty-gfx-video-file-extensions))
           (kitty-gfx--dirvish-preview file ext preview-window dv))))
     ;; Prepend kitty-image to dispatchers if not already there
     (unless (memq 'kitty-image dirvish-preview-dispatchers)
@@ -3746,47 +4109,111 @@ Uses the selected window dimensions and cell pixel size."
          (height-px (* video-rows ch)))
     (list 1 1 width-px height-px video-cols video-rows)))
 
-(defun kitty-gfx--mpv-overlay-position ()
-  "Return (ROW . COL) terminal position of the mpv overlay, or nil if hidden.
-ROW and COL are 1-based terminal cell coordinates."
+(defun kitty-gfx--mpv-overlay-position (win)
+  "Return (ROW . COL) terminal position of the mpv overlay in WIN, or nil.
+ROW and COL are 1-based terminal cell coordinates.  Returns nil when
+the overlay is not visible in WIN or when a minibuffer is currently
+active -- during minibuffer activation the source window is in a
+transient state and `posn-at-point' tends to return origin
+coordinates that would yank the video to (1,1)."
   (when (and kitty-gfx--mpv-overlay
-             (overlay-buffer kitty-gfx--mpv-overlay))
+             (overlay-buffer kitty-gfx--mpv-overlay)
+             win
+             (not (active-minibuffer-window)))
     (let* ((ov kitty-gfx--mpv-overlay)
-           (start (overlay-start ov))
-           (win (get-buffer-window (overlay-buffer ov))))
-      (when (and win
+           (start (overlay-start ov)))
+      (when (and (eq (window-buffer win) (overlay-buffer ov))
                  (pos-visible-in-window-p start win))
         ;; In terminal Emacs, `window-edges' already returns character
         ;; cell coordinates; the pixelwise flag is a no-op on TTY frames.
         (let* ((win-edges (window-edges win nil nil nil))
                (win-top (nth 1 win-edges))
                (win-left (nth 0 win-edges))
-               (coords (posn-col-row (posn-at-point start win)))
-               (col (+ win-left (car coords) 1))
-               (row (+ win-top (cdr coords) 1)))
-          (cons row col))))))
+               (posn (posn-at-point start win)))
+          (when posn
+            (let* ((coords (posn-col-row posn))
+                   (col (+ win-left (car coords) 1))
+                   (row (+ win-top (cdr coords) 1)))
+              (cons row col))))))))
+
+(defun kitty-gfx--mpv-canonical-window ()
+  "Return the window that should drive mpv IPC repositioning, or nil.
+Prefers `selected-window' when it shows the mpv overlay's buffer,
+otherwise the first visible window displaying that buffer."
+  (when (and kitty-gfx--mpv-overlay
+             (overlay-buffer kitty-gfx--mpv-overlay))
+    (let* ((buf (overlay-buffer kitty-gfx--mpv-overlay))
+           (sel (selected-window)))
+      (if (and (window-live-p sel) (eq (window-buffer sel) buf))
+          sel
+        (car (get-buffer-window-list buf nil 'visible))))))
 
 (defun kitty-gfx--refresh-mpv-overlay ()
-  "Update mpv position if the overlay has moved.  Called from the refresh cycle."
+  "Update mpv position if the overlay has moved.
+Uses the per-window placement record on the mpv overlay (same
+`kitty-gfx-placements' alist used by image overlays) as the source
+of truth, with the canonical window from
+`kitty-gfx--mpv-canonical-window'.  No IPC is sent while a
+minibuffer is active so M-x / vertico / helm prompts do not yank
+the video to the top of the screen."
   (when (and kitty-gfx--mpv-process
              (process-live-p kitty-gfx--mpv-process)
              kitty-gfx--mpv-overlay)
-    (let ((pos (kitty-gfx--mpv-overlay-position)))
-      (if pos
-          (let ((row (car pos))
-                (col (cdr pos)))
-            (unless (and (eql row kitty-gfx--mpv-last-row)
-                         (eql col kitty-gfx--mpv-last-col))
-              (kitty-gfx--log "mpv: reposition to row=%d col=%d" row col)
-              (kitty-gfx--mpv-ipc-send (list "set_property" "vo-kitty-top" row))
-              (kitty-gfx--mpv-ipc-send (list "set_property" "vo-kitty-left" col))
-              (setq kitty-gfx--mpv-last-row row
-                    kitty-gfx--mpv-last-col col)))
-        ;; Overlay not visible — keep audio, hide video
-        (when kitty-gfx--mpv-last-row
-          (kitty-gfx--log "mpv: overlay hidden, keeping audio")
-          (setq kitty-gfx--mpv-last-row nil
-                kitty-gfx--mpv-last-col nil))))))
+    (cond
+     ;; Bug fix: hold position while a minibuffer prompt is up.
+     ((active-minibuffer-window)
+      (kitty-gfx--log "mpv: minibuffer active, holding position"))
+     (t
+      (let ((win (kitty-gfx--mpv-canonical-window)))
+        (if (not win)
+            ;; Overlay not visible in any window — auto-pause mpv to
+            ;; stop audio + frame work, but keep the placement record
+            ;; so we can re-emit cleanly when the buffer returns.
+            (progn
+              (when kitty-gfx--mpv-last-row
+                (kitty-gfx--log "mpv: overlay hidden")
+                (setq kitty-gfx--mpv-last-row nil
+                      kitty-gfx--mpv-last-col nil))
+              (unless (or kitty-gfx--mpv-paused kitty-gfx--mpv-auto-paused)
+                (kitty-gfx--log "mpv: auto-paused (buffer hidden)")
+                (setq kitty-gfx--mpv-auto-paused t)
+                (kitty-gfx--mpv-ipc-send
+                 (list "set_property" "pause" t))))
+          ;; Visible again — if we auto-paused earlier, resume now.
+          ;; A user-driven pause (`kitty-gfx--mpv-paused') is preserved.
+          (when (and kitty-gfx--mpv-auto-paused
+                     (not kitty-gfx--mpv-paused))
+            (kitty-gfx--log "mpv: auto-resumed")
+            (setq kitty-gfx--mpv-auto-paused nil)
+            (kitty-gfx--mpv-ipc-send
+             (list "set_property" "pause" :false)))
+          (let ((pos (kitty-gfx--mpv-overlay-position win))
+                (ov kitty-gfx--mpv-overlay))
+            (when pos
+              (let* ((row (car pos))
+                     (col (cdr pos))
+                     (record (kitty-gfx--image-placement ov win))
+                     (rec-data (cdr record))
+                     (rec-row (and rec-data (plist-get rec-data :row)))
+                     (rec-col (and rec-data (plist-get rec-data :col))))
+                (cond
+                 ;; Already recorded at the same coordinates -- nothing to do.
+                 ((and rec-row (eql row rec-row) (eql col rec-col)))
+                 ;; Belt-and-suspenders guard for any other transient-window
+                 ;; mishap: drop the update if a non-origin record exists
+                 ;; and the freshly computed pos is (1, 1).
+                 ((and rec-row (not (and (eql rec-row 1) (eql rec-col 1)))
+                       (eql row 1) (eql col 1))
+                  (kitty-gfx--log "mpv: ignoring suspicious origin reposition"))
+                 (t
+                  (kitty-gfx--log "mpv: reposition to row=%d col=%d" row col)
+                  (kitty-gfx--mpv-ipc-send
+                   (list "set_property" "vo-kitty-top" row))
+                  (kitty-gfx--mpv-ipc-send
+                   (list "set_property" "vo-kitty-left" col))
+                  (kitty-gfx--record-image-placement ov win row col 0 0 0)
+                  (setq kitty-gfx--mpv-last-row row
+                        kitty-gfx--mpv-last-col col))))))))))))
 
 (defun kitty-gfx--mpv-process-sentinel (proc event)
   "Handle mpv process state changes.
@@ -3811,10 +4238,15 @@ PROC is the mpv process, EVENT describes the state change."
     (ignore-errors (delete-file kitty-gfx--mpv-ipc-socket))
     (setq kitty-gfx--mpv-ipc-socket nil))
   (when kitty-gfx--mpv-overlay
+    ;; Drop the per-window placement records before deleting the
+    ;; overlay, mirroring image-overlay cleanup.
+    (overlay-put kitty-gfx--mpv-overlay 'kitty-gfx-placements nil)
     (ignore-errors (delete-overlay kitty-gfx--mpv-overlay))
     (setq kitty-gfx--mpv-overlay nil))
   (setq kitty-gfx--mpv-last-row nil
-        kitty-gfx--mpv-last-col nil)
+        kitty-gfx--mpv-last-col nil
+        kitty-gfx--mpv-paused nil
+        kitty-gfx--mpv-auto-paused nil)
   ;; mpv's kitty VO may hide the cursor; restore it.  Also force a full
   ;; redisplay so Emacs repaints the region mpv was occupying.
   (ignore-errors (send-string-to-terminal "\e[?25h"))
@@ -3856,11 +4288,21 @@ Requires `kitty-gfx-enable-video' to be non-nil and mpv installed."
         (overlay-put kitty-gfx--mpv-overlay 'kitty-gfx-cols video-cols)
         (overlay-put kitty-gfx--mpv-overlay 'kitty-gfx-rows video-rows)
         (overlay-put kitty-gfx--mpv-overlay 'evaporate t)
+        ;; Local bindings on the video region: SPC toggles, q stops + back.
+        (overlay-put kitty-gfx--mpv-overlay 'keymap
+                     kitty-gfx-video-overlay-map)
         (goto-char start)))
-    ;; Compute initial terminal position
-    (let ((pos (kitty-gfx--mpv-overlay-position)))
+    ;; Compute initial terminal position and seed the per-window
+    ;; placement record so the first refresh after IPC connect does
+    ;; not re-emit identical coordinates.
+    (let* ((win (selected-window))
+           (pos (kitty-gfx--mpv-overlay-position win)))
       (when pos
-        (setq row (car pos) col (cdr pos))))
+        (setq row (car pos) col (cdr pos))
+        (kitty-gfx--record-image-placement
+         kitty-gfx--mpv-overlay win row col 0 0 0)
+        (setq kitty-gfx--mpv-last-row row
+              kitty-gfx--mpv-last-col col)))
     ;; Store socket path
     (setq kitty-gfx--mpv-ipc-socket socket-path)
     ;; Spawn mpv on a pty so its kitty VO escape stream can be captured.
@@ -3878,7 +4320,12 @@ Requires `kitty-gfx-enable-video' to be non-nil and mpv installed."
                         ;; Ignore user's mpv.conf and scripts: keeps
                         ;; embed playback predictable and avoids loading
                         ;; heavy scripts (thumbfast etc.) that spike CPU.
+                        ;; `--no-config' alone leaves `~/.config/mpv/scripts'
+                        ;; in play, so the IPC log still shows thumbfast
+                        ;; client-message events.  `--load-scripts=no'
+                        ;; closes that hole.
                         "--no-config"
+                        "--load-scripts=no"
                         ;; Hardware-decode to keep CPU down.
                         "--hwdec=auto-safe"
                         "--vo=kitty"
@@ -3917,21 +4364,73 @@ makes the terminal paint the frames inline."
       (error
        (kitty-gfx--log "mpv-filter error: %s" (error-message-string err))))))
 
+(defun kitty-gfx--mpv-buffer ()
+  "Return the buffer currently hosting an mpv playback, or nil.
+Prefers the current buffer when it owns an mpv process; otherwise
+walks `buffer-list' for the first buffer with a live mpv process."
+  (if (and kitty-gfx--mpv-process (process-live-p kitty-gfx--mpv-process))
+      (current-buffer)
+    (cl-loop for b in (buffer-list)
+             when (buffer-local-value 'kitty-gfx--mpv-process b)
+             when (process-live-p (buffer-local-value 'kitty-gfx--mpv-process b))
+             return b)))
+
 (defun kitty-gfx-stop-video ()
-  "Stop the current buffer's inline video playback."
+  "Stop inline video playback.
+Acts on the current buffer's video when present, otherwise on
+whichever buffer currently owns a live mpv process so the command
+works from M-x regardless of which buffer the user is in."
   (interactive)
-  (if kitty-gfx--mpv-process
-      (progn
-        (kitty-gfx--mpv-cleanup)
-        (message "kitty-gfx: video stopped"))
-    (message "kitty-gfx: no video playing")))
+  (let ((buf (kitty-gfx--mpv-buffer)))
+    (if buf
+        (with-current-buffer buf
+          (kitty-gfx--mpv-cleanup)
+          (message "kitty-gfx: video stopped (buffer %s)" (buffer-name buf)))
+      (message "kitty-gfx: no video playing"))))
+
+(defun kitty-gfx-stop-video-and-back ()
+  "Stop inline video playback and switch to the previously shown buffer."
+  (interactive)
+  (kitty-gfx-stop-video)
+  (previous-buffer))
+
+(defun kitty-gfx-video-help ()
+  "Echo the inline-video keymap to the minibuffer."
+  (interactive)
+  (message "SPC pause/resume  q stop+back  ? help"))
+
+(defun kitty-gfx--mpv-set-paused-mark (paused)
+  "Set the visible pause indicator on the mpv overlay.
+PAUSED non-nil shows \" \\u23F8\" as a `before-string'; nil clears."
+  (when kitty-gfx--mpv-overlay
+    (overlay-put kitty-gfx--mpv-overlay
+                 'before-string
+                 (when paused
+                   (propertize " \u23F8 " 'face 'mode-line-emphasis)))))
 
 (defun kitty-gfx-toggle-video ()
-  "Toggle pause/resume of the current buffer's inline video."
+  "Toggle pause/resume of inline video playback.
+Acts on the current buffer's video when present, otherwise on
+whichever buffer currently owns a live mpv process."
   (interactive)
-  (if (and kitty-gfx--mpv-process (process-live-p kitty-gfx--mpv-process))
-      (kitty-gfx--mpv-ipc-send '("cycle" "pause"))
-    (message "kitty-gfx: no video playing")))
+  (let ((buf (kitty-gfx--mpv-buffer)))
+    (if buf
+        (with-current-buffer buf
+          (setq kitty-gfx--mpv-paused (not kitty-gfx--mpv-paused)
+                ;; User-driven pause overrides any auto-pause: clear
+                ;; the auto flag so we don't re-resume against the
+                ;; user's wishes when the buffer is shown again.
+                kitty-gfx--mpv-auto-paused nil)
+          (kitty-gfx--mpv-ipc-send
+           (list "set_property" "pause"
+                 (if kitty-gfx--mpv-paused t :false)))
+          (kitty-gfx--mpv-set-paused-mark kitty-gfx--mpv-paused)
+          (kitty-gfx--log "mpv: %s (buffer %s)"
+                          (if kitty-gfx--mpv-paused "paused" "resumed")
+                          (buffer-name))
+          (message "kitty-gfx: video %s"
+                   (if kitty-gfx--mpv-paused "paused" "resumed")))
+      (message "kitty-gfx: no video playing"))))
 
 ;;;; Integration install/uninstall
 
@@ -4005,6 +4504,14 @@ makes the terminal paint the frames inline."
                 #'kitty-gfx--markdown-overlays-fontify-image-advice)
     (advice-add 'markdown-overlays--fontify-image-file-path :around
                 #'kitty-gfx--markdown-overlays-fontify-image-file-path-advice))
+  (with-eval-after-load 'dired
+    (advice-add 'dired-find-file :around
+                #'kitty-gfx--dired-find-file-advice)
+    (advice-add 'dired-find-file-other-window :around
+                #'kitty-gfx--dired-find-file-other-window-advice))
+  (with-eval-after-load 'dirvish
+    (add-hook 'dirvish-find-entry-hook
+              #'kitty-gfx--dirvish-find-entry-hook))
   (kitty-gfx--install-dirvish))
 
 (defun kitty-gfx--uninstall-integrations ()
@@ -4040,6 +4547,12 @@ makes the terminal paint the frames inline."
   (advice-remove 'shr-put-image #'kitty-gfx--shr-put-image-advice)
   (advice-remove 'markdown-overlays--fontify-image #'kitty-gfx--markdown-overlays-fontify-image-advice)
   (advice-remove 'markdown-overlays--fontify-image-file-path #'kitty-gfx--markdown-overlays-fontify-image-file-path-advice)
+  (advice-remove 'dired-find-file #'kitty-gfx--dired-find-file-advice)
+  (advice-remove 'dired-find-file-other-window
+                 #'kitty-gfx--dired-find-file-other-window-advice)
+  (when (boundp 'dirvish-find-entry-hook)
+    (remove-hook 'dirvish-find-entry-hook
+                 #'kitty-gfx--dirvish-find-entry-hook))
   (kitty-gfx--uninstall-dirvish))
 
 ;;;; Buffer cleanup
