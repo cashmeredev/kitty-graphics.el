@@ -83,6 +83,107 @@ test-latex:
         --eval "(kitty-graphics-mode 1)" \
         tests/test-kitty-gfx.org
 
+# Start (or attach to) a tmux session pre-configured for the kitty
+# graphics + sixel features in this package:
+#   - `allow-passthrough on'   so Kitty APC escapes survive the mux
+#   - `*:sixel' terminal-feature so tmux 3.4+ forwards Sixel
+#   - default-terminal screen-256color (closest to xterm)
+# Then drops into an emacs -nw with kitty-graphics-mode + video enabled.
+# Outer terminal should be Kitty (or any kitty-protocol capable term).
+tmux:
+    #!/usr/bin/env bash
+    set -eu
+    if [ -n "${TMUX:-}" ]; then
+        echo ">> Already inside tmux -- re-applying the kitty-graphics options here."
+        tmux set-option -g allow-passthrough on
+        tmux set-option -as terminal-features "*:sixel"
+        exec env TERM={{TERM_}} {{EMACS}} -nw -Q -l {{SRC}} \
+            --eval "(setq kitty-gfx-debug t kitty-gfx-enable-video t)" \
+            --eval "(kitty-graphics-mode 1)"
+    fi
+    SESSION=kgfx
+    SOCKET=/tmp/kgfx-tmux.sock
+    # Fresh session every time so old options don't linger.
+    tmux -S "$SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
+    tmux -S "$SOCKET" new-session -d -s "$SESSION" -x 220 -y 50 \
+        env TERM={{TERM_}} {{EMACS}} -nw -Q -l "$(pwd)/{{SRC}}" \
+            --eval "(setq kitty-gfx-debug t kitty-gfx-enable-video t)" \
+            --eval "(kitty-graphics-mode 1)"
+    tmux -S "$SOCKET" set-option -t "$SESSION" -g allow-passthrough on
+    tmux -S "$SOCKET" set-option -t "$SESSION" -as terminal-features "*:sixel"
+    tmux -S "$SOCKET" set-option -t "$SESSION" -g default-terminal "screen-256color"
+    exec tmux -S "$SOCKET" attach -t "$SESSION"
+
+# Test dirvish with kitty-graphics: image + video thumbnail previews.
+# Bootstraps a throwaway init dir under /tmp/kgfx-dirvish-init/ so
+# `package-install dirvish' doesn't touch ~/.emacs.d.  Requires network
+# on first run for MELPA refresh.
+#   just test-dirvish                        # default: open ~/
+#   just test-dirvish dir=/path/to/folder    # open given folder
+test-dirvish dir="~":
+    #!/usr/bin/env bash
+    set -eu
+    dir={{dir}}
+    # Tolerate `just test-dirvish dir=PATH' (just treats it as a
+    # positional value that starts with `dir=', so strip the prefix).
+    dir=${dir#dir=}
+    dir=$(eval echo "$dir")
+    [ -d "$dir" ] || { echo "ERROR: not a directory: $dir" >&2; exit 1; }
+    dir=$(realpath "$dir")
+    INIT_DIR=/tmp/kgfx-dirvish-init
+    mkdir -p "$INIT_DIR"
+    echo ">> Kitty terminal required.  Init dir: $INIT_DIR"
+    echo ">> Auto-preview enabled: arrow over images / videos -- side window shows the thumbnail."
+    echo ">> Manual full playback: M-x kitty-gfx-dired-play-video"
+    exec env TERM={{TERM_}} {{EMACS}} -nw -Q \
+        --init-directory "$INIT_DIR" \
+        --eval "(progn \
+                  (require 'package) \
+                  (setq package-archives \
+                        '((\"gnu\"   . \"https://elpa.gnu.org/packages/\") \
+                          (\"melpa\" . \"https://melpa.org/packages/\"))) \
+                  (package-initialize) \
+                  (unless (package-installed-p 'dirvish) \
+                    (package-refresh-contents) \
+                    (package-install 'dirvish)))" \
+        -L "$(pwd)" \
+        -l "{{SRC}}" \
+        --eval "(setq kitty-gfx-debug t kitty-gfx-enable-video t)" \
+        --eval "(kitty-graphics-mode 1)" \
+        --eval "(add-hook 'dired-mode-hook #'kitty-gfx-dired-auto-preview-mode)" \
+        --eval "(require 'dirvish)" \
+        --eval "(dirvish-override-dired-mode 1)" \
+        --eval "(dirvish \"$dir\")"
+
+# Test inline mpv video playback (Kitty terminal only, requires mpv).
+# Opens terminal Emacs with video integration enabled, then auto-plays
+# the file given as positional arg (or drops into scratch buffer when
+# omitted, ready for `M-x kitty-gfx-play-video').
+#   just test-mpv                       # manual: M-x kitty-gfx-play-video
+#   just test-mpv ~/Untitled.mp4        # auto-play (tilde expanded)
+test-mpv video="":
+    #!/usr/bin/env bash
+    set -eu
+    echo ">> Requires Kitty terminal + mpv on PATH."
+    echo ">> Stop: M-x kitty-gfx-stop-video     Pause: M-x kitty-gfx-toggle-video"
+    video={{video}}
+    # Tolerate `just test-mpv video=PATH' (just treats it as a positional
+    # value that happens to start with `video=', so strip the prefix).
+    video=${video#video=}
+    # Expand ~ and resolve relative paths so Emacs gets an absolute path.
+    if [ -n "$video" ]; then
+        video=$(eval echo "$video")
+        if [ ! -f "$video" ]; then
+            echo "ERROR: file not found: $video" >&2
+            exit 1
+        fi
+        video=$(realpath "$video")
+    fi
+    exec env TERM={{TERM_}} {{EMACS}} -nw -Q -l {{SRC}} \
+        --eval "(setq kitty-gfx-debug t kitty-gfx-enable-video t)" \
+        --eval "(kitty-graphics-mode 1)" \
+        --eval "(when (> (length \"$video\") 0) (kitty-gfx-play-video \"$video\"))"
+
 # --- Headless typst checks --------------------------------------------------
 
 # Compile a typst fragment headlessly, print the PNG path
