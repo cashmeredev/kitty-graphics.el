@@ -1789,6 +1789,11 @@ block corruption."
                     (puthash (+ row r) t occupied))
                   (kitty-gfx--place-heading ov))))))))))
 
+(defun kitty-gfx--refresh-inhibited-p ()
+  "Return non-nil if refreshing now would disturb user feedback."
+  (or (active-minibuffer-window)
+      (current-message)))
+
 (defun kitty-gfx--refresh ()
   "Re-place all visible images after redisplay using direct placements.
 Relies on placement IDs (p=PID) — re-placing with the same PID
@@ -1797,7 +1802,10 @@ Caches last position per overlay to skip redundant re-placements.
 Deletes placements for overlays that scrolled out of view.
 All terminal output is wrapped in synchronized output (BSU/ESU)
 to prevent flicker."
-  (when (and kitty-graphics-mode (not (display-graphic-p)))
+  (when (and kitty-graphics-mode
+             (not (display-graphic-p))
+             (kitty-gfx--any-visible-overlays-p)
+             (not (kitty-gfx--refresh-inhibited-p)))
     ;; Force redisplay only when a caller flagged that display properties
     ;; were just mutated (overlay creation, window/buffer-change handlers)
     ;; so `posn-at-point' would otherwise see stale pixel positions.
@@ -2119,9 +2127,10 @@ scheduling timers in unrelated buffers — issue #19."
 (defun kitty-gfx--on-redisplay ()
   "Post-command hook to schedule image refresh.
 Early-exits when no visible window has any kitty-gfx overlays so
-unrelated buffers (dired, magit, scratch, …) pay no timer or
-redisplay cost — issue #19."
-  (when (kitty-gfx--any-visible-overlays-p)
+unrelated buffers (dired, magit, scratch, ...) pay no timer or
+redisplay cost, and skips while user feedback is in the echo area."
+  (when (and (kitty-gfx--any-visible-overlays-p)
+             (not (kitty-gfx--refresh-inhibited-p)))
     (kitty-gfx--schedule-refresh)))
 
 ;;;; Image processing
