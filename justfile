@@ -155,6 +155,29 @@ test-dirvish dir="~":
         --eval "(dirvish-override-dired-mode 1)" \
         --eval "(dirvish \"$dir\")"
 
+# TEMP: dirvish + kitty-gfx loaded against the user's REAL ~/.emacs.d
+# config (config.org) instead of the throwaway init dir.  Useful for
+# iterating on the kitty-media dispatcher without restarting the
+# main Emacs.  Forces the local kitty-graphics.el over the elpaca build
+# via -L + (load ...) so edits in this repo take effect immediately.
+#   just test-dirvish-myconfig                  # default: open ~/
+#   just test-dirvish-myconfig dir=/path        # open given folder
+test-dirvish-myconfig dir="~":
+    #!/usr/bin/env bash
+    set -eu
+    dir={{dir}}
+    dir=${dir#dir=}
+    dir=$(eval echo "$dir")
+    [ -d "$dir" ] || { echo "ERROR: not a directory: $dir" >&2; exit 1; }
+    dir=$(realpath "$dir")
+    echo ">> Loading ~/.emacs.d/config.org (your real config)."
+    echo ">> Local $(pwd)/{{SRC}} overrides the elpaca build."
+    exec env TERM={{TERM_}} {{EMACS}} -nw \
+        -L "$(pwd)" \
+        --eval "(load \"$(pwd)/{{SRC}}\")" \
+        --eval "(setq kitty-gfx-debug t)" \
+        --eval "(dirvish \"$dir\")"
+
 # Test inline mpv video playback (Kitty terminal only, requires mpv).
 # Opens terminal Emacs with video integration enabled, then auto-plays
 # the file given as positional arg (or drops into scratch buffer when
