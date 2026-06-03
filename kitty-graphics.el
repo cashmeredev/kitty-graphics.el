@@ -4423,13 +4423,23 @@ Requires `kitty-gfx-enable-video' to be non-nil and mpv installed."
                   (list "mpv"
                         ;; Ignore user's mpv.conf and scripts: keeps
                         ;; embed playback predictable and avoids loading
-                        ;; heavy scripts (thumbfast etc.) that spike CPU.
-                        ;; `--no-config' alone leaves `~/.config/mpv/scripts'
-                        ;; in play, so the IPC log still shows thumbfast
-                        ;; client-message events.  `--load-scripts=no'
-                        ;; closes that hole.
+                        ;; heavy scripts (thumbfast, uosc, mpris, …) that
+                        ;; spike CPU and pollute IPC with `client-message'
+                        ;; events.
+                        ;;
+                        ;; Three flags are needed for distro builds that
+                        ;; wrap mpv with prepended `--script=…' args (Nix
+                        ;; `mpv-with-scripts', some Flatpaks):
+                        ;;   --no-config        skip mpv.conf
+                        ;;   --load-scripts=no  skip auto-discovered scripts
+                        ;;   --scripts-clr      clear the list option, so
+                        ;;                      wrapper-injected `--script='
+                        ;;                      entries are dropped too
+                        ;;                      (explicit `--script=' loads
+                        ;;                      regardless of `--load-scripts').
                         "--no-config"
                         "--load-scripts=no"
+                        "--scripts-clr"
                         ;; Hardware-decode to keep CPU down.
                         "--hwdec=auto-safe"
                         "--vo=kitty"
