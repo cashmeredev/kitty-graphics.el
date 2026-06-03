@@ -4860,6 +4860,10 @@ Requires `kitty-gfx-enable-browser' to be non-nil and casty installed."
                     :noquery t
                     :connection-type 'pty
                     :coding '(binary . binary)
+                    ;; Keep casty's stderr (status/error logs) OFF the pty so
+                    ;; it is never forwarded into the kitty graphics stream and
+                    ;; painted as garbage; route it to a debug buffer instead.
+                    :stderr (get-buffer-create "*kitty-casty-log*")
                     :command
                     (list kitty-gfx-casty-program "--embed"
                           "--ipc" socket
@@ -4935,6 +4939,11 @@ Requires `kitty-gfx-enable-browser' to be non-nil and casty installed."
     (define-key map "k"       #'kitty-gfx-browser-scroll-up)
     (define-key map (kbd "C-f") #'kitty-gfx-browser-page-down)
     (define-key map (kbd "C-b") #'kitty-gfx-browser-page-up)
+    ;; Mouse wheel → scroll the page instead of the Emacs window.
+    (define-key map [wheel-down] #'kitty-gfx-browser-scroll-down)
+    (define-key map [wheel-up]   #'kitty-gfx-browser-scroll-up)
+    (define-key map [mouse-5]    #'kitty-gfx-browser-scroll-down)
+    (define-key map [mouse-4]    #'kitty-gfx-browser-scroll-up)
     (define-key map "H"       #'kitty-gfx-browser-back)
     (define-key map "L"       #'kitty-gfx-browser-forward)
     (define-key map "r"       #'kitty-gfx-browser-reload)
