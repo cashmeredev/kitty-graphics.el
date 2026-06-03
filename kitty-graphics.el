@@ -111,6 +111,46 @@ Requires mpv with --vo=kitty support (mpv 0.36.0+)."
   :type 'boolean
   :group 'kitty-graphics)
 
+(defcustom kitty-gfx-enable-browser nil
+  "When non-nil, enable the inline casty web browser.
+Requires the casty program (see `kitty-gfx-casty-program') built
+with embed-mode support, and the Kitty backend."
+  :type 'boolean
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-casty-program "casty"
+  "Program name or path used to launch the casty browser in embed mode."
+  :type 'string
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-casty-chrome nil
+  "Path to a Chromium-based browser for casty to drive, or nil.
+When set, it is passed to casty as the CASTY_CHROME environment
+variable so casty reuses an already-installed browser (Chromium,
+Helium, Brave, …) instead of downloading Chrome Headless Shell."
+  :type '(choice (const :tag "casty default" nil) (file :tag "Browser binary"))
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-browser-max-width 200
+  "Maximum width in columns for the inline browser frame."
+  :type 'integer
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-browser-max-height 60
+  "Maximum height in rows for the inline browser frame."
+  :type 'integer
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-browser-scroll-step 300
+  "Pixels scrolled per `j'/`k' keypress in the inline browser."
+  :type 'integer
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-browser-evil-bindings t
+  "When non-nil, mirror the browser keymap into evil normal/motion state."
+  :type 'boolean
+  :group 'kitty-graphics)
+
 (defcustom kitty-gfx-video-file-extensions
   '("mp4" "mkv" "webm" "mov" "m4v" "avi")
   "File extensions handled by inline mpv preview in dired / dirvish.
@@ -517,6 +557,33 @@ echo-area feedback without round-tripping through mpv IPC.")
 was no longer shown in any window.  Distinct from
 `kitty-gfx--mpv-paused' so the user-driven pause state is preserved
 across window hide/show.")
+
+(defvar-local kitty-gfx--browser-process nil
+  "The casty process object for the current browser buffer.")
+
+(defvar-local kitty-gfx--browser-ipc-socket nil
+  "Path to the casty JSON IPC socket file.")
+
+(defvar-local kitty-gfx--browser-ipc-connection nil
+  "Network process connected to casty's IPC socket.")
+
+(defvar-local kitty-gfx--browser-overlay nil
+  "The overlay reserving space for the browser frame.")
+
+(defvar-local kitty-gfx--browser-image-id nil
+  "Kitty image id allocated for this buffer's casty frames.")
+
+(defvar-local kitty-gfx--browser-cols nil
+  "Current browser frame width in columns.")
+
+(defvar-local kitty-gfx--browser-rows nil
+  "Current browser frame height in rows.")
+
+(defvar-local kitty-gfx--browser-last-row nil
+  "Last known terminal row of the browser overlay.")
+
+(defvar-local kitty-gfx--browser-last-col nil
+  "Last known terminal column of the browser overlay.")
 
 (defvar kitty-gfx-video-overlay-map
   (let ((map (make-sparse-keymap)))
@@ -1905,6 +1972,11 @@ to prevent flicker."
           (with-current-buffer buf
             (when kitty-gfx--mpv-overlay
               (kitty-gfx--refresh-mpv-overlay))))
+        ;; Reposition inline casty browser frames the same way.
+        (dolist (buf (buffer-list))
+          (with-current-buffer buf
+            (when kitty-gfx--browser-overlay
+              (kitty-gfx--refresh-browser-overlay))))
         ;; Phase 2: emit OSC 66 for all visible heading overlays.
         ;; This runs AFTER all posn-at-point queries (phase 1) to
         ;; prevent Emacs mini-redraws from destroying freshly-placed
@@ -4545,6 +4617,356 @@ whichever buffer currently owns a live mpv process."
           (message "kitty-gfx: video %s"
                    (if kitty-gfx--mpv-paused "paused" "resumed")))
       (message "kitty-gfx: no video playing"))))
+
+;;;; casty browser integration
+
+(defun kitty-gfx--browser-available-p ()
+  "Return non-nil if the inline casty browser is available."
+  (and kitty-gfx-enable-browser
+       kitty-graphics-mode
+       (not (display-graphic-p))
+       (eq kitty-gfx--active-backend 'kitty)
+       (executable-find kitty-gfx-casty-program)))
+
+(defun kitty-gfx--browser-unavailable-reason ()
+  "Return a user-facing string explaining why the browser is unavailable."
+  (cond
+   ((not kitty-gfx-enable-browser)
+    "kitty-gfx-enable-browser is nil (set it to t to enable)")
+   ((not kitty-graphics-mode)
+    "kitty-graphics-mode is disabled")
+   ((display-graphic-p)
+    "running in GUI Emacs (the inline browser is a terminal feature)")
+   ((not (eq kitty-gfx--active-backend 'kitty))
+    "Kitty backend not active")
+   ((not (executable-find kitty-gfx-casty-program))
+    (format "casty program %S not found on PATH" kitty-gfx-casty-program))))
+
+(defun kitty-gfx--browser-send (plist)
+  "Send PLIST as a newline-terminated JSON command to this buffer's casty.
+PLIST uses keyword keys, e.g. (:cmd \"scroll\" :dy 300)."
+  (let ((conn kitty-gfx--browser-ipc-connection))
+    (when (and conn (process-live-p conn))
+      (condition-case err
+          (process-send-string conn (concat (json-serialize plist) "\n"))
+        (error
+         (kitty-gfx--log "browser-ipc-send error: %s" (error-message-string err)))))))
+
+(defun kitty-gfx--browser-ipc-filter (_proc output)
+  "Log casty IPC replies (OUTPUT).  Reply parsing is added in later milestones."
+  (kitty-gfx--log "browser-ipc: %s" (string-trim output)))
+
+(defun kitty-gfx--browser-ipc-connect (socket-path buffer)
+  "Poll for SOCKET-PATH, then connect and store the process in BUFFER.
+Polls every 50ms, times out after 2 seconds (mirrors the mpv path)."
+  (let ((attempts 0)
+        (max-attempts 40))
+    (cl-labels
+        ((try-connect ()
+           (cond
+            ((file-exists-p socket-path)
+             (condition-case err
+                 (let ((proc (make-network-process
+                              :name "kitty-gfx-browser-ipc"
+                              :family 'local
+                              :service socket-path
+                              :buffer nil
+                              :noquery t
+                              :filter #'kitty-gfx--browser-ipc-filter)))
+                   (when (buffer-live-p buffer)
+                     (with-current-buffer buffer
+                       (setq kitty-gfx--browser-ipc-connection proc)))
+                   (kitty-gfx--log "browser: IPC connected to %s" socket-path))
+               (error
+                (kitty-gfx--log "browser: IPC connect failed: %s" (error-message-string err))
+                (cl-incf attempts)
+                (when (< attempts max-attempts)
+                  (run-at-time 0.05 nil #'try-connect)))))
+            ((< attempts max-attempts)
+             (cl-incf attempts)
+             (run-at-time 0.05 nil #'try-connect))
+            (t
+             (kitty-gfx--log "browser: IPC socket timeout after 2s")
+             (message "kitty-gfx: casty IPC connection timed out")))))
+      (try-connect))))
+
+(defun kitty-gfx--browser-compute-geometry ()
+  "Compute browser geometry as (COLS ROWS WIDTH-PX HEIGHT-PX).
+Fills the selected window body, clamped to the configured maxima."
+  (kitty-gfx--query-cell-size)
+  (let* ((cw (or kitty-gfx--cell-pixel-width 8))
+         (ch (or kitty-gfx--cell-pixel-height 16))
+         (cols (max 1 (min (1- (window-body-width)) kitty-gfx-browser-max-width)))
+         (rows (max 1 (min (1- (window-body-height)) kitty-gfx-browser-max-height))))
+    (list cols rows (* cols cw) (* rows ch))))
+
+(defun kitty-gfx--browser-overlay-position (win)
+  "Return (ROW . COL) terminal position of the browser overlay in WIN, or nil.
+ROW and COL are 1-based.  Returns nil when the overlay is not visible
+in WIN or while a minibuffer is active (mirrors the mpv logic)."
+  (when (and kitty-gfx--browser-overlay
+             (overlay-buffer kitty-gfx--browser-overlay)
+             win
+             (not (active-minibuffer-window)))
+    (let* ((ov kitty-gfx--browser-overlay)
+           (start (overlay-start ov)))
+      (when (and (eq (window-buffer win) (overlay-buffer ov))
+                 (pos-visible-in-window-p start win))
+        (let* ((win-edges (window-edges win nil nil nil))
+               (win-top (nth 1 win-edges))
+               (win-left (nth 0 win-edges))
+               (posn (posn-at-point start win)))
+          (when posn
+            (let* ((coords (posn-col-row posn))
+                   (col (+ win-left (car coords) 1))
+                   (row (+ win-top (cdr coords) 1)))
+              (cons row col))))))))
+
+(defun kitty-gfx--browser-canonical-window ()
+  "Return the window that should drive browser repositioning, or nil."
+  (when (and kitty-gfx--browser-overlay
+             (overlay-buffer kitty-gfx--browser-overlay))
+    (let* ((buf (overlay-buffer kitty-gfx--browser-overlay))
+           (sel (selected-window)))
+      (if (and (window-live-p sel) (eq (window-buffer sel) buf))
+          sel
+        (car (get-buffer-window-list buf nil 'visible))))))
+
+(defun kitty-gfx--refresh-browser-overlay ()
+  "Send a `set-geometry' IPC command when the browser overlay has moved.
+No IPC is sent while a minibuffer is active so prompts do not yank the
+frame to the top of the screen."
+  (when (and kitty-gfx--browser-process
+             (process-live-p kitty-gfx--browser-process)
+             kitty-gfx--browser-overlay
+             (not (active-minibuffer-window)))
+    (let ((win (kitty-gfx--browser-canonical-window)))
+      (when win
+        (let ((pos (kitty-gfx--browser-overlay-position win)))
+          (when pos
+            (let ((row (car pos))
+                  (col (cdr pos)))
+              (cond
+               ;; Unchanged -- nothing to do.
+               ((and (eql row kitty-gfx--browser-last-row)
+                     (eql col kitty-gfx--browser-last-col)))
+               ;; Drop a suspicious (1,1) reposition when we already had a
+               ;; real position (transient-window mishap during prompts).
+               ((and kitty-gfx--browser-last-row
+                     (not (and (eql kitty-gfx--browser-last-row 1)
+                               (eql kitty-gfx--browser-last-col 1)))
+                     (eql row 1) (eql col 1))
+                (kitty-gfx--log "browser: ignoring suspicious origin reposition"))
+               (t
+                (kitty-gfx--log "browser: reposition row=%d col=%d" row col)
+                (kitty-gfx--browser-send (list :cmd "set-geometry" :top row :left col))
+                (setq kitty-gfx--browser-last-row row
+                      kitty-gfx--browser-last-col col))))))))))
+
+(defun kitty-gfx--browser-process-sentinel (proc event)
+  "Clean up when the casty PROC exits.  EVENT describes the change."
+  (kitty-gfx--log "browser: process event: %s" (string-trim event))
+  (when (memq (process-status proc) '(exit signal))
+    (dolist (b (buffer-list))
+      (with-current-buffer b
+        (when (eq kitty-gfx--browser-process proc)
+          (kitty-gfx--browser-cleanup))))))
+
+(defun kitty-gfx--browser-cleanup ()
+  "Tear down the casty browser in the current buffer.
+Safe to call more than once."
+  (when kitty-gfx--browser-ipc-connection
+    (ignore-errors (delete-process kitty-gfx--browser-ipc-connection))
+    (setq kitty-gfx--browser-ipc-connection nil))
+  (when kitty-gfx--browser-process
+    (when (process-live-p kitty-gfx--browser-process)
+      (ignore-errors (kill-process kitty-gfx--browser-process)))
+    (setq kitty-gfx--browser-process nil))
+  (when kitty-gfx--browser-ipc-socket
+    (ignore-errors (delete-file kitty-gfx--browser-ipc-socket))
+    (setq kitty-gfx--browser-ipc-socket nil))
+  ;; Free the kitty image casty was drawing into.
+  (when kitty-gfx--browser-image-id
+    (ignore-errors (kitty-gfx--delete-by-id kitty-gfx--browser-image-id))
+    (setq kitty-gfx--browser-image-id nil))
+  (when kitty-gfx--browser-overlay
+    (ignore-errors (delete-overlay kitty-gfx--browser-overlay))
+    (setq kitty-gfx--browser-overlay nil))
+  (setq kitty-gfx--browser-last-row nil
+        kitty-gfx--browser-last-col nil)
+  ;; casty hid nothing in embed mode, but restore the cursor defensively
+  ;; and force a repaint of the region it occupied.
+  (ignore-errors (send-string-to-terminal "\e[?25h"))
+  (force-mode-line-update t)
+  (when (fboundp 'redraw-display) (redraw-display)))
+
+;;;###autoload
+(defun kitty-gfx-browse (url)
+  "Open URL in an inline casty browser buffer (`*kitty-browser*').
+Requires `kitty-gfx-enable-browser' to be non-nil and casty installed."
+  (interactive (list (read-string "URL: " "https://")))
+  (unless (kitty-gfx--browser-available-p)
+    (user-error "casty browser unavailable: %s" (kitty-gfx--browser-unavailable-reason)))
+  (let ((buf (get-buffer-create "*kitty-browser*")))
+    (switch-to-buffer buf)
+    (unless (eq major-mode 'kitty-gfx-browser-mode)
+      (kitty-gfx-browser-mode))
+    ;; Replace any existing session in this buffer.
+    (when kitty-gfx--browser-process
+      (kitty-gfx--browser-cleanup))
+    (let* ((geom (kitty-gfx--browser-compute-geometry))
+           (cols (nth 0 geom))
+           (rows (nth 1 geom))
+           (width-px (nth 2 geom))
+           (height-px (nth 3 geom))
+           (id (kitty-gfx--alloc-id))
+           (socket (concat (make-temp-name "/tmp/kitty-gfx-casty-") ".sock"))
+           (inhibit-read-only t))
+      (erase-buffer)
+      (insert (make-string rows ?\n))
+      (goto-char (point-min))
+      (setq kitty-gfx--browser-image-id id
+            kitty-gfx--browser-ipc-socket socket
+            kitty-gfx--browser-cols cols
+            kitty-gfx--browser-rows rows)
+      (let ((ov (make-overlay (point-min) (point-max) nil t nil)))
+        (overlay-put ov 'kitty-gfx t)
+        (overlay-put ov 'kitty-gfx-browser t)
+        (overlay-put ov 'kitty-gfx-id id)
+        (overlay-put ov 'evaporate t)
+        (setq kitty-gfx--browser-overlay ov))
+      ;; Seed the initial terminal position so the first refresh after the
+      ;; IPC connects does not re-emit identical coordinates.
+      (let* ((win (selected-window))
+             (pos (kitty-gfx--browser-overlay-position win)))
+        (when pos
+          (setq kitty-gfx--browser-last-row (car pos)
+                kitty-gfx--browser-last-col (cdr pos))))
+      (let* ((row (or kitty-gfx--browser-last-row 1))
+             (col (or kitty-gfx--browser-last-col 1))
+             (process-environment
+              (append
+               (list (format "CASTY_CELL_WIDTH=%d" (or kitty-gfx--cell-pixel-width 8))
+                     (format "CASTY_CELL_HEIGHT=%d" (or kitty-gfx--cell-pixel-height 16)))
+               ;; A configured browser means we also skip casty's
+               ;; Chrome-Headless-Shell auto-install bootstrap.
+               (when kitty-gfx-casty-chrome
+                 (list (format "CASTY_CHROME=%s" kitty-gfx-casty-chrome)
+                       "CASTY_ENSURE_CHROME=1"))
+               process-environment))
+             (proc (make-process
+                    :name "kitty-gfx-casty"
+                    :buffer nil
+                    :noquery t
+                    :connection-type 'pty
+                    :coding '(binary . binary)
+                    :command
+                    (list kitty-gfx-casty-program "--embed"
+                          "--ipc" socket
+                          "--image-id" (number-to-string id)
+                          "--cols" (number-to-string cols)
+                          "--rows" (number-to-string rows)
+                          "--top" (number-to-string row)
+                          "--left" (number-to-string col)
+                          "--width" (number-to-string width-px)
+                          "--height" (number-to-string height-px)
+                          url)
+                    :filter #'kitty-gfx--mpv-filter
+                    :sentinel #'kitty-gfx--browser-process-sentinel)))
+        (setq kitty-gfx--browser-process proc)
+        (kitty-gfx--log "browser: started pid=%s url=%s" (process-id proc) url)
+        (kitty-gfx--browser-ipc-connect socket buf))
+      (message "kitty-gfx: browsing %s" url))))
+
+;; ── browser commands (bound in the mode map) ──
+
+(defun kitty-gfx-browser-scroll-down ()
+  "Scroll the browser page down."
+  (interactive)
+  (kitty-gfx--browser-send (list :cmd "scroll" :dy kitty-gfx-browser-scroll-step)))
+
+(defun kitty-gfx-browser-scroll-up ()
+  "Scroll the browser page up."
+  (interactive)
+  (kitty-gfx--browser-send (list :cmd "scroll" :dy (- kitty-gfx-browser-scroll-step))))
+
+(defun kitty-gfx-browser-page-down ()
+  "Scroll the browser one page down."
+  (interactive)
+  (kitty-gfx--browser-send (list :cmd "key" :name "PageDown")))
+
+(defun kitty-gfx-browser-page-up ()
+  "Scroll the browser one page up."
+  (interactive)
+  (kitty-gfx--browser-send (list :cmd "key" :name "PageUp")))
+
+(defun kitty-gfx-browser-back ()
+  "Go back in browser history."
+  (interactive)
+  (kitty-gfx--browser-send (list :cmd "back")))
+
+(defun kitty-gfx-browser-forward ()
+  "Go forward in browser history."
+  (interactive)
+  (kitty-gfx--browser-send (list :cmd "forward")))
+
+(defun kitty-gfx-browser-reload ()
+  "Reload the current browser page."
+  (interactive)
+  (kitty-gfx--browser-send (list :cmd "reload")))
+
+(defun kitty-gfx-browser-open-url (url)
+  "Navigate the browser to URL."
+  (interactive (list (read-string "URL: " "https://")))
+  (kitty-gfx--browser-send (list :cmd "navigate" :url url)))
+
+(defun kitty-gfx-browser-quit ()
+  "Stop the browser and kill its buffer."
+  (interactive)
+  (kitty-gfx--browser-send (list :cmd "quit"))
+  (let ((buf (current-buffer)))
+    (kitty-gfx--browser-cleanup)
+    (kill-buffer buf)))
+
+(defvar kitty-gfx-browser-mode-map
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map special-mode-map)
+    (define-key map "j"       #'kitty-gfx-browser-scroll-down)
+    (define-key map "k"       #'kitty-gfx-browser-scroll-up)
+    (define-key map (kbd "C-f") #'kitty-gfx-browser-page-down)
+    (define-key map (kbd "C-b") #'kitty-gfx-browser-page-up)
+    (define-key map "H"       #'kitty-gfx-browser-back)
+    (define-key map "L"       #'kitty-gfx-browser-forward)
+    (define-key map "r"       #'kitty-gfx-browser-reload)
+    (define-key map "o"       #'kitty-gfx-browser-open-url)
+    (define-key map (kbd ":") #'kitty-gfx-browser-open-url)
+    (define-key map "q"       #'kitty-gfx-browser-quit)
+    map)
+  "Keymap for `kitty-gfx-browser-mode'.")
+
+(define-derived-mode kitty-gfx-browser-mode special-mode "KittyBrowser"
+  "Major mode for the inline casty web browser.
+Frames are rendered by casty and forwarded to the terminal; keys are
+translated to casty IPC commands."
+  (setq buffer-read-only t)
+  (setq-local cursor-type nil)
+  (buffer-disable-undo)
+  ;; Tear the browser down with the buffer.
+  (add-hook 'kill-buffer-hook #'kitty-gfx--browser-cleanup nil t)
+  ;; Mirror the bindings into evil normal/motion state so evil's defaults
+  ;; (j/k motions, etc.) do not shadow them -- same pattern as image-mode.
+  (when (and kitty-gfx-browser-evil-bindings (fboundp 'evil-local-set-key))
+    (dolist (state '(normal motion))
+      (evil-local-set-key state "j" #'kitty-gfx-browser-scroll-down)
+      (evil-local-set-key state "k" #'kitty-gfx-browser-scroll-up)
+      (evil-local-set-key state (kbd "C-f") #'kitty-gfx-browser-page-down)
+      (evil-local-set-key state (kbd "C-b") #'kitty-gfx-browser-page-up)
+      (evil-local-set-key state "H" #'kitty-gfx-browser-back)
+      (evil-local-set-key state "L" #'kitty-gfx-browser-forward)
+      (evil-local-set-key state "r" #'kitty-gfx-browser-reload)
+      (evil-local-set-key state "o" #'kitty-gfx-browser-open-url)
+      (evil-local-set-key state (kbd ":") #'kitty-gfx-browser-open-url)
+      (evil-local-set-key state "q" #'kitty-gfx-browser-quit))))
 
 ;;;; Integration install/uninstall
 

@@ -207,6 +207,41 @@ test-mpv video="":
         --eval "(kitty-graphics-mode 1)" \
         --eval "(when (> (length \"$video\") 0) (kitty-gfx-play-video \"$video\"))"
 
+# Launch terminal Emacs with the inline casty browser (Kitty/Ghostty only).
+# casty is auto-resolved to ../casty/bin/casty.js; a Chromium-based browser
+# (Helium, Chromium, Chrome) is auto-detected on PATH.  Override either with
+# KGFX_CASTY=/path/to/casty and CASTY_CHROME=/path/to/browser.
+#   just test-browser                                   # opens example.com
+#   just test-browser url=https://news.ycombinator.com
+test-browser url="https://example.com":
+    #!/usr/bin/env bash
+    set -eu
+    echo ">> Requires Kitty (or Ghostty) terminal."
+    echo ">> Navigate: j/k scroll  C-f/C-b page  H/L back/forward  r reload  o open  q quit"
+    url={{url}}
+    url=${url#url=}
+    # Resolve the casty launcher: env override, else the sibling repo, else PATH.
+    casty="${KGFX_CASTY:-{{justfile_directory()}}/../casty/bin/casty.js}"
+    if [ ! -x "$casty" ]; then
+        command -v casty >/dev/null && casty=casty || {
+            echo "ERROR: casty not found at $casty (set KGFX_CASTY=/path/to/casty)" >&2; exit 1; }
+    fi
+    # Reuse an installed Chromium-based browser so casty skips the download.
+    chrome="${CASTY_CHROME:-}"
+    if [ -z "$chrome" ]; then
+        for c in helium-browser chromium chromium-browser google-chrome-stable google-chrome; do
+            p=$(command -v "$c" 2>/dev/null) && { chrome="$p"; break; }
+        done
+    fi
+    echo ">> casty:  $casty"
+    echo ">> chrome: ${chrome:-<casty default / auto-install Chrome Headless Shell>}"
+    exec env TERM={{TERM_}} {{EMACS}} -nw -Q -l {{SRC}} \
+        --eval "(setq kitty-gfx-debug t kitty-gfx-enable-browser t)" \
+        --eval "(setq kitty-gfx-casty-program \"$casty\")" \
+        --eval "(when (> (length \"$chrome\") 0) (setq kitty-gfx-casty-chrome \"$chrome\"))" \
+        --eval "(kitty-graphics-mode 1)" \
+        --eval "(kitty-gfx-browse \"$url\")"
+
 # --- Headless typst checks --------------------------------------------------
 
 # Compile a typst fragment headlessly, print the PNG path
