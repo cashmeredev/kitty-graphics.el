@@ -2,7 +2,35 @@
 
 ** Unreleased
 
+** kitty-graphics 0.6.0
+
+Three headline additions land in =0.6.0=: inline video playback, an
+inline web browser, and Kitty graphics that finally work through tmux.
+Videos now play right inside a terminal Emacs buffer via [[https://mpv.io][mpv]], with
+thumbnail and full-frame previews in dired/dirvish.  The browser embeds
+[[https://github.com/cashmeredev/casty][casty]] (a headless-Chrome bridge) over an IPC socket, so you can drive a
+real web page inside a buffer.  And the tmux work wraps Kitty's APC
+sequences in DCS passthrough plus a Unicode-placeholder placement mode
+so images survive pane and window switches.  =0.5.0= shipped Sixel
+inside tmux and typst; =0.6.0= builds on that foundation.
+
 *** Features
+
+**** Inline mpv video playback (Kitty backend)
+
+Play videos right inside a terminal Emacs buffer via [[https://mpv.io][mpv]] and the
+Kitty graphics protocol.  mpv runs on a PTY with =--vo=kitty=, its frame
+stream is forwarded to the terminal, and a JSON IPC socket drives
+pause/resume.  Commands: =kitty-gfx-play-video=, =kitty-gfx-toggle-video=
+(=SPC=), =kitty-gfx-stop-video=, =kitty-gfx-stop-video-and-back= (=q=),
+=kitty-gfx-video-help= (=?=).  dired and dirvish gained inline previews:
+video thumbnails in the preview pane plus =kitty-gfx-dired-play-video= and
+=RET= full-frame playback (opt-in =kitty-gfx-dirvish-video-inline-preview=,
+thanks to [[https://github.com/unship][unship]]'s frame-placement work).  Falls back gracefully with
+an ffmpeg warning when a thumbnail cannot be extracted.  Kitty backend
+only -- the Sixel re-emit cost makes per-frame video impractical.
+Requires mpv >= 0.36.0 with =--vo=kitty= support; enable with
+=kitty-gfx-enable-video=.
 
 **** Inline web browser (experimental)
 
@@ -82,9 +110,10 @@ Refs #2.
 ** kitty-graphics 0.5.0
 
 A feature-heavy follow-up to =0.4.0=: typst inline equations, a much
-more robust Sixel encoder pipeline, Sixel inside tmux, and inline mpv
-video playback.  =0.4.0= already shipped the Sixel backend and the
-text-sizing protocol; =0.5.0= builds on that foundation.
+more robust Sixel encoder pipeline, and Sixel inside tmux.  =0.4.0=
+already shipped the Sixel backend and the text-sizing protocol; =0.5.0=
+builds on that foundation.  (Inline mpv video landed after this tag and
+ships in =0.6.0=.)
 
 *** Features
 
@@ -154,13 +183,6 @@ package can fix.  The Kitty graphics protocol still does not work
 inside tmux because we do not yet wrap APC sequences with the
 =\ePtmux;...\e\\= passthrough envelope -- separate piece of work.
 Refs #2.
-
-**** Inline mpv video playback (Kitty backend)
-
-The Kitty backend grew video support via mpv IPC.  New commands:
-=kitty-gfx-play-video=, =kitty-gfx-stop-video=,
-=kitty-gfx-toggle-video=, =kitty-gfx-seek-video=.  Limited to the
-Kitty backend (Sixel re-emit cost makes video impractical there).
 
 **** Loud warning on missing Sixel encoder
 
