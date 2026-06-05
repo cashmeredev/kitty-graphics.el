@@ -585,6 +585,18 @@ across window hide/show.")
 (defvar-local kitty-gfx--browser-last-col nil
   "Last known terminal column of the browser overlay.")
 
+(defvar-local kitty-gfx--browser-xterm-mouse-was-off nil
+  "Non-nil if `kitty-gfx-browser-mode' turned on `xterm-mouse-mode'.
+Terminal Emacs only delivers mouse events (wheel scroll, click-to-follow)
+while `xterm-mouse-mode' is enabled; we enable it for the browser and
+restore the prior state on cleanup.")
+
+(defvar-local kitty-gfx--browser-hint-active nil
+  "Non-nil while casty link-hint mode is active in this buffer.
+Set by `kitty-gfx-browser-hints' and cleared when casty replies
+`{\"hintActive\":false}' (a label was chosen or hints were cancelled);
+used as the keep-predicate of the hint transient keymap.")
+
 (defvar kitty-gfx-video-overlay-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "SPC") #'kitty-gfx-toggle-video)
@@ -2862,6 +2874,7 @@ will render even though detection reports Sixel as supported."
         (message "Kitty graphics: terminal not supported"))
     (kitty-gfx--log "mode: disabling")
     (kitty-gfx-stop-video)
+    (kitty-gfx--stop-all-browsers)
     (kitty-gfx--uninstall-hooks)
     (kitty-gfx--uninstall-integrations)
     (when kitty-gfx--active-backend
@@ -4652,9 +4665,27 @@ PLIST uses keyword keys, e.g. (:cmd \"scroll\" :dy 300)."
         (error
          (kitty-gfx--log "browser-ipc-send error: %s" (error-message-string err)))))))
 
-(defun kitty-gfx--browser-ipc-filter (_proc output)
-  "Log casty IPC replies (OUTPUT).  Reply parsing is added in later milestones."
-  (kitty-gfx--log "browser-ipc: %s" (string-trim output)))
+(defun kitty-gfx--browser-ipc-filter (proc output)
+  "Parse casty IPC replies (OUTPUT) for PROC.
+Replies are newline-delimited JSON.  Partial lines are buffered on the
+process.  A reply with `hintActive' false clears the owning buffer's
+`kitty-gfx--browser-hint-active' flag, which ends the hint transient map."
+  (kitty-gfx--log "browser-ipc: %s" (string-trim output))
+  (let* ((buf (concat (or (process-get proc 'kitty-gfx-ipc-buf) "") output))
+         (lines (split-string buf "\n")))
+    ;; Last element is the (possibly empty) trailing partial line.
+    (process-put proc 'kitty-gfx-ipc-buf (car (last lines)))
+    (dolist (line (butlast lines))
+      (when (> (length (string-trim line)) 0)
+        (let ((obj (ignore-errors
+                     (json-parse-string line :object-type 'plist
+                                        :false-object nil :null-object nil))))
+          (when (and obj (plist-member obj :hintActive)
+                     (not (plist-get obj :hintActive)))
+            (let ((owner (process-get proc 'kitty-gfx-buffer)))
+              (when (buffer-live-p owner)
+                (with-current-buffer owner
+                  (setq kitty-gfx--browser-hint-active nil))))))))))
 
 (defun kitty-gfx--browser-ipc-connect (socket-path buffer)
   "Poll for SOCKET-PATH, then connect and store the process in BUFFER.
@@ -4673,6 +4704,7 @@ Polls every 50ms, times out after 2 seconds (mirrors the mpv path)."
                               :buffer nil
                               :noquery t
                               :filter #'kitty-gfx--browser-ipc-filter)))
+                   (process-put proc 'kitty-gfx-buffer buffer)
                    (when (buffer-live-p buffer)
                      (with-current-buffer buffer
                        (setq kitty-gfx--browser-ipc-connection proc)))
@@ -4794,11 +4826,24 @@ Safe to call more than once."
     (setq kitty-gfx--browser-overlay nil))
   (setq kitty-gfx--browser-last-row nil
         kitty-gfx--browser-last-col nil)
+  ;; Restore xterm-mouse-mode if we turned it on for this buffer.
+  (when kitty-gfx--browser-xterm-mouse-was-off
+    (setq kitty-gfx--browser-xterm-mouse-was-off nil)
+    (when (bound-and-true-p xterm-mouse-mode)
+      (xterm-mouse-mode -1)))
   ;; casty hid nothing in embed mode, but restore the cursor defensively
   ;; and force a repaint of the region it occupied.
   (ignore-errors (send-string-to-terminal "\e[?25h"))
   (force-mode-line-update t)
   (when (fboundp 'redraw-display) (redraw-display)))
+
+(defun kitty-gfx--stop-all-browsers ()
+  "Tear down every live casty browser session across all buffers."
+  (dolist (buf (buffer-list))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (when kitty-gfx--browser-process
+          (kitty-gfx--browser-cleanup))))))
 
 ;;;###autoload
 (defun kitty-gfx-browse (url)
@@ -4932,6 +4977,54 @@ Requires `kitty-gfx-enable-browser' to be non-nil and casty installed."
     (kitty-gfx--browser-cleanup)
     (kill-buffer buf)))
 
+;; ── link hints (Vimium-style, casty draws the labels) ──
+
+(defvar kitty-gfx-browser-hint-chars '(?a ?s ?d ?f ?j ?k ?l)
+  "Label characters casty uses for link hints (casty `HINT_CHARS').")
+
+(defun kitty-gfx--browser-hint-key ()
+  "Forward the just-typed key to casty as a hint-mode keystroke."
+  (interactive)
+  (let ((e last-command-event))
+    (kitty-gfx--browser-send
+     (list :cmd "hint-key"
+           :key (cond ((memq e '(?\d backspace)) "\x7f")
+                      ((characterp e) (char-to-string e))
+                      (t ""))))))
+
+(defun kitty-gfx-browser-hint-abort ()
+  "Cancel link-hint mode (tell casty to remove the labels)."
+  (interactive)
+  (setq kitty-gfx--browser-hint-active nil)
+  (kitty-gfx--browser-send (list :cmd "hint-key" :key "\e")))
+
+(defun kitty-gfx-browser-hints ()
+  "Show Vimium-style link hints and follow the one whose label you type.
+casty injects the labels into the page (they appear in the next frame);
+subsequent label keystrokes are forwarded until a link is chosen or
+`escape'/`C-g' cancels."
+  (interactive)
+  (setq kitty-gfx--browser-hint-active t)
+  (kitty-gfx--browser-send (list :cmd "hints"))
+  (let ((map (make-sparse-keymap)))
+    (dolist (c kitty-gfx-browser-hint-chars)
+      (define-key map (char-to-string c) #'kitty-gfx--browser-hint-key))
+    (define-key map (kbd "DEL")      #'kitty-gfx--browser-hint-key)
+    (define-key map (kbd "<escape>") #'kitty-gfx-browser-hint-abort)
+    (define-key map (kbd "C-g")      #'kitty-gfx-browser-hint-abort)
+    (set-transient-map map (lambda () kitty-gfx--browser-hint-active))))
+
+(defun kitty-gfx-browser-click (event)
+  "Forward a left click in the browser frame to casty as a page click.
+The browser overlay sits at the window's top-left and never scrolls, so
+the clicked cell from EVENT maps directly to casty's 1-based content cell."
+  (interactive "e")
+  (let* ((cr (posn-col-row (event-start event)))
+         (col (1+ (car cr)))
+         (row (1+ (cdr cr))))
+    (kitty-gfx--log "browser: click col=%d row=%d" col row)
+    (kitty-gfx--browser-send (list :cmd "click" :col col :row row))))
+
 (defvar kitty-gfx-browser-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map special-mode-map)
@@ -4949,6 +5042,8 @@ Requires `kitty-gfx-enable-browser' to be non-nil and casty installed."
     (define-key map "r"       #'kitty-gfx-browser-reload)
     (define-key map "o"       #'kitty-gfx-browser-open-url)
     (define-key map (kbd ":") #'kitty-gfx-browser-open-url)
+    (define-key map "f"       #'kitty-gfx-browser-hints)
+    (define-key map [mouse-1] #'kitty-gfx-browser-click)
     (define-key map "q"       #'kitty-gfx-browser-quit)
     map)
   "Keymap for `kitty-gfx-browser-mode'.")
@@ -4960,6 +5055,13 @@ translated to casty IPC commands."
   (setq buffer-read-only t)
   (setq-local cursor-type nil)
   (buffer-disable-undo)
+  ;; Terminal Emacs only receives mouse events (wheel scroll, click-to-follow
+  ;; links) when xterm-mouse-mode is on.  Enable it for the browser, remembering
+  ;; to restore the prior state on cleanup.
+  (when (and (not (display-graphic-p))
+             (not (bound-and-true-p xterm-mouse-mode)))
+    (setq kitty-gfx--browser-xterm-mouse-was-off t)
+    (xterm-mouse-mode 1))
   ;; Tear the browser down with the buffer.
   (add-hook 'kill-buffer-hook #'kitty-gfx--browser-cleanup nil t)
   ;; Mirror the bindings into evil normal/motion state so evil's defaults
@@ -4975,6 +5077,8 @@ translated to casty IPC commands."
       (evil-local-set-key state "r" #'kitty-gfx-browser-reload)
       (evil-local-set-key state "o" #'kitty-gfx-browser-open-url)
       (evil-local-set-key state (kbd ":") #'kitty-gfx-browser-open-url)
+      (evil-local-set-key state "f" #'kitty-gfx-browser-hints)
+      (evil-local-set-key state [mouse-1] #'kitty-gfx-browser-click)
       (evil-local-set-key state "q" #'kitty-gfx-browser-quit))))
 
 ;;;; Integration install/uninstall
