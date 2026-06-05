@@ -155,6 +155,29 @@ test-dirvish dir="~":
         --eval "(dirvish-override-dired-mode 1)" \
         --eval "(dirvish \"$dir\")"
 
+# TEMP: dirvish + kitty-gfx loaded against the user's REAL ~/.emacs.d
+# config (config.org) instead of the throwaway init dir.  Useful for
+# iterating on the kitty-media dispatcher without restarting the
+# main Emacs.  Forces the local kitty-graphics.el over the elpaca build
+# via -L + (load ...) so edits in this repo take effect immediately.
+#   just test-dirvish-myconfig                  # default: open ~/
+#   just test-dirvish-myconfig dir=/path        # open given folder
+test-dirvish-myconfig dir="~":
+    #!/usr/bin/env bash
+    set -eu
+    dir={{dir}}
+    dir=${dir#dir=}
+    dir=$(eval echo "$dir")
+    [ -d "$dir" ] || { echo "ERROR: not a directory: $dir" >&2; exit 1; }
+    dir=$(realpath "$dir")
+    echo ">> Loading ~/.emacs.d/config.org (your real config)."
+    echo ">> Local $(pwd)/{{SRC}} overrides the elpaca build."
+    exec env TERM={{TERM_}} {{EMACS}} -nw \
+        -L "$(pwd)" \
+        --eval "(load \"$(pwd)/{{SRC}}\")" \
+        --eval "(setq kitty-gfx-debug t)" \
+        --eval "(dirvish \"$dir\")"
+
 # Test inline mpv video playback (Kitty terminal only, requires mpv).
 # Opens terminal Emacs with video integration enabled, then auto-plays
 # the file given as positional arg (or drops into scratch buffer when
@@ -183,6 +206,41 @@ test-mpv video="":
         --eval "(setq kitty-gfx-debug t kitty-gfx-enable-video t)" \
         --eval "(kitty-graphics-mode 1)" \
         --eval "(when (> (length \"$video\") 0) (kitty-gfx-play-video \"$video\"))"
+
+# Launch terminal Emacs with the inline casty browser (Kitty only).
+# casty is auto-resolved to ../casty/bin/casty.js; a Chromium-based browser
+# (Helium, Chromium, Chrome) is auto-detected on PATH.  Override either with
+# KGFX_CASTY=/path/to/casty and CASTY_CHROME=/path/to/browser.
+#   just test-browser                                   # opens example.com
+#   just test-browser url=https://news.ycombinator.com
+test-browser url="https://example.com":
+    #!/usr/bin/env bash
+    set -eu
+    echo ">> Requires the Kitty terminal."
+    echo ">> Navigate: j/k scroll  C-f/C-b page  H/L back/forward  r reload  o open  q quit"
+    url={{url}}
+    url=${url#url=}
+    # Resolve the casty launcher: env override, else the sibling repo, else PATH.
+    casty="${KGFX_CASTY:-{{justfile_directory()}}/../casty/bin/casty.js}"
+    if [ ! -x "$casty" ]; then
+        command -v casty >/dev/null && casty=casty || {
+            echo "ERROR: casty not found at $casty (set KGFX_CASTY=/path/to/casty)" >&2; exit 1; }
+    fi
+    # Reuse an installed Chromium-based browser so casty skips the download.
+    chrome="${CASTY_CHROME:-}"
+    if [ -z "$chrome" ]; then
+        for c in helium-browser chromium chromium-browser google-chrome-stable google-chrome; do
+            p=$(command -v "$c" 2>/dev/null) && { chrome="$p"; break; }
+        done
+    fi
+    echo ">> casty:  $casty"
+    echo ">> chrome: ${chrome:-<casty default / auto-install Chrome Headless Shell>}"
+    exec env TERM={{TERM_}} {{EMACS}} -nw -Q -l {{SRC}} \
+        --eval "(setq kitty-gfx-debug t kitty-gfx-enable-browser t)" \
+        --eval "(setq kitty-gfx-casty-program \"$casty\")" \
+        --eval "(when (> (length \"$chrome\") 0) (setq kitty-gfx-casty-chrome \"$chrome\"))" \
+        --eval "(kitty-graphics-mode 1)" \
+        --eval "(kitty-gfx-browse \"$url\")"
 
 # --- Headless typst checks --------------------------------------------------
 
