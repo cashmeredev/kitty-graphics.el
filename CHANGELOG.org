@@ -221,7 +221,7 @@ Performance wise, the kitty image protocol is superior in terms of speed and act
 
 ***** Showcase
 
-[[file:foot.gif]]
+[[file:assets/foot.gif]]
 
 **** Text sizing protocol
 
@@ -237,7 +237,7 @@ I will keep on improving this feature. I think it is actually great eyecandy, an
 
 ***** Showcase
 
-[[file:kitty.gif]]
+[[file:assets/mpv-showcase.gif]]
 
 *** Bug fixes & polish
 

@@ -7,11 +7,11 @@ Display images in terminal Emacs (~emacs -nw~) using the [[https://sw.kovidgoyal
 
 *Kitty backend (truecolor):*
 
-[[file:kitty.gif]]
+[[file:assets/mpv-showcase.gif]]
 
 *Sixel backend (foot):*
 
-[[file:foot.gif]]
+[[file:assets/foot.gif]]
 
 * Foreword
 
