@@ -241,6 +241,31 @@ Key design differences from images:
   headings in one window don't block headings at different terminal
   rows in another window showing the same buffer.
 
+### Inline video (mpv)
+
+`kitty-gfx-play-video` runs `mpv --vo=kitty` on a PTY, captures its
+graphics stream, and forwards it to the terminal; a JSON IPC socket
+drives pause/resume/stop.  Only one video plays at a time and it
+auto-pauses when scrolled out of view.  Kitty backend only (the Sixel
+re-emit cost per frame makes playback impractical).
+
+### Inline web browser (casty embed mode)
+
+`kitty-gfx-browse` embeds [casty](https://github.com/cashmeredev/casty)
+(a fork of [sanohiro/casty](https://github.com/sanohiro/casty), MIT) in
+its embed mode.  casty is spawned with `--embed --ipc <sock> --image-id
+<n> --cols/--rows/--top/--left/--width/--height`; it renders the page to
+PNG frames over the Kitty graphics protocol (single image id, frames
+staged in `/dev/shm`) while Emacs sends newline-delimited JSON commands
+(scroll, navigate, back/forward, reload, click, hints, hint-key,
+set-geometry, get-url, quit) over the IPC socket.  `CASTY_CHROME` (from
+`kitty-gfx-casty-chrome`) reuses an existing Chromium binary.  The
+refresh cycle sends `set-geometry` when the overlay's terminal position
+changes; `kitty-gfx--browser-ipc-filter` parses replies and clears
+`kitty-gfx--browser-hint-active` on `{"hintActive":false}`.
+`kitty-graphics-mode` disable tears down every session via
+`kitty-gfx--stop-all-browsers`.  Experimental; Kitty terminal only.
+
 ## Known Issues & Planned Work
 
 - **Fixed**: Overlays remain visible when org headings are collapsed (#1)

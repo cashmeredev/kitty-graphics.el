@@ -4,6 +4,17 @@
 
 *** Features
 
+**** Inline web browser (experimental)
+
+=kitty-gfx-browse= embeds a real Chromium page inside an Emacs buffer
+by driving [[https://github.com/cashmeredev/casty][casty]] (my fork of [[https://github.com/sanohiro/casty][sanohiro/casty]], MIT) in its embed
+mode: casty renders the page to PNG frames over the Kitty graphics
+protocol while Emacs forwards scroll, navigation, clicks, and
+Vimium-style link hints over an IPC socket.  Evil normal/motion
+bindings are mirrored by default.  Enable with =kitty-gfx-enable-browser=
+and point =kitty-gfx-casty-program= at the casty launcher.  Experimental;
+Kitty terminal only.
+
 **** Kitty graphics protocol inside tmux
 
 Two pieces together let the Kitty backend work through tmux DCS

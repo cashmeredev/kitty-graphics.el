@@ -207,7 +207,7 @@ test-mpv video="":
         --eval "(kitty-graphics-mode 1)" \
         --eval "(when (> (length \"$video\") 0) (kitty-gfx-play-video \"$video\"))"
 
-# Launch terminal Emacs with the inline casty browser (Kitty/Ghostty only).
+# Launch terminal Emacs with the inline casty browser (Kitty only).
 # casty is auto-resolved to ../casty/bin/casty.js; a Chromium-based browser
 # (Helium, Chromium, Chrome) is auto-detected on PATH.  Override either with
 # KGFX_CASTY=/path/to/casty and CASTY_CHROME=/path/to/browser.
@@ -216,7 +216,7 @@ test-mpv video="":
 test-browser url="https://example.com":
     #!/usr/bin/env bash
     set -eu
-    echo ">> Requires Kitty (or Ghostty) terminal."
+    echo ">> Requires the Kitty terminal."
     echo ">> Navigate: j/k scroll  C-f/C-b page  H/L back/forward  r reload  o open  q quit"
     url={{url}}
     url=${url#url=}
