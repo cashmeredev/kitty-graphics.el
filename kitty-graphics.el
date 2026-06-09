@@ -2309,6 +2309,7 @@ Does NOT emit any OSC 66 -- that happens during refresh."
                  (list #'kitty-gfx--heading-modified))
     (overlay-put ov 'insert-behind-hooks
                  (list #'kitty-gfx--heading-modified))
+    (add-hook 'change-major-mode-hook #'kitty-gfx--remove-buffer-graphics nil t)
     (push ov kitty-gfx--overlays)
     (kitty-gfx--log "make-heading-ov: L%d scale=%.2f s=%d n=%d d=%d text=%S beg=%d end=%d"
                      level (float scale) cell-s frac-n frac-d text beg end)
@@ -3675,6 +3676,7 @@ delete step, avoiding visual glitches in some terminals."
     (overlay-put ov 'kitty-gfx-file file)
     ;; Don't set evaporate — zero-width overlays (beg==end) would be
     ;; deleted immediately if evaporate is set.
+    (add-hook 'change-major-mode-hook #'kitty-gfx--remove-buffer-graphics nil t)
     (push ov kitty-gfx--overlays)
     (kitty-gfx--log "make-overlay: id=%d pid=%d cols=%d rows=%d beg=%d end=%d buf=%s (total=%d)"
                      image-id pid cols rows beg end (buffer-name) (length kitty-gfx--overlays))
@@ -3713,8 +3715,14 @@ on-screen copies."
                                      (overlay-get ov 'kitty-gfx-placements)))))
 
 (defun kitty-gfx--delete-image-placement (ov placement)
-  "Delete one recorded image PLACEMENT for OV."
-  (let* ((data (cdr placement))
+  "Delete one recorded image PLACEMENT for OV.
+The delete escape is routed to the terminal of the window the
+placement was recorded for, so killing a buffer shown on another
+daemon client erases that client's copy rather than whatever
+terminal happens to be selected.  When the window or its terminal
+is gone, output falls back to the currently targeted terminal."
+  (let* ((win (car placement))
+         (data (cdr placement))
          (id (overlay-get ov 'kitty-gfx-id))
          (pid (plist-get data :pid))
          (row (plist-get data :row))
@@ -3724,7 +3732,9 @@ on-screen copies."
          (old-row (overlay-get ov 'kitty-gfx-last-row))
          (old-col (overlay-get ov 'kitty-gfx-last-col))
          (old-cols (overlay-get ov 'kitty-gfx-cols))
-         (old-rows (overlay-get ov 'kitty-gfx-rows)))
+         (old-rows (overlay-get ov 'kitty-gfx-rows))
+         (term (and (window-live-p win)
+                    (frame-terminal (window-frame win)))))
     (when (and id pid row col cols rows kitty-gfx--active-backend)
       ;; Sixel deletion is position-based and reads these properties from OV;
       ;; Kitty deletion ignores them and deletes by PID.  Temporarily bind the
@@ -3735,7 +3745,10 @@ on-screen copies."
             (overlay-put ov 'kitty-gfx-last-col col)
             (overlay-put ov 'kitty-gfx-cols cols)
             (overlay-put ov 'kitty-gfx-rows rows)
-            (funcall (kitty-gfx--backend-fn 'delete) ov id pid))
+            (if (and term (terminal-live-p term))
+                (kitty-gfx--with-terminal term
+                  (funcall (kitty-gfx--backend-fn 'delete) ov id pid))
+              (funcall (kitty-gfx--backend-fn 'delete) ov id pid)))
         (overlay-put ov 'kitty-gfx-last-row old-row)
         (overlay-put ov 'kitty-gfx-last-col old-col)
         (overlay-put ov 'kitty-gfx-cols old-cols)
@@ -3944,6 +3957,23 @@ The buffer should be writable (caller handles `inhibit-read-only')."
         (kitty-gfx--remove-overlay ov)))
     (kitty-gfx--log "remove-images: removed %d overlays from %s" count (buffer-name))))
 
+(defun kitty-gfx--remove-buffer-graphics ()
+  "Remove every kitty-gfx rendering from the current buffer.
+Reuses the existing removal paths: heading size overlays are erased
+\(with their conflicting minor modes restored), then all remaining
+kitty-gfx overlays are removed along with their terminal placements.
+Runs when `kitty-graphics-mode' is disabled and, via a buffer-local
+`change-major-mode-hook', before a major-mode change (revert-buffer,
+mode switch) kills the buffer-local overlay list and orphans the
+placements."
+  (when (or kitty-gfx--heading-sizes-enabled
+            (cl-some (lambda (ov) (overlay-get ov 'kitty-gfx-heading))
+                     kitty-gfx--overlays))
+    (kitty-gfx--org-remove-heading-sizes)
+    (kitty-gfx--heading-restore-modes))
+  (when kitty-gfx--overlays
+    (kitty-gfx-remove-images)))
+
 (defun kitty-gfx-clear-all ()
   "Remove all images from all buffers and the terminal."
   (interactive)
@@ -3957,9 +3987,8 @@ The buffer should be writable (caller handles `inhibit-read-only')."
   (kitty-gfx--cleanup-all-terminals)
   (clrhash kitty-gfx--image-cache)
   (setq kitty-gfx--cache-lru nil)
-  (setq kitty-gfx--next-id 1)
   (setq kitty-gfx--next-placement-id 1)
-  (kitty-gfx--log "clear-all: done (reset IDs to 1)"))
+  (kitty-gfx--log "clear-all: done"))
 
 ;;;; Debug commands
 
@@ -4135,6 +4164,10 @@ will render even though detection reports Sixel as supported."
     (kitty-gfx--log "mode: disabling")
     (kitty-gfx-stop-video)
     (kitty-gfx--stop-all-browsers)
+    (dolist (buf (buffer-list))
+      (when (buffer-live-p buf)
+        (with-current-buffer buf
+          (kitty-gfx--remove-buffer-graphics))))
     (kitty-gfx--uninstall-hooks)
     (kitty-gfx--uninstall-integrations)
     (kitty-gfx--cleanup-all-terminals)
@@ -5782,8 +5815,22 @@ PROC is the mpv process, EVENT describes the state change."
   (when kitty-gfx--mpv-overlay
     ;; Drop the per-window placement records before deleting the
     ;; overlay, mirroring image-overlay cleanup.
-    (overlay-put kitty-gfx--mpv-overlay 'kitty-gfx-placements nil)
-    (ignore-errors (delete-overlay kitty-gfx--mpv-overlay))
+    (let* ((ov kitty-gfx--mpv-overlay)
+           (buf (overlay-buffer ov))
+           (beg (overlay-get ov 'kitty-gfx-inserted-beg))
+           (end (overlay-get ov 'kitty-gfx-inserted-end)))
+      (overlay-put ov 'kitty-gfx-placements nil)
+      (ignore-errors (delete-overlay ov))
+      (when (and (buffer-live-p buf)
+                 (markerp beg) (markerp end)
+                 (eq (marker-buffer beg) buf)
+                 (eq (marker-buffer end) buf)
+                 (< beg end))
+        (with-current-buffer buf
+          (let ((inhibit-read-only t))
+            (ignore-errors (delete-region beg end)))))
+      (when (markerp beg) (set-marker beg nil))
+      (when (markerp end) (set-marker end nil)))
     (setq kitty-gfx--mpv-overlay nil))
   (setq kitty-gfx--mpv-last-row nil
         kitty-gfx--mpv-last-col nil
@@ -5832,6 +5879,10 @@ Requires `kitty-gfx-enable-video' to be non-nil and mpv installed."
         (overlay-put kitty-gfx--mpv-overlay 'kitty-gfx-cols video-cols)
         (overlay-put kitty-gfx--mpv-overlay 'kitty-gfx-rows video-rows)
         (overlay-put kitty-gfx--mpv-overlay 'evaporate t)
+        (overlay-put kitty-gfx--mpv-overlay 'kitty-gfx-inserted-beg
+                     (copy-marker start))
+        (overlay-put kitty-gfx--mpv-overlay 'kitty-gfx-inserted-end
+                     (copy-marker end t))
         ;; Local bindings on the video region: SPC toggles, q stops + back.
         (overlay-put kitty-gfx--mpv-overlay 'keymap
                      kitty-gfx-video-overlay-map)
@@ -6232,7 +6283,9 @@ Safe to call more than once."
         (ignore-errors (kill-buffer log)))))
   ;; Free the kitty image casty was drawing into.
   (when kitty-gfx--browser-image-id
-    (ignore-errors (kitty-gfx--delete-by-id kitty-gfx--browser-image-id))
+    (kitty-gfx--with-terminal (and (terminal-live-p kitty-gfx--browser-terminal)
+                                   kitty-gfx--browser-terminal)
+      (ignore-errors (kitty-gfx--delete-by-id kitty-gfx--browser-image-id)))
     (setq kitty-gfx--browser-image-id nil))
   (when kitty-gfx--browser-overlay
     (ignore-errors (delete-overlay kitty-gfx--browser-overlay))
@@ -6682,8 +6735,8 @@ and image-mode simultaneously)."
                   (pid (overlay-get ov 'kitty-gfx-pid))
                   (temp-file (overlay-get ov 'kitty-gfx-delete-file)))
               (when (and id pid kitty-gfx--active-backend)
-                ;; Always delete the placement (it's buffer-specific)
-                (funcall (kitty-gfx--backend-fn 'delete) ov id pid))
+                ;; Always delete the placements (they're buffer-specific)
+                (kitty-gfx--delete-image-placements ov))
               (when temp-file
                 (ignore-errors (delete-file temp-file)))
               ;; Only delete the image data if no other buffer uses it
@@ -6695,11 +6748,9 @@ and image-mode simultaneously)."
       ;; Remove cache entries only for IDs we actually deleted
       (when deleted-ids
         (kitty-gfx--log "kill-buffer-hook: cleaning cache for ids=%S" deleted-ids)
-        (when kitty-gfx--active-backend
-          (dolist (id deleted-ids)
-            (funcall (kitty-gfx--backend-fn 'cleanup) nil id)))
         (maphash (lambda (file id)
                    (when (memq id deleted-ids)
+                     (kitty-gfx--evict-image-everywhere file id)
                      (kitty-gfx--cache-remove file)))
                  (copy-hash-table kitty-gfx--image-cache)))
       (setq kitty-gfx--overlays nil)
