@@ -7,6 +7,11 @@ set shell := ["bash", "-cu"]
 
 export KITTY_GFX_DEBUG := "1"
 
+# Interactive tests load YOUR ~/.emacs.d by default (the local kitty-graphics.el
+# is loaded after init and overrides any installed copy).  Set KGFX_VANILLA=1
+# for the old isolated `-Q` behaviour when bisecting config interference.
+QFLAG  := if env_var_or_default("KGFX_VANILLA", "0") == "1" { "-Q" } else { "" }
+
 EMACS  := env_var_or_default("EMACS", "emacs")
 TERM_  := env_var_or_default("KGFX_TERM", "xterm-256color")
 SRC    := "kitty-graphics.el"
@@ -48,45 +53,45 @@ clean:
 test-typst:
     @echo ">> M-x kitty-gfx-typst-preview     to render"
     @echo ">> M-x kitty-gfx-typst-clear-preview to clear"
-    TERM={{TERM_}} {{EMACS}} -nw -Q -l {{SRC}} \
+    TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
         --eval "(kitty-graphics-mode 1)" \
         --eval "(setq kitty-gfx-debug t)" \
         tests/test-typst.typ
 
 # Test org-mode inline images -- C-c C-x C-v after open
 test-org:
-    TERM={{TERM_}} {{EMACS}} -nw -Q -l {{SRC}} \
+    TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
         --eval "(kitty-graphics-mode 1)" \
         tests/test-kitty-gfx.org
 
 # Test text sizing protocol (OSC 66) on org headings
 test-headings file="tests/test-kitty-gfx.org":
-    TERM={{TERM_}} {{EMACS}} -nw -Q -l {{SRC}} \
+    TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
         --eval "(setq kitty-gfx-heading-sizes-auto t)" \
         --eval "(kitty-graphics-mode 1)" \
         {{file}}
 
 # Test image-mode rendering
 test-image:
-    TERM={{TERM_}} {{EMACS}} -nw -Q -l {{SRC}} \
+    TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
         --eval "(kitty-graphics-mode 1)" \
         tests/test-image.png
 
 # Test doc-view / PDF rendering
 test-pdf:
-    TERM={{TERM_}} {{EMACS}} -nw -Q -l {{SRC}} \
+    TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
         --eval "(kitty-graphics-mode 1)" \
         tests/test-document.pdf
 
 # Test markdown-overlays integration
 test-markdown:
-    TERM={{TERM_}} {{EMACS}} -nw -Q -l {{SRC}} \
+    TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
         --eval "(kitty-graphics-mode 1)" \
         tests/test-markdown.md
 
 # Test LaTeX fragment preview in org-mode (C-c C-x C-l on a fragment)
 test-latex:
-    TERM={{TERM_}} {{EMACS}} -nw -Q -l {{SRC}} \
+    TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
         --eval "(kitty-graphics-mode 1)" \
         tests/test-kitty-gfx.org
 
@@ -295,7 +300,7 @@ tmux:
         echo ">> Already inside tmux -- re-applying the kitty-graphics options here."
         tmux set-option -g allow-passthrough on
         tmux set-option -as terminal-features "*:sixel"
-        exec env TERM={{TERM_}} {{EMACS}} -nw -Q -l {{SRC}} \
+        exec env TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
             --eval "(setq kitty-gfx-debug t kitty-gfx-enable-video t)" \
             --eval "(kitty-graphics-mode 1)"
     fi
@@ -304,7 +309,7 @@ tmux:
     # Fresh session every time so old options don't linger.
     tmux -S "$SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
     tmux -S "$SOCKET" new-session -d -s "$SESSION" -x 220 -y 50 \
-        env TERM={{TERM_}} {{EMACS}} -nw -Q -l "$(pwd)/{{SRC}}" \
+        env TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l "$(pwd)/{{SRC}}" \
             --eval "(setq kitty-gfx-debug t kitty-gfx-enable-video t)" \
             --eval "(kitty-graphics-mode 1)"
     tmux -S "$SOCKET" set-option -t "$SESSION" -g allow-passthrough on
@@ -400,7 +405,7 @@ test-mpv video="":
         fi
         video=$(realpath "$video")
     fi
-    exec env TERM={{TERM_}} {{EMACS}} -nw -Q -l {{SRC}} \
+    exec env TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
         --eval "(setq kitty-gfx-debug t kitty-gfx-enable-video t)" \
         --eval "(kitty-graphics-mode 1)" \
         --eval "(when (> (length \"$video\") 0) (kitty-gfx-play-video \"$video\"))"
@@ -433,7 +438,7 @@ test-browser url="https://example.com":
     fi
     echo ">> casty:  $casty"
     echo ">> chrome: ${chrome:-<casty default / auto-install Chrome Headless Shell>}"
-    exec env TERM={{TERM_}} {{EMACS}} -nw -Q -l {{SRC}} \
+    exec env TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
         --eval "(setq kitty-gfx-debug t kitty-gfx-enable-browser t)" \
         --eval "(setq kitty-gfx-casty-program \"$casty\")" \
         --eval "(when (> (length \"$chrome\") 0) (setq kitty-gfx-casty-chrome \"$chrome\"))" \
@@ -496,7 +501,7 @@ sixel-timeout-test:
 # Open test-image.png with sixel backend forced (foot/Konsole/mintty/WezTerm)
 test-sixel-image encoder="":
     @echo ">> Run inside foot, Konsole, mintty, mlterm, or WezTerm."
-    TERM={{TERM_}} {{EMACS}} -nw -Q -l {{SRC}} \
+    TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
         --eval "(setq kitty-gfx-debug t kitty-gfx-preferred-protocol 'sixel)" \
         --eval '(when (> (length "{{encoder}}") 0) (setq kitty-gfx-sixel-encoder-program "{{encoder}}"))' \
         --eval "(kitty-graphics-mode 1)" \
@@ -511,7 +516,7 @@ test-sixel-tmux encoder="":
     set -eu
     if [ -n "${TMUX:-}" ]; then
         echo ">> Already inside tmux -- running emacs directly in this pane."
-        exec env TERM={{TERM_}} {{EMACS}} -nw -Q -l {{SRC}} \
+        exec env TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
             --eval '(setq kitty-gfx-debug t kitty-gfx-preferred-protocol (quote sixel))' \
             --eval '(when (> (length "{{encoder}}") 0) (setq kitty-gfx-sixel-encoder-program "{{encoder}}"))' \
             --eval '(kitty-graphics-mode 1)' \
@@ -519,7 +524,7 @@ test-sixel-tmux encoder="":
     else
         echo ">> Outer terminal must be sixel-capable; spawning fresh tmux session."
         exec tmux new-session -As kgfx-sixel-test \
-            "TERM={{TERM_}} {{EMACS}} -nw -Q -l {{SRC}} \
+            "TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
                 --eval '(setq kitty-gfx-debug t kitty-gfx-preferred-protocol (quote sixel))' \
                 --eval '(when (> (length \"{{encoder}}\") 0) (setq kitty-gfx-sixel-encoder-program \"{{encoder}}\"))' \
                 --eval '(kitty-graphics-mode 1)' tests/test-image.png"
