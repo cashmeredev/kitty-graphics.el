@@ -2,6 +2,16 @@
 
 ** Unreleased
 
+*** Performance
+
+Refreshes are now skipped entirely when nothing on screen changed: each visible image window stores a cheap signature (buffer, modification tick, displayed region, hscroll, pixel size) after a successful refresh, and the post-command scheduler does nothing while every signature still matches. New ~kitty-gfx-skip-clean-refresh~ (default ~t~) is the escape hatch.
+
+Non-PNG images (jpeg, webp, svg, ...) are converted to PNG in a background process instead of blocking Emacs, controlled by new ~kitty-gfx-async-conversion~ (default ~t~); the overlay reserves its space immediately and the image appears via a forced refresh once the conversion lands. Conversion results are cached per file mtime, so repeat displays skip ImageMagick altogether.
+
+Transmitting an image to a terminal that does not hold its data yet (a freshly attached daemon client, or a first display) no longer happens synchronously inside the refresh loop: transmits go through a queue drained one image per timer tick, keeping keystrokes responsive while a new client catches up.
+
+Base64 payloads are cached in memory keyed on file and mtime, bounded by new ~kitty-gfx-base64-cache-bytes~ (default 64 MiB, LRU eviction), so sending the same image to a second terminal skips the read and encode cost.
+
 *** Features
 
 **** Multi-tty daemon support

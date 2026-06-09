@@ -144,6 +144,24 @@ This debounces rapid redisplay events.  Default is ~1 frame at 60fps."
   :type 'number
   :group 'kitty-graphics)
 
+(defcustom kitty-gfx-skip-clean-refresh t
+  "When non-nil, skip scheduling a refresh when no window content changed.
+`kitty-gfx--on-redisplay' compares each visible overlay window against
+the signature stored after the last successful refresh (see
+`kitty-gfx--window-signature') and schedules nothing when they all
+match.  Set to nil to restore the old refresh-on-every-command
+behaviour as an escape hatch."
+  :type 'boolean
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-async-conversion t
+  "When non-nil, convert non-PNG images to PNG asynchronously.
+The overlay reserves its blank screen area immediately and the image
+appears via a forced refresh once the background conversion finishes.
+When nil, conversion blocks Emacs as before."
+  :type 'boolean
+  :group 'kitty-graphics)
+
 (defcustom kitty-gfx-debug nil
   "When non-nil, log debug info to *kitty-gfx-debug* buffer."
   :type 'boolean
@@ -565,6 +583,16 @@ terminal data deleted via `a=d'."
   :type 'integer
   :group 'kitty-graphics)
 
+(defcustom kitty-gfx-base64-cache-bytes 67108864
+  "Maximum total bytes of base64-encoded image data to cache in memory.
+`kitty-gfx--read-file-base64' keeps encoded payloads keyed by file and
+modification time so re-transmits to additional terminals skip the
+read+encode cost.  Least-recently-used entries are evicted when the
+total exceeds this cap; a single payload larger than the cap is never
+cached."
+  :type 'integer
+  :group 'kitty-graphics)
+
 (defcustom kitty-gfx-preferred-protocol 'auto
   "Preferred graphics protocol to use.
 Choices: `auto' (try Kitty first, then Sixel), `kitty', or `sixel'.
@@ -639,6 +667,41 @@ display contexts (window sizes, zoom levels, etc.).")
 (defvar kitty-gfx--cache-lru nil
   "LRU list of file paths in `kitty-gfx--image-cache'.
 Most recently used at the front.")
+
+(defvar kitty-gfx--png-cache (make-hash-table :test 'equal)
+  "Maps source file paths to (MTIME . PNG-PATH) conversion results.
+Consulted by `kitty-gfx--convert-to-png' before shelling out and
+populated after every successful conversion (sync or async).  Stale
+entries (source mtime changed) are reconverted and their old temp PNG
+deleted.")
+
+(defvar kitty-gfx--converting (make-hash-table :test 'equal)
+  "Maps file paths to the list of callbacks awaiting an async conversion.
+A key's presence means a conversion process for that file is in
+flight; further requests append their callback instead of spawning a
+second process.")
+
+(defvar kitty-gfx--transmit-queue nil
+  "Pending image transmits as a list of (TERMINAL FILE IMAGE-ID).
+Filled by `kitty-gfx--ensure-transmitted' when a terminal lacks an
+image's data; drained one entry per tick by
+`kitty-gfx--transmit-drain' so a newly attached client does not block
+Emacs transmitting its whole backlog inside one refresh.")
+
+(defvar kitty-gfx--transmit-drain-timer nil
+  "Repeating timer that drains `kitty-gfx--transmit-queue'.")
+
+(defvar kitty-gfx--base64-cache (make-hash-table :test 'equal)
+  "Maps file paths to (MTIME . BASE64-STRING) for transmitted images.
+Bounded by `kitty-gfx-base64-cache-bytes'; see
+`kitty-gfx--base64-cache-lru' for eviction order.")
+
+(defvar kitty-gfx--base64-cache-lru nil
+  "LRU list of file paths in `kitty-gfx--base64-cache'.
+Most recently used at the front.")
+
+(defvar kitty-gfx--base64-cache-total 0
+  "Total bytes of base64 payloads currently in `kitty-gfx--base64-cache'.")
 
 (defvar-local kitty-gfx--overlays nil
   "Image overlays in this buffer.")
@@ -1089,40 +1152,89 @@ evidence that the outer terminal speaks the Kitty protocol."
 (defun kitty-gfx--kitty-prepare (file image-id)
   "Prepare image FILE for Kitty display.
 Converts to PNG if needed, encodes to base64, transmits to terminal.
+Converted PNGs are owned by `kitty-gfx--png-cache' and kept for reuse.
 Returns IMAGE-ID on success, nil on failure."
   (let* ((png (kitty-gfx--convert-to-png file))
-         (temp-p (and png (not (string= png file)))))
-    (unwind-protect
-        (let ((b64 (when png (kitty-gfx--read-file-base64 png))))
-          (if (not b64)
-              (progn
-                (kitty-gfx--log "kitty-prepare: skipped %s (conversion failed)" file)
-                nil)
-            (kitty-gfx--log "kitty-prepare: transmit id=%d b64-len=%d png=%s"
-                             image-id (length b64) png)
-            (kitty-gfx--transmit-image image-id b64)
-            ;; The bytes now live on the terminal output was routed to;
-            ;; record it so this client is not re-transmitted needlessly and
-            ;; other clients still re-transmit on their own first use.
-            (kitty-gfx--mark-transmitted image-id)
-            image-id))
-      (when temp-p
-        (ignore-errors (delete-file png))))))
+         (b64 (when png (kitty-gfx--read-file-base64 png))))
+    (if (not b64)
+        (progn
+          (kitty-gfx--log "kitty-prepare: skipped %s (conversion failed)" file)
+          nil)
+      (kitty-gfx--log "kitty-prepare: transmit id=%d b64-len=%d png=%s"
+                       image-id (length b64) png)
+      (kitty-gfx--transmit-image image-id b64)
+      ;; The bytes now live on the terminal output was routed to;
+      ;; record it so this client is not re-transmitted needlessly and
+      ;; other clients still re-transmit on their own first use.
+      (kitty-gfx--mark-transmitted image-id)
+      image-id)))
+
+(defun kitty-gfx--transmit-queue-reset ()
+  "Cancel the drain timer and drop all queued transmits."
+  (when kitty-gfx--transmit-drain-timer
+    (cancel-timer kitty-gfx--transmit-drain-timer))
+  (setq kitty-gfx--transmit-drain-timer nil
+        kitty-gfx--transmit-queue nil))
+
+(defun kitty-gfx--transmit-drain ()
+  "Transmit one queued image, then stop and force a refresh when done.
+Each tick pops a single (TERMINAL FILE IMAGE-ID) entry and runs the
+Kitty prepare with output routed to that entry's terminal.  When the
+queue empties the timer cancels itself and a forced refresh is
+scheduled so the freshly transmitted images get placed."
+  (let ((entry (pop kitty-gfx--transmit-queue)))
+    (when entry
+      (let ((term (nth 0 entry))
+            (file (nth 1 entry))
+            (id (nth 2 entry)))
+        (if (not (terminal-live-p term))
+            (kitty-gfx--log "transmit-drain: dropped id=%d (dead terminal)" id)
+          (kitty-gfx--log "transmit-drain: id=%d term=%s (queued=%d)"
+                          id term (length kitty-gfx--transmit-queue))
+          (kitty-gfx--with-terminal term
+            (kitty-gfx--kitty-prepare file id))))))
+  (unless kitty-gfx--transmit-queue
+    (when kitty-gfx--transmit-drain-timer
+      (cancel-timer kitty-gfx--transmit-drain-timer)
+      (setq kitty-gfx--transmit-drain-timer nil))
+    (kitty-gfx--schedule-refresh t)))
+
+(defun kitty-gfx--transmit-enqueue (term file image-id)
+  "Queue IMAGE-ID/FILE for transmission to TERM and ensure the drain runs.
+Duplicate (TERM, IMAGE-ID) pairs are not queued twice."
+  (unless (cl-find-if (lambda (entry)
+                        (and (eq (nth 0 entry) term)
+                             (eql (nth 2 entry) image-id)))
+                      kitty-gfx--transmit-queue)
+    (kitty-gfx--log "transmit-enqueue: id=%d term=%s (queued=%d)"
+                    image-id term (1+ (length kitty-gfx--transmit-queue)))
+    (setq kitty-gfx--transmit-queue
+          (append kitty-gfx--transmit-queue (list (list term file image-id)))))
+  (unless kitty-gfx--transmit-drain-timer
+    (setq kitty-gfx--transmit-drain-timer
+          (run-at-time 0.01 0.01 #'kitty-gfx--transmit-drain))))
 
 (defun kitty-gfx--ensure-transmitted (file image-id)
-  "Ensure IMAGE-ID's data is present on `kitty-gfx--target-terminal'.
-Called from the refresh path, where the target terminal is bound, so a
-client that has not yet received this id gets a fresh `a=t' transmit (and,
-in placeholder mode, a fresh virtual placement) before placement.  No-op
-for the Sixel backend, which re-emits pixels on every placement and keeps
-no per-terminal image store.  `kitty-gfx--kitty-prepare' marks the
-terminal transmitted on success, so this runs at most once per (id,
-terminal)."
-  (when (and (eq kitty-gfx--active-backend 'kitty)
-             file image-id
-             (not (kitty-gfx--transmitted-p image-id)))
-    (kitty-gfx--log "ensure-transmitted: id=%d not yet on target terminal" image-id)
-    (funcall (kitty-gfx--backend-fn 'prepare) file image-id)))
+  "Return non-nil when IMAGE-ID is ready to place on the target terminal.
+Called from the refresh path, where the target terminal is bound.  When
+the terminal already holds the image (or the backend is Sixel, which
+re-emits pixels on every placement) this returns t and the caller
+places immediately.  When the image's data is missing, the transmit is
+queued on `kitty-gfx--transmit-queue' instead of blocking the refresh
+loop, and nil is returned so the caller skips this overlay; the drain
+timer's trailing forced refresh places it once transmitted.  Also
+returns nil while FILE's async PNG conversion is still in flight."
+  (cond
+   ((and file (gethash file kitty-gfx--converting))
+    (kitty-gfx--log "ensure-transmitted: %s still converting, deferring" file)
+    nil)
+   ((not (and (eq kitty-gfx--active-backend 'kitty) file image-id)) t)
+   ((kitty-gfx--transmitted-p image-id) t)
+   (t
+    (kitty-gfx--transmit-enqueue
+     (or kitty-gfx--target-terminal (frame-terminal))
+     file image-id)
+    nil)))
 
 (defun kitty-gfx--kitty-place (ov image-id placement-id cols rows term-row term-col)
   "Place Kitty image at (TERM-ROW, TERM-COL) using the active placement mode.
@@ -2244,7 +2356,8 @@ several daemon clients on different ttys render correctly at once."
             (when kitty-gfx--browser-overlay
               (kitty-gfx--refresh-browser-overlay)))))
       (kitty-gfx--log "refresh: done total=%d placed=%d hidden=%d pruned=%d"
-                       total-overlays placed hidden pruned))))
+                       total-overlays placed hidden pruned)
+      (kitty-gfx--update-window-signatures))))
 
 (defun kitty-gfx--refresh-overlay (ov win win-bottom)
   "Refresh a single overlay OV in WIN.
@@ -2279,10 +2392,16 @@ refresh based on overlay type."
           ;; Visible and fits — place if position changed
           (let ((new-row (car pos))
                 (new-col (cdr pos)))
-            (if (and (eql new-row last-row)
-                     (eql new-col last-col))
-                (kitty-gfx--log "refresh-ov: pid=%d unchanged at row=%d col=%d"
-                                pid new-row new-col)
+            (cond
+             ((and (eql new-row last-row)
+                   (eql new-col last-col))
+              (kitty-gfx--log "refresh-ov: pid=%d unchanged at row=%d col=%d"
+                              pid new-row new-col))
+             ((not (kitty-gfx--ensure-transmitted
+                    (overlay-get ov 'kitty-gfx-file) id))
+              (kitty-gfx--log "refresh-ov: pid=%d deferred (transmit queued or converting)"
+                              pid))
+             (t
               (kitty-gfx--log "refresh-ov: pid=%d moved %s -> row=%d col=%d"
                               pid
                               (if last-row (format "row=%d,col=%d" last-row last-col) "nil")
@@ -2335,12 +2454,8 @@ refresh based on overlay type."
               ;; the terminal placement so record and emit never diverge.
               (setq pid (kitty-gfx--record-image-placement
                          ov win new-row new-col cols rows nil))
-              ;; This window's terminal may be a client that has never
-              ;; received this image (the global cache only tracks that some
-              ;; terminal has it).  Transmit to it before placing.
-              (kitty-gfx--ensure-transmitted (overlay-get ov 'kitty-gfx-file) id)
               (funcall (kitty-gfx--backend-fn 'place)
-                       ov id pid cols rows new-row new-col)))
+                       ov id pid cols rows new-row new-col))))
         ;; Not visible or overflows — delete if was placed in this window
         (when placement
           (kitty-gfx--log "refresh-ov: pid=%d hiding in win=%s (was row=%d col=%d)"
@@ -2407,7 +2522,8 @@ When FORCE-REDISPLAY is non-nil, the next refresh will call
 just mutated display properties and `posn-at-point' would otherwise
 return stale coordinates."
   (when force-redisplay
-    (setq kitty-gfx--force-redisplay t))
+    (setq kitty-gfx--force-redisplay t)
+    (kitty-gfx--invalidate-window-signatures))
   (if kitty-gfx--render-timer
       ;; Cooldown active — flag that another refresh is wanted.
       (setq kitty-gfx--refresh-pending t)
@@ -2427,6 +2543,7 @@ return stale coordinates."
   "Handle window scroll for image refresh."
   (when (buffer-local-value 'kitty-gfx--overlays (window-buffer win))
     (kitty-gfx--log "on-scroll: win=%s buf=%s" win (buffer-name (window-buffer win)))
+    (set-window-parameter win 'kitty-gfx-sig nil)
     (kitty-gfx--schedule-refresh)))
 
 (defun kitty-gfx--on-buffer-change (_frame-or-window)
@@ -2434,6 +2551,7 @@ return stale coordinates."
 Deletes placements for buffers no longer visible in any window,
 then invalidates position caches and schedules a refresh."
   (kitty-gfx--log "on-buffer-change: cleaning up non-visible placements")
+  (kitty-gfx--invalidate-window-signatures)
   ;; Find which buffers are currently visible
   (let ((visible-bufs nil))
     (walk-windows (lambda (w) (push (window-buffer w) visible-bufs))
@@ -2512,6 +2630,7 @@ to let Emacs finish window layout transitions (e.g., when closing a
 split, Emacs briefly shows two windows for the same buffer before
 settling to one)."
   (kitty-gfx--log "on-window-change: deleting stale placements and invalidating cell size")
+  (kitty-gfx--invalidate-window-signatures)
   (setq kitty-gfx--cell-pixel-width nil
         kitty-gfx--cell-pixel-height nil)
   ;; Invalidate FRAME's terminal cell-size parameter too, so the
@@ -2576,29 +2695,128 @@ scheduling timers in unrelated buffers — issue #19."
      nil 'visible)
     nil))
 
+(defun kitty-gfx--window-signature (win)
+  "Return a cheap signature of WIN's displayed content.
+Captures buffer identity, the buffer's text-change tick, the displayed
+region, hscroll, and pixel geometry.  `window-end' is called
+non-forcing so computing a signature never triggers redisplay work."
+  (let ((buf (window-buffer win)))
+    (list buf
+          (buffer-chars-modified-tick buf)
+          (window-start win)
+          (window-end win nil)
+          (window-hscroll win)
+          (window-pixel-width win)
+          (window-pixel-height win))))
+
+(defun kitty-gfx--windows-clean-p ()
+  "Return non-nil when every visible overlay window matches its stored signature.
+A clean result means nothing an image placement depends on has changed
+since the last successful refresh, so `kitty-gfx--on-redisplay' can
+skip scheduling one.  Windows showing an mpv or browser overlay are
+never considered clean — their terminal-side frames move independently
+of any buffer-visible state the signature captures."
+  (catch 'dirty
+    (walk-windows
+     (lambda (w)
+       (let ((buf (window-buffer w)))
+         (when (or (buffer-local-value 'kitty-gfx--mpv-overlay buf)
+                   (buffer-local-value 'kitty-gfx--browser-overlay buf))
+           (throw 'dirty nil))
+         (when (buffer-local-value 'kitty-gfx--overlays buf)
+           (unless (equal (kitty-gfx--window-signature w)
+                          (window-parameter w 'kitty-gfx-sig))
+             (throw 'dirty nil)))))
+     nil 'visible)
+    t))
+
+(defun kitty-gfx--update-window-signatures ()
+  "Store the current signature on every visible overlay window.
+Called at the end of a successful `kitty-gfx--refresh' pass; a refresh
+that bailed early leaves the old signatures so the next
+`kitty-gfx--on-redisplay' retries."
+  (walk-windows
+   (lambda (w)
+     (when (buffer-local-value 'kitty-gfx--overlays (window-buffer w))
+       (set-window-parameter w 'kitty-gfx-sig (kitty-gfx--window-signature w))))
+   nil 'visible))
+
+(defun kitty-gfx--invalidate-window-signatures ()
+  "Drop every window's stored refresh signature so the next refresh runs."
+  (walk-windows
+   (lambda (w) (set-window-parameter w 'kitty-gfx-sig nil))
+   nil t))
+
 (defun kitty-gfx--on-redisplay ()
   "Post-command hook to schedule image refresh.
 Early-exits when no visible window has any kitty-gfx overlays so
 unrelated buffers (dired, magit, scratch, ...) pay no timer or
-redisplay cost, and skips while user feedback is in the echo area."
+redisplay cost, and skips while user feedback is in the echo area.
+When `kitty-gfx-skip-clean-refresh' is enabled and no forced refresh
+is pending, windows whose signatures are unchanged since the last
+refresh schedule nothing at all."
   (when (and (kitty-gfx--any-visible-overlays-p)
              (not (active-minibuffer-window))
-             (not (current-message)))
+             (not (current-message))
+             (not (and kitty-gfx-skip-clean-refresh
+                       (not kitty-gfx--force-redisplay)
+                       (kitty-gfx--windows-clean-p))))
     (kitty-gfx--schedule-refresh)))
 
 ;;;; Image processing
 
+(defun kitty-gfx--base64-cache-store (file mtime b64)
+  "Cache B64 for FILE at MTIME, evicting LRU entries over the byte cap.
+Payloads larger than `kitty-gfx-base64-cache-bytes' are not cached."
+  (when (<= (length b64) kitty-gfx-base64-cache-bytes)
+    (let ((old (gethash file kitty-gfx--base64-cache)))
+      (when old
+        (setq kitty-gfx--base64-cache-total
+              (- kitty-gfx--base64-cache-total (length (cdr old))))))
+    (puthash file (cons mtime b64) kitty-gfx--base64-cache)
+    (setq kitty-gfx--base64-cache-lru
+          (cons file (delete file kitty-gfx--base64-cache-lru)))
+    (setq kitty-gfx--base64-cache-total
+          (+ kitty-gfx--base64-cache-total (length b64)))
+    (while (and (> kitty-gfx--base64-cache-total kitty-gfx-base64-cache-bytes)
+                (cdr kitty-gfx--base64-cache-lru))
+      (let* ((victim (car (last kitty-gfx--base64-cache-lru)))
+             (entry (gethash victim kitty-gfx--base64-cache)))
+        (when entry
+          (setq kitty-gfx--base64-cache-total
+                (- kitty-gfx--base64-cache-total (length (cdr entry)))))
+        (remhash victim kitty-gfx--base64-cache)
+        (setq kitty-gfx--base64-cache-lru
+              (butlast kitty-gfx--base64-cache-lru))
+        (kitty-gfx--log "base64-cache-evict: %s (total=%d cap=%d)"
+                        (file-name-nondirectory victim)
+                        kitty-gfx--base64-cache-total
+                        kitty-gfx-base64-cache-bytes)))))
+
 (defun kitty-gfx--read-file-base64 (file)
-  "Read FILE and return base64-encoded string."
-  (kitty-gfx--log "read-file-base64: %s size=%s"
-                   file (ignore-errors (file-attribute-size (file-attributes file))))
-  (with-temp-buffer
-    (set-buffer-multibyte nil)
-    (insert-file-contents-literally file)
-    (base64-encode-region (point-min) (point-max) t)
-    (let ((result (buffer-string)))
-      (kitty-gfx--log "read-file-base64: done b64-len=%d" (length result))
-      result)))
+  "Read FILE and return base64-encoded string.
+Results are cached keyed on FILE and its modification time (bounded by
+`kitty-gfx-base64-cache-bytes'), so transmitting the same image to a
+second terminal skips the read+encode cost."
+  (let* ((mtime (file-attribute-modification-time (file-attributes file)))
+         (entry (gethash file kitty-gfx--base64-cache)))
+    (if (and entry (equal (car entry) mtime))
+        (progn
+          (setq kitty-gfx--base64-cache-lru
+                (cons file (delete file kitty-gfx--base64-cache-lru)))
+          (kitty-gfx--log "read-file-base64: cache hit %s b64-len=%d"
+                          file (length (cdr entry)))
+          (cdr entry))
+      (kitty-gfx--log "read-file-base64: %s size=%s"
+                      file (ignore-errors (file-attribute-size (file-attributes file))))
+      (with-temp-buffer
+        (set-buffer-multibyte nil)
+        (insert-file-contents-literally file)
+        (base64-encode-region (point-min) (point-max) t)
+        (let ((result (buffer-string)))
+          (kitty-gfx--log "read-file-base64: done b64-len=%d" (length result))
+          (kitty-gfx--base64-cache-store file mtime result)
+          result)))))
 
 (defun kitty-gfx--image-pixel-size (file)
   "Return (WIDTH . HEIGHT) in pixels for image FILE, or nil."
@@ -2623,38 +2841,118 @@ redisplay cost, and skips while user feedback is in the echo area."
                   (kitty-gfx--log "identify: %dx%d pixels" w h)
                   (cons w h))))))))))
 
+(defun kitty-gfx--png-cache-get (file)
+  "Return the cached PNG path for FILE, or nil if absent or stale."
+  (let ((entry (gethash file kitty-gfx--png-cache)))
+    (when entry
+      (let ((mtime (file-attribute-modification-time (file-attributes file))))
+        (if (and (equal (car entry) mtime)
+                 (file-exists-p (cdr entry)))
+            (cdr entry)
+          (remhash file kitty-gfx--png-cache)
+          (unless (string= (cdr entry) file)
+            (ignore-errors (delete-file (cdr entry))))
+          nil)))))
+
+(defun kitty-gfx--png-cache-put (file png)
+  "Record PNG as FILE's conversion result at FILE's current mtime."
+  (let ((old (gethash file kitty-gfx--png-cache)))
+    (when (and old
+               (not (string= (cdr old) png))
+               (not (string= (cdr old) file)))
+      (ignore-errors (delete-file (cdr old)))))
+  (puthash file
+           (cons (file-attribute-modification-time (file-attributes file)) png)
+           kitty-gfx--png-cache)
+  png)
+
+(defun kitty-gfx--convert-program ()
+  "Return the ImageMagick binary to use for PNG conversion, or nil."
+  (or (executable-find "magick")
+      (executable-find "convert")))
+
 (defun kitty-gfx--convert-to-png (file)
   "Convert FILE to PNG if needed.  Returns path to PNG file.
-Returns FILE unchanged if it is already PNG.
-Returns nil if FILE is not PNG and ImageMagick is unavailable or
-conversion fails — callers must handle nil gracefully."
+Returns FILE unchanged if it is already PNG.  Successful conversions
+are cached in `kitty-gfx--png-cache' keyed on FILE's mtime, so repeat
+displays (and the async path's later synchronous prepare) skip the
+shell-out.  Returns nil if FILE is not PNG and ImageMagick is
+unavailable or conversion fails — callers must handle nil gracefully."
   (if (string-suffix-p ".png" file t)
       (progn
         (kitty-gfx--log "convert-to-png: %s already PNG" file)
         file)
-    (let ((convert (or (executable-find "magick")
-                       (executable-find "convert"))))
-      (if (not convert)
-          (progn
-            (kitty-gfx--log "convert-to-png: no ImageMagick, cannot convert %s" file)
-            (message "kitty-gfx: %s requires ImageMagick for display"
-                     (file-name-nondirectory file))
-            nil)
-        (let ((out (make-temp-file "kitty-gfx-" nil ".png")))
-          (kitty-gfx--log "convert-to-png: %s -> %s via %s" file out convert)
-          (let ((exit-code
-                 (call-process convert nil nil nil file out)))
-            (kitty-gfx--log "convert-to-png: exit-code=%s" exit-code)
-            ;; Check that conversion produced a non-empty file
-            (if (and (file-exists-p out)
-                     (> (file-attribute-size (file-attributes out)) 0))
-                (progn
-                  (kitty-gfx--log "convert-to-png: success out-size=%d"
-                                   (file-attribute-size (file-attributes out)))
-                  out)
-              (kitty-gfx--log "convert-to-png: FAILED (empty or missing output)")
-              (ignore-errors (delete-file out))
-              nil)))))))
+    (or (kitty-gfx--png-cache-get file)
+        (let ((convert (kitty-gfx--convert-program)))
+          (if (not convert)
+              (progn
+                (kitty-gfx--log "convert-to-png: no ImageMagick, cannot convert %s" file)
+                (message "kitty-gfx: %s requires ImageMagick for display"
+                         (file-name-nondirectory file))
+                nil)
+            (let ((out (make-temp-file "kitty-gfx-" nil ".png")))
+              (kitty-gfx--log "convert-to-png: %s -> %s via %s" file out convert)
+              (let ((exit-code
+                     (call-process convert nil nil nil file out)))
+                (kitty-gfx--log "convert-to-png: exit-code=%s" exit-code)
+                (if (and (file-exists-p out)
+                         (> (file-attribute-size (file-attributes out)) 0))
+                    (progn
+                      (kitty-gfx--log "convert-to-png: success out-size=%d"
+                                      (file-attribute-size (file-attributes out)))
+                      (kitty-gfx--png-cache-put file out))
+                  (kitty-gfx--log "convert-to-png: FAILED (empty or missing output)")
+                  (ignore-errors (delete-file out))
+                  nil))))))))
+
+(defun kitty-gfx--convert-to-png-async (file callback)
+  "Convert FILE to PNG in a background process, then funcall CALLBACK.
+CALLBACK receives the PNG path on success, nil on failure.  Cache hits
+and already-PNG files invoke CALLBACK immediately.  Concurrent requests
+for the same FILE share one conversion process; their callbacks all run
+when it finishes."
+  (let ((cached (and (string-suffix-p ".png" file t) file)))
+    (unless cached
+      (setq cached (kitty-gfx--png-cache-get file)))
+    (cond
+     (cached (funcall callback cached))
+     ((gethash file kitty-gfx--converting)
+      (puthash file (cons callback (gethash file kitty-gfx--converting))
+               kitty-gfx--converting))
+     (t
+      (let ((convert (kitty-gfx--convert-program)))
+        (if (not convert)
+            (progn
+              (kitty-gfx--log "convert-to-png-async: no ImageMagick for %s" file)
+              (funcall callback nil))
+          (let ((out (make-temp-file "kitty-gfx-" nil ".png")))
+            (puthash file (list callback) kitty-gfx--converting)
+            (kitty-gfx--log "convert-to-png-async: %s -> %s via %s" file out convert)
+            (make-process
+             :name "kitty-gfx-convert"
+             :command (list convert file out)
+             :noquery t
+             :sentinel
+             (lambda (proc _event)
+               (when (memq (process-status proc) '(exit signal))
+                 (let ((callbacks (gethash file kitty-gfx--converting))
+                       (ok (and (eq (process-status proc) 'exit)
+                                (zerop (process-exit-status proc))
+                                (file-exists-p out)
+                                (> (file-attribute-size (file-attributes out)) 0))))
+                   (remhash file kitty-gfx--converting)
+                   (if ok
+                       (progn
+                         (kitty-gfx--log "convert-to-png-async: success %s out-size=%d"
+                                         file
+                                         (file-attribute-size (file-attributes out)))
+                         (kitty-gfx--png-cache-put file out))
+                     (kitty-gfx--log "convert-to-png-async: FAILED %s status=%s exit=%s"
+                                     file (process-status proc)
+                                     (process-exit-status proc))
+                     (ignore-errors (delete-file out)))
+                   (dolist (cb (nreverse callbacks))
+                     (funcall cb (and ok out))))))))))))))
 
 (defvar kitty-gfx--dim-scale nil
   "When a positive float, multiply natural image cell dims by this factor.
@@ -2942,6 +3240,37 @@ the next placement lands at a different position or size
 
 ;;;; Public API
 
+(defun kitty-gfx--async-prepare-p (file)
+  "Return non-nil when FILE's display should use background conversion.
+True for non-PNG files with no fresh entry in `kitty-gfx--png-cache'
+while `kitty-gfx-async-conversion' is enabled."
+  (and kitty-gfx-async-conversion
+       (not (string-suffix-p ".png" file t))
+       (not (kitty-gfx--png-cache-get file))))
+
+(defun kitty-gfx--start-async-prepare (file)
+  "Convert FILE in the background, then force a refresh to place it.
+The caller has already created the overlay (blank placeholder) and
+registered FILE in the image cache; until the conversion lands,
+`kitty-gfx--ensure-transmitted' defers placement.  On success the PNG
+is also stored for the Sixel backend and a forced refresh makes the
+image appear.  On failure the overlay and cache entry are removed,
+matching the synchronous path's no-overlay-on-failure behaviour."
+  (kitty-gfx--convert-to-png-async
+   file
+   (lambda (png)
+     (if (not png)
+         (progn
+           (kitty-gfx--log "async-prepare: conversion failed, dropping %s" file)
+           (kitty-gfx--cache-remove file)
+           (dolist (buf (buffer-list))
+             (with-current-buffer buf
+               (dolist (ov (copy-sequence kitty-gfx--overlays))
+                 (when (equal (overlay-get ov 'kitty-gfx-file) file)
+                   (kitty-gfx--remove-overlay ov))))))
+       (puthash file png kitty-gfx--sixel-cache)
+       (kitty-gfx--schedule-refresh t)))))
+
 ;;;###autoload
 (defun kitty-gfx-display-image (file &optional beg end max-cols max-rows)
   "Display image FILE in the current buffer.
@@ -2969,8 +3298,12 @@ BEG/END span the overlay region.  MAX-COLS/MAX-ROWS limit size."
                     abs-file image-id cols rows start stop (if cached-id "yes" "no"))
     ;; Prepare image if not cached (backend-specific: transmit or validate)
     (unless cached-id
-      (when (funcall (kitty-gfx--backend-fn 'prepare) abs-file image-id)
-        (kitty-gfx--cache-put abs-file image-id)))
+      (if (kitty-gfx--async-prepare-p abs-file)
+          (progn
+            (kitty-gfx--cache-put abs-file image-id)
+            (kitty-gfx--start-async-prepare abs-file))
+        (when (funcall (kitty-gfx--backend-fn 'prepare) abs-file image-id)
+          (kitty-gfx--cache-put abs-file image-id))))
     ;; Create overlay with blank space (even for cached images, dims are fresh)
     (when (or cached-id (gethash abs-file kitty-gfx--image-cache))
       (let ((ov (kitty-gfx--make-overlay start stop image-id cols rows abs-file)))
@@ -3018,8 +3351,12 @@ The buffer should be writable (caller handles `inhibit-read-only')."
            (cached-id (kitty-gfx--cache-get abs-file))
            (image-id (or cached-id (kitty-gfx--alloc-id))))
       (unless cached-id
-        (when (funcall (kitty-gfx--backend-fn 'prepare) abs-file image-id)
-          (kitty-gfx--cache-put abs-file image-id)))
+        (if (kitty-gfx--async-prepare-p abs-file)
+            (progn
+              (kitty-gfx--cache-put abs-file image-id)
+              (kitty-gfx--start-async-prepare abs-file))
+          (when (funcall (kitty-gfx--backend-fn 'prepare) abs-file image-id)
+            (kitty-gfx--cache-put abs-file image-id))))
       ;; Create overlay at the scaled dimensions.
       (when (or cached-id (gethash abs-file kitty-gfx--image-cache))
         (kitty-gfx--make-overlay img-start (point) image-id
@@ -3199,6 +3536,7 @@ The buffer should be writable (caller handles `inhibit-read-only')."
               (kitty-gfx--query-text-sizing-support))
             (kitty-gfx--install-hooks)
             (kitty-gfx--install-integrations)
+            (kitty-gfx--invalidate-window-signatures)
             ;; Sixel backend silently drops images when no encoder is on
             ;; PATH.  Warn loudly so users notice before they wonder why
             ;; nothing renders.
@@ -3231,6 +3569,8 @@ will render even though detection reports Sixel as supported."
     (kitty-gfx--cleanup-all-terminals)
     (when kitty-gfx--render-timer
       (cancel-timer kitty-gfx--render-timer))
+    (kitty-gfx--transmit-queue-reset)
+    (kitty-gfx--invalidate-window-signatures)
     (setq kitty-gfx--render-timer nil
           kitty-gfx--refresh-pending nil
           kitty-gfx--active-backend nil
@@ -3261,10 +3601,17 @@ are deferred to the first refresh in which FRAME is the selected frame
   "Free kitty-graphics state bound to TERM as it is being deleted.
 Runs on `delete-terminal-functions': stops any video/browser launched on
 TERM and drops its per-client parameters (backend, cell size, text-sizing,
-transmitted set).  The terminal's stored images need no explicit deletion
-- they vanish with the terminal."
+transmitted set) plus any transmits still queued for it.  The terminal's
+stored images need no explicit deletion - they vanish with the terminal."
   (kitty-gfx--stop-terminal-processes term)
-  (kitty-gfx--clear-terminal-state term))
+  (kitty-gfx--clear-terminal-state term)
+  (setq kitty-gfx--transmit-queue
+        (cl-remove-if (lambda (entry) (eq (nth 0 entry) term))
+                      kitty-gfx--transmit-queue))
+  (when (and (null kitty-gfx--transmit-queue)
+             kitty-gfx--transmit-drain-timer)
+    (cancel-timer kitty-gfx--transmit-drain-timer)
+    (setq kitty-gfx--transmit-drain-timer nil)))
 
 (defun kitty-gfx--install-hooks ()
   "Install redisplay hooks for image refresh."
@@ -3365,6 +3712,7 @@ inside a fold).  Heading overlays use nuke-and-repaint: erase all,
 then let the refresh cycle re-emit the visible ones."
   (kitty-gfx--log "on-org-cycle: overlays=%d" (length kitty-gfx--overlays))
   (when (and kitty-graphics-mode kitty-gfx--overlays)
+    (kitty-gfx--invalidate-window-signatures)
     (kitty-gfx--sync-begin)
     (unwind-protect
         (dolist (ov kitty-gfx--overlays)
