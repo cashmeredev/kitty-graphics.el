@@ -3293,16 +3293,51 @@ return stale coordinates."
                            (setq kitty-gfx--refresh-pending nil)
                            (kitty-gfx--refresh)))))))
 
+(defun kitty-gfx--heading-erase-window-blocks (win)
+  "Erase WIN's emitted heading blocks at their cached coordinates.
+Must run before WIN is redrawn (`window-scroll-functions' time), while
+the cached positions still match the glass: Emacs's tty redisplay may
+redraw lines instead of scrolling, which leaves the old multicell
+block painted at its absolute rows where new text only partially
+overwrites it.  Clears the emitted state and position cache but keeps
+the space reservation, so the window does not reflow mid-scroll and
+the scheduled refresh re-places each heading at its new coordinates."
+  (let ((blocks nil))
+    (dolist (ov (buffer-local-value 'kitty-gfx--overlays (window-buffer win)))
+      (when (and (overlay-buffer ov)
+                 (overlay-get ov 'kitty-gfx-heading)
+                 (overlay-get ov 'kitty-gfx-heading-emitted)
+                 (overlay-get ov 'kitty-gfx-last-row)
+                 (overlay-get ov 'kitty-gfx-last-col)
+                 (memq (overlay-get ov 'window) (list nil win)))
+        (push ov blocks)))
+    (when blocks
+      (kitty-gfx--with-terminal (frame-terminal (window-frame win))
+        (kitty-gfx--sync-begin)
+        (unwind-protect
+            (dolist (ov blocks)
+              (kitty-gfx--erase-heading-at
+               (overlay-get ov 'kitty-gfx-last-row)
+               (overlay-get ov 'kitty-gfx-last-col)
+               (or (overlay-get ov 'kitty-gfx-cols) 0)
+               (or (overlay-get ov 'kitty-gfx-rows) 1))
+              (overlay-put ov 'kitty-gfx-heading-emitted nil)
+              (overlay-put ov 'kitty-gfx-last-row nil)
+              (overlay-put ov 'kitty-gfx-last-col nil))
+          (kitty-gfx--sync-end))))))
+
 (defun kitty-gfx--on-window-scroll (win _new-start)
   "Handle window scroll for image refresh.
 Also extends heading instrumentation around WIN's new region when
-visible-only heading scanning is active."
+visible-only heading scanning is active, and erases WIN's emitted
+heading blocks while their cached coordinates are still valid."
   (when (and kitty-gfx-heading-scan-visible-only
              (buffer-local-value 'kitty-gfx--heading-sizes-enabled
                                  (window-buffer win)))
     (kitty-gfx--heading-scan-window win))
   (when (buffer-local-value 'kitty-gfx--overlays (window-buffer win))
     (kitty-gfx--log "on-scroll: win=%s buf=%s" win (buffer-name (window-buffer win)))
+    (kitty-gfx--heading-erase-window-blocks win)
     (set-window-parameter win 'kitty-gfx-sig nil)
     (kitty-gfx--schedule-refresh)))
 
