@@ -658,6 +658,26 @@ activation via `kitty-gfx-org-heading-sizes'."
   :type 'boolean
   :group 'kitty-graphics)
 
+(defcustom kitty-gfx-heading-scan-visible-only t
+  "When non-nil, instrument org headings only around the visible region.
+Heading overlays are created lazily for the displayed window region
+plus a margin of two screenfuls in each direction, driven by scroll
+and window-change hooks.  Keeps activation cheap in buffers with
+thousands of headings.  Set to nil to scan the whole buffer up front
+\(the pre-0.7 behavior)."
+  :type 'boolean
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-heading-conflicting-modes
+  '(org-modern-mode org-appear-mode org-indent-mode visual-line-mode olivetti-mode)
+  "Minor modes temporarily disabled while OSC 66 heading sizes are active.
+These modes attach display properties, virtual indentation, soft
+wrapping, or window margins that corrupt the heading position math or
+the OSC 66 payload.  Their prior state is saved and restored when
+heading sizes are turned off."
+  :type '(repeat symbol)
+  :group 'kitty-graphics)
+
 (defvar kitty-gfx--image-cache (make-hash-table :test 'equal)
   "Maps file paths to image IDs (integers).
 Only stores the terminal-side image ID — display dimensions are
@@ -741,8 +761,14 @@ nil means not yet queried.  Possible values after query:
 
 (defvar-local kitty-gfx--heading-rescan-timer nil
   "Timer for debouncing heading re-scans after text edits.
-Prevents queuing redundant `kitty-gfx--org-apply-heading-sizes'
-calls when multiple characters are typed rapidly.")
+Prevents queuing redundant stale-heading updates when multiple
+characters are typed rapidly.")
+
+(defvar-local kitty-gfx--heading-sizes-enabled nil
+  "Non-nil while scaled heading sizes are active in this org buffer.
+Set by `kitty-gfx-org-heading-sizes' and the auto-enable hook;
+consulted by the scroll/window-change hooks that drive
+visible-region heading scans.")
 
 (defvar-local kitty-gfx--mpv-process nil
   "The mpv process object for the current buffer's video.")
@@ -1950,7 +1976,7 @@ Does NOT emit any OSC 66 -- that happens during refresh."
          (frac-n (nth 1 decomposed))
          (frac-d (nth 2 decomposed))
          (rows cell-s)
-         (cols (* (length text) cell-s))
+         (cols (* (string-width text) cell-s))
          (ov (make-overlay beg end nil t nil)))
     (overlay-put ov 'kitty-gfx t)
     (overlay-put ov 'kitty-gfx-heading t)
@@ -1983,11 +2009,13 @@ Does NOT emit any OSC 66 -- that happens during refresh."
                             (make-list (1- cell-s) spaceline)))))
     ;; High priority so kitty-gfx overlays win over org-modern etc.
     (overlay-put ov 'priority 100)
-    ;; Remove overlay when heading text is edited; rescan will
-    ;; re-create it with updated text.
+    ;; Mark the overlay stale when the heading text is edited; the
+    ;; debounced rescan updates it in place (no remove/re-create blink).
     (overlay-put ov 'modification-hooks
                  (list #'kitty-gfx--heading-modified))
     (overlay-put ov 'insert-in-front-hooks
+                 (list #'kitty-gfx--heading-modified))
+    (overlay-put ov 'insert-behind-hooks
                  (list #'kitty-gfx--heading-modified))
     (push ov kitty-gfx--overlays)
     (kitty-gfx--log "make-heading-ov: L%d scale=%.2f s=%d n=%d d=%d text=%S beg=%d end=%d"
@@ -1996,22 +2024,103 @@ Does NOT emit any OSC 66 -- that happens during refresh."
 
 (defun kitty-gfx--heading-modified (ov after &rest _args)
   "Modification hook for heading overlays.
-When the heading text is edited (AFTER is non-nil), remove the
-stale overlay and schedule a rescan to re-create it."
+When the heading text is edited (AFTER is non-nil), the overlay stays
+in place: it is marked stale, its emitted multicell block is erased,
+and its display property is dropped so the live buffer text shows at
+normal size while typing.  A debounced rescan then updates the overlay
+in place (or removes it when the line is no longer a heading)."
   (when (and after (overlay-buffer ov))
-    (kitty-gfx--log "heading-modified: removing stale overlay at %d"
-                     (overlay-start ov))
-    (kitty-gfx--remove-overlay ov)
-    ;; Debounced rescan — don't re-scan on every keystroke
+    (unless (overlay-get ov 'kitty-gfx-heading-stale)
+      (kitty-gfx--log "heading-modified: marking overlay stale at %d"
+                       (overlay-start ov))
+      (overlay-put ov 'kitty-gfx-heading-stale t)
+      (overlay-put ov 'kitty-gfx-heading-emitted nil)
+      (overlay-put ov 'display nil)
+      (when (overlay-get ov 'kitty-gfx-last-row)
+        (kitty-gfx--erase-heading-at (overlay-get ov 'kitty-gfx-last-row)
+                                     (overlay-get ov 'kitty-gfx-last-col)
+                                     (or (overlay-get ov 'kitty-gfx-cols) 0)
+                                     (or (overlay-get ov 'kitty-gfx-rows) 1))
+        (overlay-put ov 'kitty-gfx-last-row nil)
+        (overlay-put ov 'kitty-gfx-last-col nil)))
     (when kitty-gfx--heading-rescan-timer
       (cancel-timer kitty-gfx--heading-rescan-timer))
     (setq kitty-gfx--heading-rescan-timer
-          (run-at-time 0.2 nil
-                       (lambda ()
-                         (setq kitty-gfx--heading-rescan-timer nil)
-                         (when (and kitty-graphics-mode
-                                    (derived-mode-p 'org-mode))
-                           (kitty-gfx--org-apply-heading-sizes)))))))
+          (let ((buf (current-buffer)))
+            (run-at-time 0.2 nil
+                         (lambda ()
+                           (when (buffer-live-p buf)
+                             (with-current-buffer buf
+                               (setq kitty-gfx--heading-rescan-timer nil)
+                               (kitty-gfx--heading-rescan-stale)))))))))
+
+(defun kitty-gfx--heading-rescan-stale ()
+  "Update every stale heading overlay in the current buffer in place.
+Overlays whose line still matches `org-heading-regexp' are re-anchored
+and refreshed via `kitty-gfx--heading-update-overlay'; the rest are
+removed and their line is re-scanned so a heading whose level (and thus
+scale) changed gets a fresh overlay."
+  (when (and kitty-graphics-mode (derived-mode-p 'org-mode))
+    (let ((changed 0))
+      (dolist (ov (copy-sequence kitty-gfx--overlays))
+        (when (and (overlay-get ov 'kitty-gfx-heading)
+                   (overlay-get ov 'kitty-gfx-heading-stale)
+                   (overlay-buffer ov))
+          (cl-incf changed)
+          (unless (kitty-gfx--heading-update-overlay ov)
+            (let ((line-beg (save-excursion
+                              (goto-char (overlay-start ov))
+                              (line-beginning-position)))
+                  (line-end (save-excursion
+                              (goto-char (overlay-start ov))
+                              (line-end-position))))
+              (kitty-gfx--remove-overlay ov)
+              (kitty-gfx--org-apply-heading-sizes line-beg line-end)))))
+      (when (> changed 0)
+        (kitty-gfx--log "heading-rescan-stale: refreshed %d overlays" changed)
+        (kitty-gfx--schedule-refresh t)))))
+
+(defun kitty-gfx--heading-update-overlay (ov)
+  "Re-anchor stale heading overlay OV to its line and refresh its text.
+Returns non-nil when OV still covers a heading of unchanged scale and
+was updated in place; nil when the caller should remove it (line is no
+longer a heading, the level's scale changed, or another heading overlay
+already owns the line)."
+  (save-excursion
+    (goto-char (overlay-start ov))
+    (let ((line-beg (line-beginning-position))
+          (line-end (line-end-position)))
+      (goto-char line-beg)
+      (when (and (< line-beg line-end)
+                 (looking-at org-heading-regexp)
+                 (not (cl-some (lambda (other)
+                                 (and (not (eq other ov))
+                                      (overlay-get other 'kitty-gfx-heading)
+                                      (not (overlay-get other 'kitty-gfx-heading-stale))))
+                               (overlays-in line-beg line-end))))
+        (let* ((level (org-current-level))
+               (scale (and level (alist-get level kitty-gfx-heading-scales)))
+               (cell-s (overlay-get ov 'kitty-gfx-heading-cell-s))
+               (decomposed (and scale (kitty-gfx--decompose-scale scale))))
+          (when (and scale (> scale 1.0)
+                     (= cell-s (nth 0 decomposed)))
+            (let* ((raw (org-get-heading t t t t))
+                   (text (substring-no-properties
+                          (if (fboundp 'org-link-display-format)
+                              (org-link-display-format raw)
+                            raw))))
+              (move-overlay ov line-beg line-end)
+              (overlay-put ov 'kitty-gfx-heading-text text)
+              (overlay-put ov 'kitty-gfx-heading-scale (float scale))
+              (overlay-put ov 'kitty-gfx-heading-frac-n (nth 1 decomposed))
+              (overlay-put ov 'kitty-gfx-heading-frac-d (nth 2 decomposed))
+              (overlay-put ov 'kitty-gfx-heading-level level)
+              (overlay-put ov 'kitty-gfx-cols (* (string-width text) cell-s))
+              (overlay-put ov 'display text)
+              (overlay-put ov 'kitty-gfx-heading-stale nil)
+              (overlay-put ov 'kitty-gfx-heading-emitted nil)
+              (kitty-gfx--log "heading-update: L%d re-anchored text=%S" level text)
+              t)))))))
 
 (defun kitty-gfx--org-apply-heading-sizes (&optional beg end)
   "Scan org headings in region BEG..END and create scaled overlays.
@@ -2047,11 +2156,59 @@ a kitty-gfx heading overlay."
       (when (> count 0)
         (kitty-gfx--schedule-refresh t)))))
 
+(defun kitty-gfx--heading-scan-window (win)
+  "Apply heading sizes around WIN's displayed region.
+Scans from two screenfuls above `window-start' to two screenfuls
+below `window-end'.  Idempotent: already-instrumented headings are
+skipped by `kitty-gfx--org-apply-heading-sizes'.  No-op unless WIN's
+buffer has heading sizes enabled."
+  (when (window-live-p win)
+    (with-current-buffer (window-buffer win)
+      (when (and kitty-gfx--heading-sizes-enabled
+                 (derived-mode-p 'org-mode))
+        (let ((margin (* 2 (max 1 (window-body-height win)))))
+          (save-excursion
+            (goto-char (window-start win))
+            (forward-line (- margin))
+            (let ((beg (point)))
+              (goto-char (or (window-end win t) (point-max)))
+              (forward-line margin)
+              (kitty-gfx--org-apply-heading-sizes beg (point)))))))))
+
+(defun kitty-gfx--heading-scan-visible ()
+  "Run a visible-region heading scan for every relevant window.
+Covers windows whose buffer has heading sizes enabled when
+`kitty-gfx-heading-scan-visible-only' is active."
+  (when kitty-gfx-heading-scan-visible-only
+    (walk-windows
+     (lambda (w)
+       (when (buffer-local-value 'kitty-gfx--heading-sizes-enabled
+                                 (window-buffer w))
+         (kitty-gfx--heading-scan-window w)))
+     nil 'visible)))
+
+(defun kitty-gfx--heading-apply-initial ()
+  "Instrument headings after enabling sizes in the current buffer.
+Scans only the displayed viewport when
+`kitty-gfx-heading-scan-visible-only' is non-nil (later regions are
+picked up by the scroll and window-change hooks); otherwise scans the
+whole buffer."
+  (if kitty-gfx-heading-scan-visible-only
+      (let ((win (get-buffer-window)))
+        (when win
+          (kitty-gfx--heading-scan-window win)))
+    (kitty-gfx--org-apply-heading-sizes)))
+
 (defun kitty-gfx--org-remove-heading-sizes ()
-  "Remove all heading size overlays from the current buffer."
+  "Remove all heading size overlays from the current buffer.
+Erases each overlay's emitted multicell block first so no scaled
+glyphs linger on the terminal."
+  (setq kitty-gfx--heading-sizes-enabled nil)
   (let ((count 0))
     (dolist (ov (overlays-in (point-min) (point-max)))
       (when (overlay-get ov 'kitty-gfx-heading)
+        (when (overlay-get ov 'kitty-gfx-last-row)
+          (kitty-gfx--erase-heading ov))
         (kitty-gfx--remove-overlay ov)
         (cl-incf count)))
     (kitty-gfx--log "remove-heading-sizes: removed %d" count)))
@@ -2062,19 +2219,16 @@ Used to restore conflicting minor modes when heading sizes are disabled.")
 
 (defun kitty-gfx--heading-disable-conflicting ()
   "Disable minor modes that conflict with OSC 66 heading rendering.
-Saves their state for restoration by `kitty-gfx--heading-restore-modes'.
-Conflicts: org-modern (overlay display props), org-appear (emphasis toggling),
-org-indent (virtual indentation), visual-line-mode (line wrapping),
-olivetti-mode (window margins shift position calculations)."
+The modes come from `kitty-gfx-heading-conflicting-modes'; their state
+is saved for restoration by `kitty-gfx--heading-restore-modes'.
+Folded headings are left alone — they are skipped during rendering via
+`kitty-gfx--in-folded-region-p'."
   (setq kitty-gfx--heading-saved-modes nil)
-  (dolist (mode '(org-modern-mode org-appear-mode org-indent-mode visual-line-mode olivetti-mode))
-    (when (and (boundp mode) (symbol-value mode))
+  (dolist (mode kitty-gfx-heading-conflicting-modes)
+    (when (and (boundp mode) (symbol-value mode) (fboundp mode))
       (push (cons mode t) kitty-gfx--heading-saved-modes)
       (funcall mode -1)
       (kitty-gfx--log "heading-preview: disabled %s" mode)))
-  ;; Unfold all headings so positions are stable
-  (when (fboundp 'org-fold-show-all)
-    (org-fold-show-all))
   (when kitty-gfx--heading-saved-modes
     (kitty-gfx--log "heading-preview: saved modes=%S" kitty-gfx--heading-saved-modes)))
 
@@ -2089,9 +2243,10 @@ olivetti-mode (window margins shift position calculations)."
 ;;;###autoload
 (defun kitty-gfx-org-heading-sizes (&optional arg)
   "Toggle scaled heading sizes in the current org buffer.
-Enters a clean preview mode: conflicting minor modes (org-modern,
-org-appear, org-indent, visual-line-mode) are temporarily disabled
-and headings are unfolded.  Toggling off restores previous state.
+Enters a clean preview mode: the minor modes listed in
+`kitty-gfx-heading-conflicting-modes' are temporarily disabled.
+Folding is preserved; folded headings render as plain text until
+revealed.  Toggling off restores previous state.
 With prefix ARG, force remove heading sizes."
   (interactive "P")
   (unless (derived-mode-p 'org-mode)
@@ -2104,8 +2259,9 @@ With prefix ARG, force remove heading sizes."
         (kitty-gfx--org-remove-heading-sizes)
         (kitty-gfx--heading-restore-modes)
         (message "Heading sizes removed, modes restored"))
+    (setq kitty-gfx--heading-sizes-enabled t)
     (kitty-gfx--heading-disable-conflicting)
-    (kitty-gfx--org-apply-heading-sizes)
+    (kitty-gfx--heading-apply-initial)
     (message "Heading sizes applied (preview mode — conflicting modes disabled)")))
 
 ;;;; Position mapping
@@ -2188,6 +2344,28 @@ range, inside a folded region, or not visible on screen."
 
 ;;;; Refresh cycle
 
+(defun kitty-gfx--terminal-image-rows (term)
+  "Return the list of terminal rows covered by image placements on TERM.
+Reads the per-window placements recorded by
+`kitty-gfx--record-image-placement' across all buffers, keeping only
+windows that live on TERM.  Used to keep scaled headings from
+overwriting image pixels."
+  (let ((rows nil))
+    (dolist (buf (buffer-list))
+      (dolist (ov (buffer-local-value 'kitty-gfx--overlays buf))
+        (unless (overlay-get ov 'kitty-gfx-heading)
+          (dolist (placement (overlay-get ov 'kitty-gfx-placements))
+            (let ((win (car placement))
+                  (data (cdr placement)))
+              (when (and (window-live-p win)
+                         (eq (frame-terminal (window-frame win)) term))
+                (let ((row (plist-get data :row))
+                      (span (plist-get data :rows)))
+                  (when (and row span)
+                    (dotimes (r span)
+                      (push (+ row r) rows))))))))))
+    rows))
+
 (defun kitty-gfx--emit-heading-overlays (term)
   "Phase 2: emit OSC 66 for visible heading overlays on terminal TERM.
 Runs inside the caller's `kitty-gfx--with-terminal' + synchronized-output
@@ -2195,44 +2373,49 @@ block, so phase-1 placement and phase-2 emission stay in one terminal
 frame (interleaved Emacs redisplay would otherwise corrupt freshly-placed
 multicell blocks).  Only buffers with a visible window on TERM are
 processed.  Skips headings already emitted at their current position and
-detects row collisions — if two headings would occupy overlapping terminal
-rows, the later one is skipped to prevent multicell block corruption."
-  (dolist (buf (buffer-list))
-    (when (buffer-live-p buf)
-      (with-current-buffer buf
-        (when (and kitty-gfx--overlays
-                   (cl-find-if (lambda (w)
-                                 (eq (frame-terminal (window-frame w)) term))
-                               (get-buffer-window-list buf nil 'visible)))
-          (let ((occupied (make-hash-table :test 'eql)))
-            ;; First pass: mark rows occupied by already-emitted headings
-            (dolist (ov kitty-gfx--overlays)
-              (when (and (overlay-get ov 'kitty-gfx-heading)
-                         (overlay-get ov 'kitty-gfx-heading-emitted)
-                         (overlay-get ov 'kitty-gfx-last-row))
-                (let ((row (overlay-get ov 'kitty-gfx-last-row))
-                      (rows (or (overlay-get ov 'kitty-gfx-rows) 1)))
-                  (dotimes (r rows)
-                    (puthash (+ row r) t occupied)))))
-            ;; Second pass: emit new headings, checking for row conflicts
-            (dolist (ov kitty-gfx--overlays)
-              (when (and (overlay-get ov 'kitty-gfx-heading)
-                         (overlay-get ov 'kitty-gfx-last-row)
-                         (not (overlay-get ov 'kitty-gfx-heading-emitted)))
-                (let* ((row (overlay-get ov 'kitty-gfx-last-row))
-                       (rows (or (overlay-get ov 'kitty-gfx-rows) 1))
-                       (conflict nil))
-                  ;; Check if any target row is already occupied
-                  (dotimes (r rows)
-                    (when (gethash (+ row r) occupied)
-                      (setq conflict t)))
-                  (if conflict
-                      (kitty-gfx--log "emit-heading: SKIP L%d row=%d (row conflict)"
-                                      (overlay-get ov 'kitty-gfx-heading-level) row)
-                    ;; No conflict — place and mark rows
+detects row collisions — if a heading would occupy terminal rows already
+taken by another heading or by an image placement, it is skipped to
+prevent multicell block / pixel corruption."
+  (let ((image-rows (kitty-gfx--terminal-image-rows term)))
+    (dolist (buf (buffer-list))
+      (when (buffer-live-p buf)
+        (with-current-buffer buf
+          (when (and kitty-gfx--overlays
+                     (cl-find-if (lambda (w)
+                                   (eq (frame-terminal (window-frame w)) term))
+                                 (get-buffer-window-list buf nil 'visible)))
+            (let ((occupied (make-hash-table :test 'eql)))
+              (dolist (r image-rows)
+                (puthash r t occupied))
+              ;; First pass: mark rows occupied by already-emitted headings
+              (dolist (ov kitty-gfx--overlays)
+                (when (and (overlay-get ov 'kitty-gfx-heading)
+                           (overlay-get ov 'kitty-gfx-heading-emitted)
+                           (overlay-get ov 'kitty-gfx-last-row))
+                  (let ((row (overlay-get ov 'kitty-gfx-last-row))
+                        (rows (or (overlay-get ov 'kitty-gfx-rows) 1)))
                     (dotimes (r rows)
-                      (puthash (+ row r) t occupied))
-                    (kitty-gfx--place-heading ov)))))))))))
+                      (puthash (+ row r) t occupied)))))
+              ;; Second pass: emit new headings, checking for row conflicts
+              (dolist (ov kitty-gfx--overlays)
+                (when (and (overlay-get ov 'kitty-gfx-heading)
+                           (overlay-get ov 'kitty-gfx-last-row)
+                           (not (overlay-get ov 'kitty-gfx-heading-stale))
+                           (not (overlay-get ov 'kitty-gfx-heading-emitted)))
+                  (let* ((row (overlay-get ov 'kitty-gfx-last-row))
+                         (rows (or (overlay-get ov 'kitty-gfx-rows) 1))
+                         (conflict nil))
+                    ;; Check if any target row is already occupied
+                    (dotimes (r rows)
+                      (when (gethash (+ row r) occupied)
+                        (setq conflict t)))
+                    (if conflict
+                        (kitty-gfx--log "emit-heading: SKIP L%d row=%d (row conflict)"
+                                        (overlay-get ov 'kitty-gfx-heading-level) row)
+                      ;; No conflict — place and mark rows
+                      (dotimes (r rows)
+                        (puthash (+ row r) t occupied))
+                      (kitty-gfx--place-heading ov))))))))))))
 
 (defun kitty-gfx--refresh-inhibited-p ()
   "Return non-nil if painting now would disturb user feedback.
@@ -2478,6 +2661,22 @@ refresh based on overlay type."
           (overlay-put ov 'kitty-gfx-last-row nil)
           (overlay-put ov 'kitty-gfx-last-col nil)))))))
 
+(defun kitty-gfx--heading-canonical-window (buf term)
+  "Return the single window that renders BUF's scaled headings on TERM.
+Mirrors `kitty-gfx--browser-canonical-window': prefers the selected
+window when it shows BUF on TERM, else the first visible window on
+TERM.  Heading overlays cache one terminal position, so only one
+window per buffer and terminal can show the OSC 66 rendering; the
+others keep plain text."
+  (let ((sel (selected-window)))
+    (if (and (window-live-p sel)
+             (eq (window-buffer sel) buf)
+             (eq (frame-terminal (window-frame sel)) term))
+        sel
+      (cl-find-if (lambda (w)
+                    (eq (frame-terminal (window-frame w)) term))
+                  (get-buffer-window-list buf nil 'visible)))))
+
 (defun kitty-gfx--refresh-heading-overlay (ov win win-bottom)
   "Refresh heading overlay OV in WIN.
 WIN-BOTTOM is WIN's bottom edge.  Phase 1 of two-phase heading
@@ -2485,32 +2684,42 @@ refresh: computes screen position, erases old multicell block if
 heading moved or became hidden, and caches the new position.  Does
 NOT emit OSC 66 — that happens in phase 2
 (`kitty-gfx--emit-heading-overlays') to avoid posn-at-point redraws
-destroying freshly-placed blocks."
-  (let ((pos (kitty-gfx--overlay-screen-pos ov win))
-        (rows (overlay-get ov 'kitty-gfx-rows))
-        (last-row (overlay-get ov 'kitty-gfx-last-row))
-        (last-col (overlay-get ov 'kitty-gfx-last-col)))
-    (if (and pos
-             (<= (car pos) win-bottom)
-             (<= (+ (car pos) rows -1) win-bottom))
-        ;; Visible — erase old position if moved, cache new
-        (let ((new-row (car pos))
-              (new-col (cdr pos)))
-          (when (and last-row
-                     (not (and (eql new-row last-row)
-                               (eql new-col last-col))))
-            ;; Heading moved — erase at old position
-            (kitty-gfx--erase-heading ov))
-          (overlay-put ov 'kitty-gfx-last-row new-row)
-          (overlay-put ov 'kitty-gfx-last-col new-col)
-          (kitty-gfx--log "refresh-heading: L%d visible at row=%d col=%d"
-                           (overlay-get ov 'kitty-gfx-heading-level)
-                           new-row new-col))
-      ;; Not visible — erase if was placed, clear cache
-      (when last-row
-        (kitty-gfx--erase-heading ov))
-      (overlay-put ov 'kitty-gfx-last-row nil)
-      (overlay-put ov 'kitty-gfx-last-col nil))))
+destroying freshly-placed blocks.  Stale overlays (mid-edit) are left
+untouched, and only the canonical window for the buffer+terminal pair
+is processed; the overlay's `window' property is pinned to it so other
+windows showing the buffer display plain heading text."
+  (when (and (not (overlay-get ov 'kitty-gfx-heading-stale))
+             (eq win (kitty-gfx--heading-canonical-window
+                      (overlay-buffer ov)
+                      (frame-terminal (window-frame win)))))
+    (unless (eq (overlay-get ov 'window) win)
+      (overlay-put ov 'window win)
+      (kitty-gfx--schedule-refresh t))
+    (let ((pos (kitty-gfx--overlay-screen-pos ov win))
+          (rows (overlay-get ov 'kitty-gfx-rows))
+          (last-row (overlay-get ov 'kitty-gfx-last-row))
+          (last-col (overlay-get ov 'kitty-gfx-last-col)))
+      (if (and pos
+               (<= (car pos) win-bottom)
+               (<= (+ (car pos) rows -1) win-bottom))
+          ;; Visible — erase old position if moved, cache new
+          (let ((new-row (car pos))
+                (new-col (cdr pos)))
+            (when (and last-row
+                       (not (and (eql new-row last-row)
+                                 (eql new-col last-col))))
+              ;; Heading moved — erase at old position
+              (kitty-gfx--erase-heading ov))
+            (overlay-put ov 'kitty-gfx-last-row new-row)
+            (overlay-put ov 'kitty-gfx-last-col new-col)
+            (kitty-gfx--log "refresh-heading: L%d visible at row=%d col=%d"
+                             (overlay-get ov 'kitty-gfx-heading-level)
+                             new-row new-col))
+        ;; Not visible — erase if was placed, clear cache
+        (when last-row
+          (kitty-gfx--erase-heading ov))
+        (overlay-put ov 'kitty-gfx-last-row nil)
+        (overlay-put ov 'kitty-gfx-last-col nil)))))
 
 (defvar kitty-gfx--refresh-pending nil
   "Non-nil if a refresh was requested during the cooldown period.")
@@ -2553,7 +2762,13 @@ return stale coordinates."
                            (kitty-gfx--refresh)))))))
 
 (defun kitty-gfx--on-window-scroll (win _new-start)
-  "Handle window scroll for image refresh."
+  "Handle window scroll for image refresh.
+Also extends heading instrumentation around WIN's new region when
+visible-only heading scanning is active."
+  (when (and kitty-gfx-heading-scan-visible-only
+             (buffer-local-value 'kitty-gfx--heading-sizes-enabled
+                                 (window-buffer win)))
+    (kitty-gfx--heading-scan-window win))
   (when (buffer-local-value 'kitty-gfx--overlays (window-buffer win))
     (kitty-gfx--log "on-scroll: win=%s buf=%s" win (buffer-name (window-buffer win)))
     (set-window-parameter win 'kitty-gfx-sig nil)
@@ -2562,8 +2777,11 @@ return stale coordinates."
 (defun kitty-gfx--on-buffer-change (_frame-or-window)
   "Handle buffer change for image refresh.
 Deletes placements for buffers no longer visible in any window,
-then invalidates position caches and schedules a refresh."
+then invalidates position caches and schedules a refresh.
+Newly displayed org buffers with heading sizes enabled get their
+viewport instrumented via `kitty-gfx--heading-scan-visible'."
   (kitty-gfx--log "on-buffer-change: cleaning up non-visible placements")
+  (kitty-gfx--heading-scan-visible)
   (kitty-gfx--invalidate-window-signatures)
   ;; Find which buffers are currently visible
   (let ((visible-bufs nil))
@@ -2643,6 +2861,7 @@ to let Emacs finish window layout transitions (e.g., when closing a
 split, Emacs briefly shows two windows for the same buffer before
 settling to one)."
   (kitty-gfx--log "on-window-change: deleting stale placements and invalidating cell size")
+  (kitty-gfx--heading-scan-visible)
   (kitty-gfx--invalidate-window-signatures)
   (setq kitty-gfx--cell-pixel-width nil
         kitty-gfx--cell-pixel-height nil)
@@ -3700,12 +3919,14 @@ disabling conflicting minor modes."
              (not (display-graphic-p)))
     ;; Use run-at-time 0 so conflicting modes have finished
     ;; their own org-mode-hook setup before we disable them.
-    (run-at-time 0 nil
-                 (lambda ()
-                   (when (buffer-live-p (current-buffer))
-                     (with-current-buffer (current-buffer)
-                       (kitty-gfx--heading-disable-conflicting)
-                       (kitty-gfx--org-apply-heading-sizes)))))))
+    (let ((buf (current-buffer)))
+      (run-at-time 0 nil
+                   (lambda ()
+                     (when (buffer-live-p buf)
+                       (with-current-buffer buf
+                         (setq kitty-gfx--heading-sizes-enabled t)
+                         (kitty-gfx--heading-disable-conflicting)
+                         (kitty-gfx--heading-apply-initial))))))))
 
 (defun kitty-gfx--nuke-headings ()
   "Erase all heading multicell blocks in the current buffer.

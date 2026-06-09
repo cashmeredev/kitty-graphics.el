@@ -12,6 +12,22 @@ Transmitting an image to a terminal that does not hold its data yet (a freshly a
 
 Base64 payloads are cached in memory keyed on file and mtime, bounded by new ~kitty-gfx-base64-cache-bytes~ (default 64 MiB, LRU eviction), so sending the same image to a second terminal skips the read and encode cost.
 
+*** Headings
+
+OSC 66 heading widths are now computed with ~string-width~ instead of character count, so CJK and emoji headings get their full double-width footprint for placement, erase, and collision detection.
+
+Editing a scaled heading no longer makes it vanish and reappear: the overlay stays in place, the buffer text shows at normal size while you type, and a debounced rescan updates the heading text, width, and OSC 66 rendering in place. A line that stops being a heading (or moves to an unscaled level) drops its overlay cleanly, and typing at the end of the heading is now detected at all.
+
+Heading instrumentation is lazy by default: only the displayed window region plus two screenfuls of margin is scanned, driven by scroll and window-change hooks, which keeps activation instant in buffers with thousands of headings. New ~kitty-gfx-heading-scan-visible-only~ (default ~t~); set to ~nil~ for the old full-buffer scan.
+
+Scaled headings no longer overwrite inline images: the emit phase seeds its occupied-row set from the image placements recorded on the target terminal and skips any heading that would overlap them, exactly like heading-heading conflicts.
+
+Enabling heading sizes no longer unfolds the whole buffer; folded headings simply render as plain text until revealed, and fold cycling erases scaled blocks that fold away.
+
+The minor modes disabled while heading sizes are active are now customizable via new ~kitty-gfx-heading-conflicting-modes~ (default matches the old hardcoded list).
+
+When the same org buffer is shown in several windows, one canonical window per buffer and terminal (preferring the selected window) renders the scaled headings; the other windows show plain heading text instead of flickering. Per-window heading rendering is a known limitation.
+
 *** Features
 
 **** Multi-tty daemon support
