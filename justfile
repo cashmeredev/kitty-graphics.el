@@ -54,45 +54,45 @@ test-typst:
     @echo ">> M-x kitty-gfx-typst-preview     to render"
     @echo ">> M-x kitty-gfx-typst-clear-preview to clear"
     TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
-        --eval "(kitty-graphics-mode 1)" \
+        --eval "(when (bound-and-true-p kitty-graphics-mode) (kitty-graphics-mode -1))" --eval "(kitty-graphics-mode 1)" \
         --eval "(setq kitty-gfx-debug t)" \
         tests/test-typst.typ
 
 # Test org-mode inline images -- C-c C-x C-v after open
 test-org:
     TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
-        --eval "(kitty-graphics-mode 1)" \
+        --eval "(when (bound-and-true-p kitty-graphics-mode) (kitty-graphics-mode -1))" --eval "(kitty-graphics-mode 1)" \
         tests/test-kitty-gfx.org
 
 # Test text sizing protocol (OSC 66) on org headings
 test-headings file="tests/test-kitty-gfx.org":
     TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
         --eval "(setq kitty-gfx-heading-sizes-auto t)" \
-        --eval "(kitty-graphics-mode 1)" \
+        --eval "(when (bound-and-true-p kitty-graphics-mode) (kitty-graphics-mode -1))" --eval "(kitty-graphics-mode 1)" \
         {{file}}
 
 # Test image-mode rendering
 test-image:
     TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
-        --eval "(kitty-graphics-mode 1)" \
+        --eval "(when (bound-and-true-p kitty-graphics-mode) (kitty-graphics-mode -1))" --eval "(kitty-graphics-mode 1)" \
         tests/test-image.png
 
 # Test doc-view / PDF rendering
 test-pdf:
     TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
-        --eval "(kitty-graphics-mode 1)" \
+        --eval "(when (bound-and-true-p kitty-graphics-mode) (kitty-graphics-mode -1))" --eval "(kitty-graphics-mode 1)" \
         tests/test-document.pdf
 
 # Test markdown-overlays integration
 test-markdown:
     TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
-        --eval "(kitty-graphics-mode 1)" \
+        --eval "(when (bound-and-true-p kitty-graphics-mode) (kitty-graphics-mode -1))" --eval "(kitty-graphics-mode 1)" \
         tests/test-markdown.md
 
 # Test LaTeX fragment preview in org-mode (C-c C-x C-l on a fragment)
 test-latex:
     TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
-        --eval "(kitty-graphics-mode 1)" \
+        --eval "(when (bound-and-true-p kitty-graphics-mode) (kitty-graphics-mode -1))" --eval "(kitty-graphics-mode 1)" \
         tests/test-kitty-gfx.org
 
 # One-shot daemon test.  Starts an ISOLATED daemon on socket `kgfx-test'
@@ -302,7 +302,7 @@ tmux:
         tmux set-option -as terminal-features "*:sixel"
         exec env TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
             --eval "(setq kitty-gfx-debug t kitty-gfx-enable-video t)" \
-            --eval "(kitty-graphics-mode 1)"
+            --eval "(when (bound-and-true-p kitty-graphics-mode) (kitty-graphics-mode -1))" --eval "(kitty-graphics-mode 1)"
     fi
     SESSION=kgfx
     SOCKET=/tmp/kgfx-tmux.sock
@@ -311,7 +311,7 @@ tmux:
     tmux -S "$SOCKET" new-session -d -s "$SESSION" -x 220 -y 50 \
         env TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l "$(pwd)/{{SRC}}" \
             --eval "(setq kitty-gfx-debug t kitty-gfx-enable-video t)" \
-            --eval "(kitty-graphics-mode 1)"
+            --eval "(when (bound-and-true-p kitty-graphics-mode) (kitty-graphics-mode -1))" --eval "(kitty-graphics-mode 1)"
     tmux -S "$SOCKET" set-option -t "$SESSION" -g allow-passthrough on
     tmux -S "$SOCKET" set-option -t "$SESSION" -as terminal-features "*:sixel"
     tmux -S "$SOCKET" set-option -t "$SESSION" -g default-terminal "screen-256color"
@@ -352,7 +352,7 @@ test-dirvish dir="~":
         -L "$(pwd)" \
         -l "{{SRC}}" \
         --eval "(setq kitty-gfx-debug t kitty-gfx-enable-video t)" \
-        --eval "(kitty-graphics-mode 1)" \
+        --eval "(when (bound-and-true-p kitty-graphics-mode) (kitty-graphics-mode -1))" --eval "(kitty-graphics-mode 1)" \
         --eval "(add-hook 'dired-mode-hook #'kitty-gfx-dired-auto-preview-mode)" \
         --eval "(require 'dirvish)" \
         --eval "(dirvish-override-dired-mode 1)" \
@@ -407,7 +407,7 @@ test-mpv video="":
     fi
     exec env TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
         --eval "(setq kitty-gfx-debug t kitty-gfx-enable-video t)" \
-        --eval "(kitty-graphics-mode 1)" \
+        --eval "(when (bound-and-true-p kitty-graphics-mode) (kitty-graphics-mode -1))" --eval "(kitty-graphics-mode 1)" \
         --eval "(when (> (length \"$video\") 0) (kitty-gfx-play-video \"$video\"))"
 
 # Launch terminal Emacs with the inline casty browser (Kitty only).
@@ -442,7 +442,7 @@ test-browser url="https://example.com":
         --eval "(setq kitty-gfx-debug t kitty-gfx-enable-browser t)" \
         --eval "(setq kitty-gfx-casty-program \"$casty\")" \
         --eval "(when (> (length \"$chrome\") 0) (setq kitty-gfx-casty-chrome \"$chrome\"))" \
-        --eval "(kitty-graphics-mode 1)" \
+        --eval "(when (bound-and-true-p kitty-graphics-mode) (kitty-graphics-mode -1))" --eval "(kitty-graphics-mode 1)" \
         --eval "(kitty-gfx-browse \"$url\")"
 
 # --- Headless typst checks --------------------------------------------------
@@ -504,7 +504,7 @@ test-sixel-image encoder="":
     TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
         --eval "(setq kitty-gfx-debug t kitty-gfx-preferred-protocol 'sixel)" \
         --eval '(when (> (length "{{encoder}}") 0) (setq kitty-gfx-sixel-encoder-program "{{encoder}}"))' \
-        --eval "(kitty-graphics-mode 1)" \
+        --eval "(when (bound-and-true-p kitty-graphics-mode) (kitty-graphics-mode -1))" --eval "(kitty-graphics-mode 1)" \
         tests/test-image.png
 
 # Open test-image.png inside tmux with sixel backend forced.
