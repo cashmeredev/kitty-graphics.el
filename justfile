@@ -30,6 +30,11 @@ lint:
 load:
     {{EMACS}} -Q -batch -l {{SRC}} -f kill-emacs
 
+# Batch self-tests + dry-run heading rendering scenarios
+test-batch:
+    {{EMACS}} -Q -batch -l {{SRC}} --eval "(kitty-gfx-run-self-tests)"
+    {{EMACS}} -Q -batch -l {{SRC}} -l tests/test-heading-scenarios.el
+
 # Remove generated artifacts
 clean:
     rm -f {{SRC}}c

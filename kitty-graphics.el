@@ -770,6 +770,15 @@ Set by `kitty-gfx-org-heading-sizes' and the auto-enable hook;
 consulted by the scroll/window-change hooks that drive
 visible-region heading scans.")
 
+(defvar kitty-gfx--heading-flush-needed nil
+  "Non-nil when a heading reservation changed during refresh phase 1.
+Set by `kitty-gfx--heading-sync-reservation' whenever an overlay's
+space-reservation display strings were just mutated.  Consumed by
+`kitty-gfx--refresh', which must flush those strings to the terminal
+with `redisplay' BEFORE phase 2 emits OSC 66 — otherwise the next
+redisplay would draw the spaces on top of the freshly painted
+multicell block and clip its leading glyphs.")
+
 (defvar-local kitty-gfx--mpv-process nil
   "The mpv process object for the current buffer's video.")
 
@@ -1760,7 +1769,8 @@ Pre-erases the target area using ECH before emitting, preventing
 artifacts from partial overwrites (adapted from mdfried's pattern).
 Sequence: save-cursor, erase-area, move-to-position, SGR-color,
 OSC-66-payload, SGR-reset, restore-cursor."
-  (let* ((raw-text (overlay-get ov 'kitty-gfx-heading-text))
+  (let* ((raw-text (or (overlay-get ov 'kitty-gfx-render-text)
+                       (overlay-get ov 'kitty-gfx-heading-text)))
          ;; Strip text properties — org-modern, font-lock, etc. can
          ;; attach display/face properties that corrupt OSC 66 payload.
          (text (substring-no-properties raw-text))
@@ -1783,21 +1793,10 @@ OSC-66-payload, SGR-reset, restore-cursor."
     ;; This prevents ghost artifacts from previous content or
     ;; partially-overwritten multicell blocks.
     (kitty-gfx--erase-heading-at row col (or cols 0) (or rows 1))
-    ;; Emit OSC 66 at the target position
     (kitty-gfx--terminal-send
      (format "\e7\e[%d;%dH%s\e]66;%s;%s\a\e[0m\e8"
              row col sgr meta text))
-    ;; After successful emission, switch display to spaces so Emacs
-    ;; incremental redraws don't overwrite the multicell block.
-    ;; Before first emission the overlay shows the plain heading text
-    ;; as a visible fallback (set in kitty-gfx--make-heading-overlay).
-    ;; Mark as emitted so subsequent refresh cycles skip re-emission.
-    ;; Cleared when heading moves, is erased, or becomes hidden.
-    (overlay-put ov 'kitty-gfx-heading-emitted t)
-    (let ((beg (overlay-start ov))
-          (end (overlay-end ov)))
-      (when (and beg end)
-        (overlay-put ov 'display (make-string (- end beg) ?\s))))))
+    (overlay-put ov 'kitty-gfx-heading-emitted t)))
 
 (defun kitty-gfx--erase-heading-at (row col cols rows)
   "Erase a heading multicell block at ROW, COL spanning COLS x ROWS cells.
@@ -1819,40 +1818,52 @@ Adapted from mdfried's erase-character dance."
                   (number-sequence 1 (1- rows)) "")
                "")))))
 
-(defun kitty-gfx--erase-heading (ov)
-  "Erase the multicell block of heading overlay OV at its cached position.
-Also restores the display property to the plain heading text so the
-heading is visible again (instead of spaces that hid it for OSC 66)."
-  (let ((row (overlay-get ov 'kitty-gfx-last-row))
-        (col (overlay-get ov 'kitty-gfx-last-col))
-        (cols (overlay-get ov 'kitty-gfx-cols))
-        (rows (overlay-get ov 'kitty-gfx-rows)))
-    (when (and row col)
-      (kitty-gfx--log "erase-heading: L%d row=%d col=%d cols=%d rows=%d"
-                       (overlay-get ov 'kitty-gfx-heading-level)
-                       row col (or cols 0) (or rows 0))
-      (kitty-gfx--erase-heading-at row col (or cols 0) (or rows 1))
-      ;; Restore display to plain text so the heading is readable
-      ;; until the next OSC 66 emission switches it back to spaces.
-      ;; Clear emitted flag so next refresh re-emits if heading
-      ;; becomes visible again.
-      (overlay-put ov 'kitty-gfx-heading-emitted nil)
-      ;; Restore display to plain text so the heading is readable
-      ;; until the next OSC 66 emission switches it back to spaces.
-      (let ((text (overlay-get ov 'kitty-gfx-heading-text)))
-        (when text
-          (overlay-put ov 'display (substring-no-properties text)))))))
+(defun kitty-gfx--heading-reset (ov)
+  "Drop heading overlay OV's cached position and show its plain text.
+Used whenever OV stops being rendered as a multicell block (scrolled
+out, folded away, collapsed, buffer hidden).  Deliberately sends NO
+erase sequence: the terminal scrolls or redraws those cells together
+with the buffer text Emacs knows about, so erasing at a cached
+position would wipe whatever content now lives there (issue seen as
+blanked body lines after fold/scroll)."
+  (overlay-put ov 'kitty-gfx-last-row nil)
+  (overlay-put ov 'kitty-gfx-last-col nil)
+  (overlay-put ov 'kitty-gfx-heading-emitted nil)
+  (let ((text (overlay-get ov 'kitty-gfx-heading-text)))
+    (when (and text (not (equal (overlay-get ov 'display) text)))
+      (overlay-put ov 'display text))))
 
-(defun kitty-gfx--heading-pin-terminal (ov)
-  "Return the terminal of heading overlay OV's pinned window, or nil.
-The pin is the `window' overlay property set by
-`kitty-gfx--refresh-heading-overlay'; its terminal is where OV's
-multicell block was emitted, so erases must be routed there rather
-than to whatever terminal happens to be selected."
-  (let ((pin (overlay-get ov 'window)))
-    (and (window-live-p pin)
-         (not (display-graphic-p (window-frame pin)))
-         (frame-terminal (window-frame pin)))))
+(defun kitty-gfx--heading-fit-text (text cell-s max-cols)
+  "Return the longest prefix of TEXT whose scaled width fits MAX-COLS.
+Each character of TEXT occupies (`char-width' * CELL-S) terminal
+columns when rendered as an OSC 66 multicell block."
+  (let ((i 0)
+        (width 0)
+        (len (length text)))
+    (while (and (< i len)
+                (<= (* (+ width (char-width (aref text i))) cell-s)
+                    max-cols))
+      (setq width (+ width (char-width (aref text i))))
+      (setq i (1+ i)))
+    (substring text 0 i)))
+
+(defun kitty-gfx--heading-sync-reservation (ov cols cell-s)
+  "Make OV reserve exactly COLS x CELL-S terminal cells with spaces.
+Sets the `display' property to COLS spaces and the `after-string' to
+\(CELL-S - 1) lines of COLS spaces, so Emacs's redisplay matrix tracks
+the precise rectangle the multicell block will occupy.  Flags
+`kitty-gfx--heading-flush-needed' when anything changed so the refresh
+cycle flushes the spaces to the terminal before emitting OSC 66."
+  (let ((spaces (make-string cols ?\s)))
+    (unless (equal (overlay-get ov 'display) spaces)
+      (overlay-put ov 'display spaces)
+      (setq kitty-gfx--heading-flush-needed t))
+    (when (> cell-s 1)
+      (let ((after (apply #'concat
+                          (make-list (1- cell-s) (concat spaces "\n")))))
+        (unless (equal (overlay-get ov 'after-string) after)
+          (overlay-put ov 'after-string after)
+          (setq kitty-gfx--heading-flush-needed t))))))
 
 (defun kitty-gfx-run-self-tests ()
   "Run batch-safe self-tests for kitty-graphics.
@@ -1947,27 +1958,39 @@ Signals error on failure, prints success message otherwise."
       (cl-assert (= (overlay-get ov 'kitty-gfx-last-row) 5)
                  nil "place-heading should not modify cached position")
       (delete-overlay ov)))
-  ;; erase-heading: verify it runs without error in dry-run
+  ;; heading-fit-text: full fit, truncation, and wide chars
+  (cl-assert (equal (kitty-gfx--heading-fit-text "Hello World" 2 79)
+                    "Hello World")
+             nil "fit-text should keep text that fits")
+  (cl-assert (equal (kitty-gfx--heading-fit-text "Hello World" 2 10)
+                    "Hello")
+             nil "fit-text should truncate to max-cols")
+  (cl-assert (equal (kitty-gfx--heading-fit-text "日本語" 2 8) "日本")
+             nil "fit-text should count double-width chars")
+  (cl-assert (equal (kitty-gfx--heading-fit-text "abc" 2 1) "")
+             nil "fit-text should return empty when nothing fits")
+  ;; heading-sync-reservation: display + after-string sized to the block
   (with-temp-buffer
-    (insert "* Erase Test\nBody\n")
-    (let* ((kitty-gfx--dry-run t)
-           (ov (kitty-gfx--make-heading-overlay 1 13 "Erase Test" 2.0 1)))
-      (overlay-put ov 'kitty-gfx-last-row 3)
-      (overlay-put ov 'kitty-gfx-last-col 1)
-      (kitty-gfx--erase-heading ov)
-      ;; After erase, cached position is still set (caller clears it)
-      (cl-assert (= (overlay-get ov 'kitty-gfx-last-row) 3)
-                 nil "erase-heading should not modify cached position")
-      (delete-overlay ov)))
-  ;; erase-heading: no-op when no cached position
-  (with-temp-buffer
-    (insert "* No Pos\nBody\n")
-    (let* ((kitty-gfx--dry-run t)
-           (ov (kitty-gfx--make-heading-overlay 1 9 "No Pos" 1.5 2)))
-      ;; No cached position — erase should be a no-op
-      (kitty-gfx--erase-heading ov)
+    (insert "* Reserve Me\nBody\n")
+    (let* ((kitty-gfx--heading-flush-needed nil)
+           (ov (kitty-gfx--make-heading-overlay 1 13 "Reserve Me" 2.0 1)))
+      (kitty-gfx--heading-sync-reservation ov 20 2)
+      (cl-assert kitty-gfx--heading-flush-needed
+                 nil "reservation change should flag a flush")
+      (cl-assert (equal (overlay-get ov 'display) (make-string 20 ?\s))
+                 nil "display should be block-width spaces")
+      (cl-assert (equal (overlay-get ov 'after-string)
+                        (concat (make-string 20 ?\s) "\n"))
+                 nil "after-string should be one block-width space line")
+      (setq kitty-gfx--heading-flush-needed nil)
+      (kitty-gfx--heading-sync-reservation ov 20 2)
+      (cl-assert (not kitty-gfx--heading-flush-needed)
+                 nil "unchanged reservation should not flag a flush")
+      (kitty-gfx--heading-reset ov)
       (cl-assert (null (overlay-get ov 'kitty-gfx-last-row))
-                 nil "erase with no pos should be a no-op")
+                 nil "reset should clear cached row")
+      (cl-assert (equal (overlay-get ov 'display) "Reserve Me")
+                 nil "reset should restore plain text display")
       (delete-overlay ov)))
   (message "kitty-gfx: all self-tests passed"))
 
@@ -2014,7 +2037,10 @@ Does NOT emit any OSC 66 -- that happens during refresh."
     ;; during incremental redisplay, naturally clearing ghost
     ;; multicell fragments via overwrite Rule 3.
     (when (> cell-s 1)
-      (let ((spaceline (concat (make-string 200 ?\s) "\n")))
+      (let ((spaceline (concat (make-string
+                                (min cols (max 1 (1- (frame-width))))
+                                ?\s)
+                               "\n")))
         (overlay-put ov 'after-string
                      (apply #'concat
                             (make-list (1- cell-s) spaceline)))))
@@ -2034,10 +2060,12 @@ Does NOT emit any OSC 66 -- that happens during refresh."
 (defun kitty-gfx--heading-modified (ov after &rest _args)
   "Modification hook for heading overlays.
 When the heading text is edited (AFTER is non-nil), the overlay stays
-in place: it is marked stale, its emitted multicell block is erased,
-and its display property is dropped so the live buffer text shows at
-normal size while typing.  A debounced rescan then updates the overlay
-in place (or removes it when the line is no longer a heading)."
+in place: it is marked stale and its display property is dropped so
+the live buffer text shows at normal size while typing — Emacs
+redrawing the line over the multicell block erases it (kitty's
+overwrite rule), so no manual erase is sent.  A debounced rescan then
+updates the overlay in place (or removes it when the line is no
+longer a heading)."
   (when (and after (overlay-buffer ov))
     (unless (overlay-get ov 'kitty-gfx-heading-stale)
       (kitty-gfx--log "heading-modified: marking overlay stale at %d"
@@ -2045,14 +2073,8 @@ in place (or removes it when the line is no longer a heading)."
       (overlay-put ov 'kitty-gfx-heading-stale t)
       (overlay-put ov 'kitty-gfx-heading-emitted nil)
       (overlay-put ov 'display nil)
-      (when (overlay-get ov 'kitty-gfx-last-row)
-        (kitty-gfx--with-terminal (kitty-gfx--heading-pin-terminal ov)
-          (kitty-gfx--erase-heading-at (overlay-get ov 'kitty-gfx-last-row)
-                                       (overlay-get ov 'kitty-gfx-last-col)
-                                       (or (overlay-get ov 'kitty-gfx-cols) 0)
-                                       (or (overlay-get ov 'kitty-gfx-rows) 1)))
-        (overlay-put ov 'kitty-gfx-last-row nil)
-        (overlay-put ov 'kitty-gfx-last-col nil)))
+      (overlay-put ov 'kitty-gfx-last-row nil)
+      (overlay-put ov 'kitty-gfx-last-col nil))
     (when kitty-gfx--heading-rescan-timer
       (cancel-timer kitty-gfx--heading-rescan-timer))
     (setq kitty-gfx--heading-rescan-timer
@@ -2211,18 +2233,18 @@ whole buffer."
 
 (defun kitty-gfx--org-remove-heading-sizes ()
   "Remove all heading size overlays from the current buffer.
-Erases each overlay's emitted multicell block first so no scaled
-glyphs linger on the terminal."
+Removing the overlays drops their space reservations, so the next
+redisplay redraws the heading lines as plain text over the multicell
+blocks, which erases them (kitty's overwrite rule)."
   (setq kitty-gfx--heading-sizes-enabled nil)
   (let ((count 0))
     (dolist (ov (overlays-in (point-min) (point-max)))
       (when (overlay-get ov 'kitty-gfx-heading)
-        (when (overlay-get ov 'kitty-gfx-last-row)
-          (kitty-gfx--with-terminal (kitty-gfx--heading-pin-terminal ov)
-            (kitty-gfx--erase-heading ov)))
         (kitty-gfx--remove-overlay ov)
         (cl-incf count)))
-    (kitty-gfx--log "remove-heading-sizes: removed %d" count)))
+    (kitty-gfx--log "remove-heading-sizes: removed %d" count)
+    (when (> count 0)
+      (kitty-gfx--schedule-refresh t))))
 
 (defvar-local kitty-gfx--heading-saved-modes nil
   "Alist of (MODE . WAS-ACTIVE) saved when heading sizes are enabled.
@@ -2549,7 +2571,12 @@ several daemon clients on different ttys render correctly at once."
                       ;; buffer is shown on this terminal, inside the SAME
                       ;; sync block as phase 1 so mini-redraws cannot corrupt
                       ;; the freshly-placed multicell blocks.
-                      (kitty-gfx--emit-heading-overlays term))
+                      (if (and kitty-gfx--heading-flush-needed
+                               (progn
+                                 (setq kitty-gfx--heading-flush-needed nil)
+                                 (not (redisplay))))
+                          (kitty-gfx--schedule-refresh t)
+                        (kitty-gfx--emit-heading-overlays term)))
                   (kitty-gfx--sync-end)))))
         ;; mpv/casty repositioning runs once, after all terminals.  These
         ;; send no direct terminal escapes (frames arrive via the routed
@@ -2697,28 +2724,27 @@ is visible on several terminals at once."
 (defun kitty-gfx--refresh-heading-overlay (ov win win-bottom)
   "Refresh heading overlay OV in WIN.
 WIN-BOTTOM is WIN's bottom edge.  Phase 1 of two-phase heading
-refresh: computes screen position, erases old multicell block if
-heading moved or became hidden, and caches the new position.  Does
-NOT emit OSC 66 — that happens in phase 2
-(`kitty-gfx--emit-heading-overlays') to avoid posn-at-point redraws
-destroying freshly-placed blocks.  Stale overlays (mid-edit) are left
-untouched, and only the buffer's canonical window is processed; the
-overlay's `window' property is pinned to it so other windows showing
-the buffer display plain heading text.  When the pin moves to another
-terminal, the block emitted on the old pin's terminal is erased there
-before the position cache is rebuilt for the new window."
+refresh: computes the screen position, fits the heading text to the
+window width, syncs the space reservation, and caches the new
+position.  Does NOT emit OSC 66 — that happens in phase 2
+\(`kitty-gfx--emit-heading-overlays') after the reservation spaces
+were flushed to the terminal.  Never erases at cached coordinates:
+when the heading moved, the terminal scrolled the old block together
+with the surrounding text, so the cached position now holds live
+content that an erase would destroy.  Collapsed headings (their own
+fold ellipsis at end of line) and hidden ones fall back to plain text
+via `kitty-gfx--heading-reset' — Emacs redrawing the line then clears
+the block.  Stale overlays (mid-edit) are left untouched, and only
+the buffer's canonical window is processed; the overlay's `window'
+property is pinned to it so other windows showing the buffer display
+plain heading text."
   (when (and (not (overlay-get ov 'kitty-gfx-heading-stale))
              (eq win (kitty-gfx--heading-canonical-window (overlay-buffer ov))))
     (unless (eq (overlay-get ov 'window) win)
-      (let ((old-term (kitty-gfx--heading-pin-terminal ov)))
-        (when (and old-term
-                   (not (eq old-term (frame-terminal (window-frame win))))
-                   (overlay-get ov 'kitty-gfx-last-row))
-          (kitty-gfx--with-terminal old-term
-            (kitty-gfx--erase-heading ov))
-          (overlay-put ov 'kitty-gfx-last-row nil)
-          (overlay-put ov 'kitty-gfx-last-col nil)))
       (overlay-put ov 'window win)
+      (overlay-put ov 'kitty-gfx-last-row nil)
+      (overlay-put ov 'kitty-gfx-last-col nil)
+      (overlay-put ov 'kitty-gfx-heading-emitted nil)
       (kitty-gfx--schedule-refresh t))
     (let ((pos (kitty-gfx--overlay-screen-pos ov win))
           (rows (overlay-get ov 'kitty-gfx-rows))
@@ -2726,25 +2752,31 @@ before the position cache is rebuilt for the new window."
           (last-col (overlay-get ov 'kitty-gfx-last-col)))
       (if (and pos
                (<= (car pos) win-bottom)
-               (<= (+ (car pos) rows -1) win-bottom))
-          ;; Visible — erase old position if moved, cache new
-          (let ((new-row (car pos))
-                (new-col (cdr pos)))
-            (when (and last-row
-                       (not (and (eql new-row last-row)
-                                 (eql new-col last-col))))
-              ;; Heading moved — erase at old position
-              (kitty-gfx--erase-heading ov))
-            (overlay-put ov 'kitty-gfx-last-row new-row)
-            (overlay-put ov 'kitty-gfx-last-col new-col)
-            (kitty-gfx--log "refresh-heading: L%d visible at row=%d col=%d"
-                             (overlay-get ov 'kitty-gfx-heading-level)
-                             new-row new-col))
-        ;; Not visible — erase if was placed, clear cache
-        (when last-row
-          (kitty-gfx--erase-heading ov))
-        (overlay-put ov 'kitty-gfx-last-row nil)
-        (overlay-put ov 'kitty-gfx-last-col nil)))))
+               (<= (+ (car pos) rows -1) win-bottom)
+               (not (kitty-gfx--in-folded-region-p (overlay-end ov))))
+          (let* ((new-row (car pos))
+                 (new-col (cdr pos))
+                 (cell-s (overlay-get ov 'kitty-gfx-heading-cell-s))
+                 (max-cols (max 0 (- (nth 2 (window-body-edges win))
+                                     new-col)))
+                 (fit (kitty-gfx--heading-fit-text
+                       (overlay-get ov 'kitty-gfx-heading-text)
+                       cell-s max-cols))
+                 (cols (* (string-width fit) cell-s)))
+            (if (zerop cols)
+                (kitty-gfx--heading-reset ov)
+              (overlay-put ov 'kitty-gfx-render-text fit)
+              (overlay-put ov 'kitty-gfx-cols cols)
+              (unless (and (eql new-row last-row)
+                           (eql new-col last-col))
+                (overlay-put ov 'kitty-gfx-heading-emitted nil))
+              (overlay-put ov 'kitty-gfx-last-row new-row)
+              (overlay-put ov 'kitty-gfx-last-col new-col)
+              (kitty-gfx--heading-sync-reservation ov cols cell-s)
+              (kitty-gfx--log "refresh-heading: L%d visible at row=%d col=%d cols=%d"
+                              (overlay-get ov 'kitty-gfx-heading-level)
+                              new-row new-col cols)))
+        (kitty-gfx--heading-reset ov)))))
 
 (defvar kitty-gfx--refresh-pending nil
   "Non-nil if a refresh was requested during the cooldown period.")
@@ -2840,13 +2872,7 @@ viewport instrumented via `kitty-gfx--heading-scan-visible'."
           (dolist (ov kitty-gfx--overlays)
             (when (overlay-buffer ov)
               (if (overlay-get ov 'kitty-gfx-heading)
-                  ;; Heading overlay — erase multicell block to prevent
-                  ;; ghost artifacts if the new buffer doesn't fully
-                  ;; overwrite the heading's terminal cells.
-                  (when (overlay-get ov 'kitty-gfx-last-row)
-                    (kitty-gfx--erase-heading ov)
-                    (overlay-put ov 'kitty-gfx-last-row nil)
-                    (overlay-put ov 'kitty-gfx-last-col nil))
+                  (kitty-gfx--heading-reset ov)
                 ;; Image overlay — delete all terminal placements, including
                 ;; multiple windows that were showing this buffer.
                 (kitty-gfx--delete-image-placements ov))))))))
@@ -3953,53 +3979,28 @@ disabling conflicting minor modes."
                          (kitty-gfx--heading-disable-conflicting)
                          (kitty-gfx--heading-apply-initial))))))))
 
-(defun kitty-gfx--nuke-headings ()
-  "Erase all heading multicell blocks in the current buffer.
-The `nuke' phase of nuke-and-repaint: erases every heading overlay's
-multicell block at its cached terminal position, then clears the
-cache.  The subsequent refresh cycle handles the `repaint' phase,
-re-emitting OSC 66 only for headings that are still visible
-\(not inside a fold)."
-  (let ((count 0))
-    (dolist (ov kitty-gfx--overlays)
-      (when (and (overlay-get ov 'kitty-gfx-heading)
-                 (overlay-buffer ov)
-                 (overlay-get ov 'kitty-gfx-last-row))
-        (kitty-gfx--erase-heading ov)
-        (overlay-put ov 'kitty-gfx-last-row nil)
-        (overlay-put ov 'kitty-gfx-last-col nil)
-        (cl-incf count)))
-    (when (> count 0)
-      (kitty-gfx--log "nuke-headings: erased %d heading blocks" count))
-    count))
-
 (defun kitty-gfx--on-org-cycle (&rest _args)
   "Handle org visibility cycling.
-Deletes image placements and erases heading multicell blocks from
-the terminal, clears position caches, then schedules a refresh
-that re-places only the overlays that are still visible (not
-inside a fold).  Heading overlays use nuke-and-repaint: erase all,
-then let the refresh cycle re-emit the visible ones."
+Deletes image placements and clears their position caches, then
+schedules a forced refresh that re-places only the overlays still
+visible (not inside a fold).  Heading overlays are left alone here:
+Emacs's post-fold redraw clears or moves their blocks together with
+the buffer text, and the refresh re-emits any heading whose screen
+position changed."
   (kitty-gfx--log "on-org-cycle: overlays=%d" (length kitty-gfx--overlays))
   (when (and kitty-graphics-mode kitty-gfx--overlays)
     (kitty-gfx--invalidate-window-signatures)
     (kitty-gfx--sync-begin)
     (unwind-protect
         (dolist (ov kitty-gfx--overlays)
-          (when (overlay-buffer ov)
-            (if (overlay-get ov 'kitty-gfx-heading)
-                ;; Heading overlay — erase multicell block (nuke phase)
-                (when (overlay-get ov 'kitty-gfx-last-row)
-                  (kitty-gfx--erase-heading ov)
-                  (overlay-put ov 'kitty-gfx-last-row nil)
-                  (overlay-put ov 'kitty-gfx-last-col nil))
-              ;; Image overlay — delete terminal placement
-              (let ((id (overlay-get ov 'kitty-gfx-id))
-                    (pid (overlay-get ov 'kitty-gfx-pid)))
-                (when (and id pid kitty-gfx--active-backend)
-                  (funcall (kitty-gfx--backend-fn 'delete) ov id pid)))
-              (overlay-put ov 'kitty-gfx-last-row nil)
-              (overlay-put ov 'kitty-gfx-last-col nil))))
+          (when (and (overlay-buffer ov)
+                     (not (overlay-get ov 'kitty-gfx-heading)))
+            (let ((id (overlay-get ov 'kitty-gfx-id))
+                  (pid (overlay-get ov 'kitty-gfx-pid)))
+              (when (and id pid kitty-gfx--active-backend)
+                (funcall (kitty-gfx--backend-fn 'delete) ov id pid)))
+            (overlay-put ov 'kitty-gfx-last-row nil)
+            (overlay-put ov 'kitty-gfx-last-col nil)))
       (kitty-gfx--sync-end))
     ;; Force-redisplay: folds change visibility, posn-at-point must re-measure.
     (kitty-gfx--schedule-refresh t)))

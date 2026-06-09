@@ -22,7 +22,9 @@ Heading instrumentation is lazy by default: only the displayed window region plu
 
 Scaled headings no longer overwrite inline images: the emit phase seeds its occupied-row set from the image placements recorded on the target terminal and skips any heading that would overlap them, exactly like heading-heading conflicts.
 
-Enabling heading sizes no longer unfolds the whole buffer; folded headings simply render as plain text until revealed, and fold cycling erases scaled blocks that fold away.
+Enabling heading sizes no longer unfolds the whole buffer; folded and collapsed headings simply render as plain text until revealed.
+
+Live-terminal rendering is now stable: each heading reserves exactly its scaled width in spaces (clamped to the window, with the OSC 66 payload truncated to fit) and the reservation is flushed to the terminal before the block is painted, so Emacs redraws no longer clip the leading glyphs, no truncation marker appears, and over-wide reservations are gone. Erases are only ever emitted at freshly measured coordinates immediately before a placement; folds, scrolls, edits, and buffer switches rely on Emacs redrawing the reserved cells instead, which stops stale-coordinate erases from blanking real buffer text.
 
 The minor modes disabled while heading sizes are active are now customizable via new ~kitty-gfx-heading-conflicting-modes~ (default matches the old hardcoded list).
 
