@@ -26,7 +26,7 @@ Enabling heading sizes no longer unfolds the whole buffer; folded headings simpl
 
 The minor modes disabled while heading sizes are active are now customizable via new ~kitty-gfx-heading-conflicting-modes~ (default matches the old hardcoded list).
 
-When the same org buffer is shown in several windows, one canonical window per buffer and terminal (preferring the selected window) renders the scaled headings; the other windows show plain heading text instead of flickering. Per-window heading rendering is a known limitation.
+When the same org buffer is shown in several windows or terminals, one canonical window per buffer (preferring the selected window) renders the scaled headings; all other windows show plain heading text instead of flickering. Per-window heading rendering is a known limitation.
 
 *** Features
 
