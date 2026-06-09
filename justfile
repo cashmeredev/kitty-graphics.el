@@ -58,11 +58,11 @@ test-org:
         tests/test-kitty-gfx.org
 
 # Test text sizing protocol (OSC 66) on org headings
-test-headings:
+test-headings file="tests/test-kitty-gfx.org":
     TERM={{TERM_}} {{EMACS}} -nw -Q -l {{SRC}} \
         --eval "(setq kitty-gfx-heading-sizes-auto t)" \
         --eval "(kitty-graphics-mode 1)" \
-        tests/test-kitty-gfx.org
+        {{file}}
 
 # Test image-mode rendering
 test-image:
