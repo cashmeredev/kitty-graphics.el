@@ -364,7 +364,8 @@ terminal is treated as fresh."
     (set-terminal-parameter term 'kitty-gfx-text-sizing nil)
     (set-terminal-parameter term 'kitty-gfx-tmux-version nil)
     (set-terminal-parameter term 'kitty-gfx-tmux-passthrough nil)
-    (set-terminal-parameter term 'kitty-gfx-transmitted nil)))
+    (set-terminal-parameter term 'kitty-gfx-transmitted nil)
+    (set-terminal-parameter term 'kitty-gfx-virtual-dims nil)))
 
 ;; Kitty stores transmitted image data per terminal: an `a=t' transmit to
 ;; client A's tty does not exist on client B's tty.  The global file->id
@@ -521,11 +522,16 @@ mode.  Order is significant — do not sort.")
   "Resolve `kitty-gfx-kitty-placement-mode' to `direct' or `placeholder'.
 The `auto' value chooses `placeholder' inside tmux (where direct
 placement leaks images across pane switches) and `direct' outside
-\(where direct is simpler and the ghost problem does not apply)."
+\(where direct is simpler and the ghost problem does not apply).
+TMUX is read from the target frame's environment, matching the frame
+`kitty-gfx--needs-tmux-wrap-p' wraps for, so a multi-tty daemon does
+not resolve a tmux client's mode from whichever frame is selected."
   (pcase kitty-gfx-kitty-placement-mode
     ('direct 'direct)
     ('placeholder 'placeholder)
-    (_ (if (kitty-gfx--frame-getenv "TMUX") 'placeholder 'direct))))
+    (_ (if (kitty-gfx--frame-getenv "TMUX" (kitty-gfx--target-frame))
+           'placeholder
+         'direct))))
 
 (defun kitty-gfx--emit-placeholder-cells (image-id cols rows term-row term-col)
   "Emit a COLS x ROWS block of Kitty Unicode placeholder cells.
@@ -544,17 +550,20 @@ fit in 24 bits; the protocol's optional fourth combining character
 for an extra MSB byte is not produced here.
 
 TERM-ROW and TERM-COL are 1-based terminal coordinates of the
-image area's top-left.  The emission is bracketed by DECSC/DECRC
-\(`\\e7' / `\\e8') so the caller's cursor and SGR state are
-preserved."
+image area's top-left.  COLS and ROWS beyond the diacritic table's
+297 entries are clamped — the protocol cannot address further cells,
+and signaling here would abort the whole refresh cycle.  The emission
+is bracketed by DECSC/DECRC \(`\\e7' / `\\e8') so the caller's cursor
+and SGR state are preserved."
   (let ((max (length kitty-gfx--diacritics)))
-    (cond
-     ((> image-id #xffffff)
+    (when (> image-id #xffffff)
       (error "kitty-gfx: image id %d exceeds 24 bits — \
 placeholder mode cannot encode it" image-id))
-     ((or (> rows max) (> cols max))
-      (error "kitty-gfx: image %dx%d cells exceeds the %d-entry placeholder grid"
-             cols rows max))))
+    (when (or (> rows max) (> cols max))
+      (kitty-gfx--log "emit-placeholder-cells: clamping %dx%d to grid max %d"
+                      cols rows max)
+      (setq cols (min cols max)
+            rows (min rows max))))
   (let* ((sgr (format "\e[38;2;%d;%d;%dm"
                       (logand (ash image-id -16) #xff)
                       (logand (ash image-id -8)  #xff)
@@ -971,17 +980,50 @@ Sets `kitty-gfx--active-backend' to the detected backend symbol."
         (kitty-gfx--log "detect-protocol: result=%s" detected)
         detected)))
 
+(defun kitty-gfx--unread-non-reply (response patterns events)
+  "Push back input consumed while reading a terminal reply.
+Strips every match of PATTERNS (and any trailing partial escape
+sequence) from RESPONSE; whatever characters remain are user
+keystrokes that arrived interleaved with the reply, so they are
+prepended to `unread-command-events' together with the non-character
+EVENTS, instead of leaking into the reader or being dropped."
+  (let ((leftover response))
+    (dolist (re patterns)
+      (setq leftover (replace-regexp-in-string re "" leftover)))
+    (setq leftover (replace-regexp-in-string "\e\\[?[0-9;]*\\'" "" leftover))
+    (let ((pending (append events (append leftover nil))))
+      (when pending
+        (kitty-gfx--log "unread-non-reply: pushing back %d events"
+                        (length pending))
+        (setq unread-command-events
+              (append pending unread-command-events))))))
+
+(defun kitty-gfx--cpr-columns (response)
+  "Return the cursor column of every full CPR reply in RESPONSE, in order."
+  (let ((cols nil)
+        (start 0))
+    (while (string-match "\e\\[[0-9]+;\\([0-9]+\\)R" response start)
+      (push (string-to-number (match-string 1 response)) cols)
+      (setq start (match-end 0)))
+    (nreverse cols)))
+
 (defun kitty-gfx--query-cell-size ()
   "Query terminal for cell size in pixels using CSI 16 t (XTWINOPS).
 The terminal responds with CSI 6 ; HEIGHT ; WIDTH t.
-Falls back to reasonable defaults if query fails or times out."
+Falls back to reasonable defaults if query fails or times out.
+The read completes only on a full match of that reply, never on a
+bare suffix check, so user keystrokes cannot terminate it early;
+keystrokes consumed while waiting are pushed back onto
+`unread-command-events'."
   ;; Guard on the per-terminal parameter, not the global, so every client
   ;; terminal queries its own cell size exactly once even when another
   ;; terminal already populated the global default.
   (unless (terminal-parameter nil 'kitty-gfx-cell-w)
-    (let ((w nil) (h nil))
+    (let ((w nil) (h nil)
+          (reply-re "\e\\[6;\\([0-9]+\\);\\([0-9]+\\)t"))
       (condition-case nil
           (let ((response "")
+                (extra nil)
                 (done nil)
                 (deadline (+ (float-time) 0.5)))  ; 500ms timeout
             ;; Send CSI 16 t — request cell size in pixels
@@ -989,20 +1031,22 @@ Falls back to reasonable defaults if query fails or times out."
             ;; Read response characters until we get the full sequence
             ;; Expected: ESC [ 6 ; HEIGHT ; WIDTH t
             (while (and (not done) (< (float-time) deadline))
-              (let ((ch (with-timeout (0.1 nil)
-                          (read-event nil nil 0.1))))
+              (let ((ch (read-event nil nil 0.1)))
                 (when ch
-                  (setq response (concat response (string ch)))
-                  ;; Check if response ends with 't' (end of CSI response)
-                  (when (string-suffix-p "t" response)
+                  (if (characterp ch)
+                      (setq response (concat response (string ch)))
+                    (push ch extra))
+                  (when (string-match-p reply-re response)
                     (setq done t)))))
             ;; Parse the response: ESC [ 6 ; HEIGHT ; WIDTH t
-            (when (string-match "\e\\[6;\\([0-9]+\\);\\([0-9]+\\)t" response)
+            (when (string-match reply-re response)
               (let ((rh (string-to-number (match-string 1 response)))
                     (rw (string-to-number (match-string 2 response))))
                 (when (and (> rw 0) (> rh 0))
                   (setq w rw h rh)
-                  (kitty-gfx--log "cell-size query: %dx%d pixels" w h)))))
+                  (kitty-gfx--log "cell-size query: %dx%d pixels" w h))))
+            (kitty-gfx--unread-non-reply response (list reply-re)
+                                         (nreverse extra)))
         (error nil))
       ;; Fallback if query failed, then publish to both the global default
       ;; and this terminal's parameter.
@@ -1027,7 +1071,10 @@ Compare column positions:
   x2 = x1+2 only           → width-only support
   no advancement            → no support
 
-Uses DSR (device status report) as a sentinel to avoid hanging."
+Uses DSR (device status report) as a sentinel to avoid hanging.
+The read completes only on a full match of the DSR reply, so user
+keystrokes cannot end it early; keystrokes consumed while waiting
+are pushed back onto `unread-command-events'."
   (if (terminal-parameter nil 'kitty-gfx-text-sizing)
       ;; Already detected for this terminal — reuse the cached result
       (progn
@@ -1037,6 +1084,7 @@ Uses DSR (device status report) as a sentinel to avoid hanging."
                         kitty-gfx--text-sizing-support))
     (condition-case err
         (let ((response "")
+              (extra nil)
               (done nil)
               (deadline (+ (float-time) 1.0)))
           ;; Save cursor, CR to column 1, then interleaved CPR + OSC 66
@@ -1047,26 +1095,21 @@ Uses DSR (device status report) as a sentinel to avoid hanging."
                    "\e]66;s=2; \a\e[6n"         ; scale test + CPR3
                    "\e[5n"                       ; DSR sentinel
                    "\e[2K\e8"))                  ; erase line + restore
-          ;; Read until DSR response (ends with 'n') or timeout
+          ;; Read until the full DSR reply (ESC [ 0 n) or timeout
           (while (and (not done) (< (float-time) deadline))
-            (let ((ch (with-timeout (0.1 nil)
-                        (read-event nil nil 0.1))))
+            (let ((ch (read-event nil nil 0.1)))
               (if ch
                   (progn
-                    (setq response (concat response (string ch)))
-                    (when (and (string-suffix-p "n" response)
-                               (>= (cl-count ?R response) 3))
+                    (if (characterp ch)
+                        (setq response (concat response (string ch)))
+                      (push ch extra))
+                    (when (string-match-p "\e\\[0n" response)
                       (setq done t)))
                 ;; No input — check if we have enough responses
-                (when (>= (cl-count ?R response) 3)
+                (when (>= (length (kitty-gfx--cpr-columns response)) 3)
                   (setq done t)))))
           ;; Parse three CPR responses: ESC [ row ; col R
-          (let ((cols nil)
-                (start 0))
-            (while (string-match "\e\\[[0-9]+;\\([0-9]+\\)R" response start)
-              (push (string-to-number (match-string 1 response)) cols)
-              (setq start (match-end 0)))
-            (setq cols (nreverse cols))
+          (let ((cols (kitty-gfx--cpr-columns response)))
             (if (>= (length cols) 3)
                 (let ((x1 (nth 0 cols))
                       (x2 (nth 1 cols))
@@ -1089,8 +1132,14 @@ Uses DSR (device status report) as a sentinel to avoid hanging."
           ;; Flush any remaining terminal responses
           (let ((flush-deadline (+ (float-time) 0.1)))
             (while (< (float-time) flush-deadline)
-              (unless (read-event nil nil 0.02)
-                (setq flush-deadline 0)))))
+              (let ((ch (read-event nil nil 0.02)))
+                (if ch
+                    (if (characterp ch)
+                        (setq response (concat response (string ch)))
+                      (push ch extra))
+                  (setq flush-deadline 0)))))
+          (kitty-gfx--unread-non-reply
+           response '("\e\\[[0-9]+;[0-9]+R" "\e\\[0n") (nreverse extra)))
       (error
        (kitty-gfx--log "text-sizing: query error: %s"
                         (error-message-string err))
@@ -1126,9 +1175,9 @@ on the active placement mode:
 
 - `direct': `kitty-gfx--place-image' later emits an `a=p,c,r' APC
   at screen coordinates.
-- `placeholder': `kitty-gfx--register-virtual-placement' is called
-  immediately below to attach a `U=1' virtual placement that
-  subsequent placeholder cells reference."
+- `placeholder': `kitty-gfx--place-placeholder' later registers a
+  `U=1' virtual placement sized to the rendered cell grid and paints
+  placeholder cells that reference it."
   (let* ((mode (kitty-gfx--effective-placement-mode))
          (chunk-size kitty-gfx-chunk-size)
          (len (length base64-data))
@@ -1148,25 +1197,35 @@ on the active placement mode:
         (cl-incf chunk-count)
         (setq offset end
               first nil)))
-    (kitty-gfx--log "transmit-done: id=%d chunks-sent=%d" id chunk-count)
-    (when (eq mode 'placeholder)
-      (kitty-gfx--register-virtual-placement id))))
+    (kitty-gfx--log "transmit-done: id=%d chunks-sent=%d" id chunk-count)))
 
-(defun kitty-gfx--register-virtual-placement (id)
-  "Register a virtual placement (`a=p,U=1') for image ID.
+(defun kitty-gfx--register-virtual-placement (id cols rows)
+  "Register a COLS x ROWS virtual placement (`a=p,U=1,p=1') for image ID.
 This is the placement-step counterpart to a plain `a=t' transmit
 when operating in `placeholder' mode.  The placement has no screen
 coordinates; instead, any subsequent cell containing the Unicode
 placeholder character with a foreground color encoding ID renders
-the corresponding fragment of the stored image.
+the corresponding fragment of the stored image.  Sending `c'/`r' is
+required for the placeholder grid to address the whole image: without
+them a downscaled image shows only its top-left crop.  The registered
+dimensions are cached per terminal, and a registration with the same
+`i' and `p' replaces the previous one (per the protocol), so this is
+re-issued only when the cell dimensions actually change.
 
 We deliberately split this from `a=T,U=1' (transmit-and-display)
 because the combined form causes some terminals (e.g. Ghostty
 1.3.x) to also draw one copy of the image at the cursor position
 at transmit time, producing an unwanted ghost copy."
-  (kitty-gfx--log "register-virtual-placement: id=%d" id)
-  (kitty-gfx--terminal-send
-   (format "\e_Ga=p,U=1,i=%d,q=2\e\\" id)))
+  (let ((dims-by-id (or (kitty-gfx--tparam 'kitty-gfx-virtual-dims)
+                        (kitty-gfx--set-tparam 'kitty-gfx-virtual-dims
+                                               (make-hash-table))))
+        (dims (cons cols rows)))
+    (unless (equal (gethash id dims-by-id) dims)
+      (kitty-gfx--log "register-virtual-placement: id=%d cols=%d rows=%d"
+                      id cols rows)
+      (kitty-gfx--terminal-send
+       (format "\e_Ga=p,U=1,i=%d,p=1,c=%d,r=%d,q=2\e\\" id cols rows))
+      (puthash id dims dims-by-id))))
 
 (defun kitty-gfx--delete-by-id (id)
   "Delete image with ID and free data."
@@ -1194,12 +1253,18 @@ at transmit time, producing an unwanted ghost copy."
 PLACEMENT-ID is the unique placement ID (p=PID) — reusing the same PID
 replaces the previous placement, preventing accumulation.
 COLS x ROWS is the size in terminal cells.
-Uses direct placement: move cursor, then `a=p' with `c' and `r' params."
+Uses direct placement: move cursor, then `a=p' with `c' and `r' params.
+The cursor movement and the APC are sent separately: inside tmux only
+the APC may travel through the passthrough envelope — wrapping the
+cursor moves with it would make them execute on the outer terminal
+with pane-relative coordinates."
   (kitty-gfx--log "place: id=%d pid=%d cols=%d rows=%d row=%d col=%d"
                    image-id placement-id cols rows term-row term-col)
+  (kitty-gfx--terminal-send (format "\e7\e[%d;%dH" term-row term-col))
   (kitty-gfx--terminal-send
-   (format "\e7\e[%d;%dH\e_Gq=2,a=p,i=%d,p=%d,c=%d,r=%d\e\\\e8"
-           term-row term-col image-id placement-id cols rows)))
+   (format "\e_Gq=2,a=p,i=%d,p=%d,c=%d,r=%d\e\\"
+           image-id placement-id cols rows))
+  (kitty-gfx--terminal-send "\e8"))
 
 ;;;; Kitty backend
 
@@ -1367,11 +1432,22 @@ re-placement."
 
 (defun kitty-gfx--place-placeholder (ov pid image-id cols rows term-row term-col)
   "Render IMAGE-ID at (TERM-ROW, TERM-COL) via Unicode placeholder cells.
-Per-window tracking is keyed by PID — the placement id allocated to
-the (overlay, window) pair by the caller.  Before emitting at the
-new position, erase the area this PID previously occupied (if any)
-so the image does not ghost where it used to be.  After emission,
-remember the new area for the next erase."
+Registers (or re-registers, when the dimensions changed) the image's
+virtual placement sized COLS x ROWS first, so the placeholder grid maps
+onto the whole image rather than a top-left crop.  Dimensions beyond
+the 297-entry diacritic table are clamped.  Per-window tracking is
+keyed by PID — the placement id allocated to the (overlay, window)
+pair by the caller.  Before emitting at the new position, erase the
+area this PID previously occupied (if any) so the image does not ghost
+where it used to be.  After emission, remember the new area for the
+next erase."
+  (let ((max (length kitty-gfx--diacritics)))
+    (when (or (> cols max) (> rows max))
+      (kitty-gfx--log "place-placeholder: clamping %dx%d to grid max %d"
+                      cols rows max)
+      (setq cols (min cols max)
+            rows (min rows max))))
+  (kitty-gfx--register-virtual-placement image-id cols rows)
   (when (overlayp ov)
     (kitty-gfx--erase-placeholder-area ov pid))
   (kitty-gfx--emit-placeholder-cells image-id cols rows term-row term-col)
@@ -2003,6 +2079,14 @@ TEXT is the string payload (max 4096 bytes UTF-8)."
        (or (zerop d) (> d n))
        (<= (length (encode-coding-string text 'utf-8)) 4096)))
 
+(defun kitty-gfx--truncate-utf8 (text max-bytes)
+  "Return TEXT truncated so its UTF-8 encoding is at most MAX-BYTES.
+Truncation happens on character boundaries, so the result is always
+valid UTF-8."
+  (while (> (length (encode-coding-string text 'utf-8)) max-bytes)
+    (setq text (substring text 0 -1)))
+  text)
+
 (defun kitty-gfx--heading-sgr (level)
   "Return SGR escape string for org heading at LEVEL.
 Applies bold + 24-bit foreground color from org-level-N face.
@@ -2030,7 +2114,8 @@ OSC-66-payload, SGR-reset, restore-cursor."
                        (overlay-get ov 'kitty-gfx-heading-text)))
          ;; Strip text properties — org-modern, font-lock, etc. can
          ;; attach display/face properties that corrupt OSC 66 payload.
-         (text (substring-no-properties raw-text))
+         (text (kitty-gfx--truncate-utf8
+                (substring-no-properties raw-text) 4096))
          (cell-s (overlay-get ov 'kitty-gfx-heading-cell-s))
          (frac-n (overlay-get ov 'kitty-gfx-heading-frac-n))
          (frac-d (overlay-get ov 'kitty-gfx-heading-frac-d))
@@ -3583,7 +3668,9 @@ data and the per-terminal transmitted sets do not grow without bound."
                  (kitty-gfx--terminal-transmitted-p term id))
         (kitty-gfx--with-terminal term
           (kitty-gfx--delete-by-id id))
-        (kitty-gfx--terminal-unmark-transmitted term id)))
+        (kitty-gfx--terminal-unmark-transmitted term id)
+        (let ((dims-by-id (terminal-parameter term 'kitty-gfx-virtual-dims)))
+          (when dims-by-id (remhash id dims-by-id)))))
     (let ((sixel-cleanup (alist-get 'cleanup (alist-get 'sixel kitty-gfx--backends))))
       (when sixel-cleanup (funcall sixel-cleanup file id)))))
 
@@ -3597,7 +3684,8 @@ other daemon clients."
                (terminal-parameter term 'kitty-gfx-transmitted))
       (kitty-gfx--with-terminal term
         (kitty-gfx--delete-all-images))
-      (set-terminal-parameter term 'kitty-gfx-transmitted nil)))
+      (set-terminal-parameter term 'kitty-gfx-transmitted nil)
+      (set-terminal-parameter term 'kitty-gfx-virtual-dims nil)))
   (let ((sixel-ca (alist-get 'cleanup-all (alist-get 'sixel kitty-gfx--backends))))
     (when sixel-ca (funcall sixel-ca))))
 
@@ -5567,10 +5655,14 @@ Falls back to ORIG-FN in GUI."
 ;;;; mpv video integration
 
 (defun kitty-gfx--mpv-available-p ()
-  "Return non-nil if mpv video playback is available."
+  "Return non-nil if mpv video playback is available.
+Unavailable inside tmux: mpv's raw Kitty frame stream is forwarded
+verbatim and bypasses the tmux passthrough wrapper, so tmux would eat
+every frame."
   (and kitty-gfx-enable-video
        kitty-graphics-mode
        (not (display-graphic-p))
+       (not (kitty-gfx--frame-getenv "TMUX"))
        (eq kitty-gfx--active-backend 'kitty)
        (executable-find "mpv")))
 
@@ -5584,6 +5676,8 @@ Returns nil when mpv playback is available."
     "kitty-graphics-mode is disabled")
    ((display-graphic-p)
     "running in GUI Emacs (inline mpv is a terminal feature)")
+   ((kitty-gfx--frame-getenv "TMUX")
+    "running inside tmux (mpv's raw frame stream bypasses the tmux passthrough wrapper)")
    ((not (eq kitty-gfx--active-backend 'kitty))
     "Kitty backend not active")
    ((not (executable-find "mpv"))
@@ -6050,10 +6144,14 @@ whichever buffer currently owns a live mpv process."
 ;;;; casty browser integration
 
 (defun kitty-gfx--browser-available-p ()
-  "Return non-nil if the inline casty browser is available."
+  "Return non-nil if the inline casty browser is available.
+Unavailable inside tmux: casty's raw Kitty frame stream is forwarded
+verbatim and bypasses the tmux passthrough wrapper, so tmux would eat
+every frame."
   (and kitty-gfx-enable-browser
        kitty-graphics-mode
        (not (display-graphic-p))
+       (not (kitty-gfx--frame-getenv "TMUX"))
        (eq kitty-gfx--active-backend 'kitty)
        (executable-find kitty-gfx-casty-program)))
 
@@ -6066,6 +6164,8 @@ whichever buffer currently owns a live mpv process."
     "kitty-graphics-mode is disabled")
    ((display-graphic-p)
     "running in GUI Emacs (the inline browser is a terminal feature)")
+   ((kitty-gfx--frame-getenv "TMUX")
+    "running inside tmux (casty's raw frame stream bypasses the tmux passthrough wrapper)")
    ((not (eq kitty-gfx--active-backend 'kitty))
     "Kitty backend not active")
    ((not (executable-find kitty-gfx-casty-program))

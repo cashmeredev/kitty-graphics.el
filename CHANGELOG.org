@@ -60,6 +60,20 @@ preserving aspect ratio and never enlarging images that already fit. The
 box tracks the live window. Default ~nil~ keeps the previous behaviour
 (natural size, shrink-to-fit ~kitty-gfx-max-width~ / ~kitty-gfx-max-height~).
 
+*** Fixes
+
+A bug-sweep pass over process, overlay, and protocol lifecycles, verified finding by finding.
+
+Placeholder mode (the default inside tmux) no longer shows a top-left crop of downscaled images: the virtual placement is registered with the rendered cell dimensions (~c~/~r~) at placement time and re-registered when they change. Direct placements inside tmux also stopped leaking their cursor movement through the passthrough envelope (it now executes pane-relative, only the APC is wrapped), the placement mode is resolved from the target client's environment under a multi-tty daemon, and images larger than the 297-cell placeholder grid (image-mode zoom) are clamped instead of aborting every refresh cycle.
+
+The cell-size and text-sizing startup probes no longer eat your keystrokes: typing while the probe waits (an =n= or =t= used to terminate the read early) leaked the real terminal reply into the command loop as garbage keys; both readers now complete only on a full match of the expected reply and push anything else back as input. OSC 66 heading text is capped at the protocol's 4096-byte limit on a UTF-8 boundary.
+
+mpv playback started from dired (or any window switch at the wrong moment) no longer loses its IPC connection to whatever buffer was current when the socket appeared — pause, auto-pause, repositioning, and cleanup work again, and the connection no longer leaks. The IPC socket pollers for mpv and casty are cancellable and stop on their own when the session is gone, a quit during a Sixel encode no longer leaves the encoder process running, the blank lines ~kitty-gfx-play-video~ inserts are removed when playback ends, and converted temp PNGs plus stale IPC sockets are deleted when Emacs exits instead of piling up in /tmp.
+
+The casty browser stops painting over unrelated buffers when no window shows it: frames are suppressed and the image is dropped, then repainted when the buffer is shown again, mirroring mpv's auto-pause. Its stderr log buffer is killed with the last browser session. mpv and casty are no longer offered inside tmux at all — their raw frame streams bypass the passthrough wrapper and could only render blank — and the unavailable-reason messages say so.
+
+Disabling ~kitty-graphics-mode~ now actually cleans up: blank image overlays and space-displayed scaled headings are removed from all buffers (with conflicting minor modes restored) before the backend state is reset, so re-enabling heading sizes works instead of erroring. Killing a buffer deletes its real per-window placements (not a never-emitted overlay id) on the terminals they were painted on, ~revert-buffer~ and major-mode switches no longer orphan overlays and placements, and ~kitty-gfx-clear-all~ no longer resets the image id counter under a live browser session (a later allocation could clobber the browser frame).
+
 ** kitty-graphics 0.6.0
 
 Three headline additions land in =0.6.0=: inline video playback, an
