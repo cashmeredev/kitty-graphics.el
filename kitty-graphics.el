@@ -1237,7 +1237,7 @@ Sixel when available."
       (kitty-gfx--log "kitty-detect: disabled, tmux allow-passthrough is off")
       (kitty-gfx--message-once
        "tmux-passthrough-off"
-       "kitty-gfx: tmux blocks Kitty graphics (allow-passthrough is off); run: tmux set -g allow-passthrough on")
+       "kitty-gfx: tmux blocks Kitty graphics (allow-passthrough is off); run: tmux set -g allow-passthrough on, then toggle kitty-graphics-mode to re-detect")
       (setq supported nil))
     (kitty-gfx--log "kitty-detect: %s (KITTY_PID=%s TERM_PROGRAM=%s GHOSTTY=%s WEZTERM=%s)"
                      supported kitty-pid term-prog
@@ -1693,17 +1693,19 @@ must delete the returned file."
         (px (kitty-gfx--image-pixel-size png-file)))
     (when (and magick px
                (or (> (car px) pixel-w) (> (cdr px) pixel-h)))
-      (let ((out (make-temp-file "kitty-gfx-prescale-" nil ".png")))
-        (if (with-temp-buffer
-              (kitty-gfx--sixel-run-encoder
-               magick kitty-gfx-sixel-encoder-timeout (current-buffer)
-               (list png-file "-resize" (format "%dx%d" pixel-w pixel-h) out)))
-            (progn
-              (kitty-gfx--log "sixel-prescale: %s %dx%d -> %s (fit %dx%d)"
-                              png-file (car px) (cdr px) out pixel-w pixel-h)
-              out)
-          (ignore-errors (delete-file out))
-          nil)))))
+      (let ((out (make-temp-file "kitty-gfx-prescale-" nil ".png"))
+            (ok nil))
+        (unwind-protect
+            (setq ok (with-temp-buffer
+                       (kitty-gfx--sixel-run-encoder
+                        magick kitty-gfx-sixel-encoder-timeout (current-buffer)
+                        (list png-file "-resize"
+                              (format "%dx%d" pixel-w pixel-h) out))))
+          (unless ok (ignore-errors (delete-file out))))
+        (when ok
+          (kitty-gfx--log "sixel-prescale: %s %dx%d -> %s (fit %dx%d)"
+                          png-file (car px) (cdr px) out pixel-w pixel-h)
+          out)))))
 
 (defun kitty-gfx--sixel-encode (png-file cols rows)
   "Encode PNG-FILE as Sixel data for COLS x ROWS cells.
@@ -1726,42 +1728,45 @@ so img2sixel quantizes the small image instead of the full-size one."
           (kitty-gfx--log "sixel-encode: no encoder found (img2sixel/magick/convert)")
           (message "kitty-gfx: Sixel backend requires img2sixel or ImageMagick")
           nil)
-      (let* ((kind (car resolved))
-             (path (cdr resolved))
-             (base (file-name-nondirectory path))
-             (prescaled (when (eq kind 'img2sixel)
-                          (kitty-gfx--sixel-prescale png-file pixel-w pixel-h)))
-             (input (or prescaled png-file))
-             (args (pcase kind
-                     ('img2sixel
-                      (append (kitty-gfx--sixel-img2sixel-tuning-args)
-                              kitty-gfx-sixel-encoder-args
-                              (unless prescaled
-                                (list "-w" (number-to-string pixel-w)
-                                      "-h" (number-to-string pixel-h)))
-                              (list input)))
-                     ('imagemagick
-                      (append (list input)
-                              (list "-geometry"
-                                    (format "%dx%d" pixel-w pixel-h))
-                              (kitty-gfx--sixel-imagemagick-tuning-args)
-                              kitty-gfx-sixel-encoder-args
-                              (list "sixel:-"))))))
-        (when (string-prefix-p "convert" (downcase base))
-          (kitty-gfx--log "sixel-encode: WARNING deprecated `convert' resolved (%s); install `magick' or `img2sixel'" path))
-        (kitty-gfx--log "sixel-encode: %s -> %dx%d pixels via %s (%s%s)"
-                        input pixel-w pixel-h base kind
-                        (if prescaled ", pre-scaled" ""))
+      (let ((kind (car resolved))
+            (path (cdr resolved))
+            (prescaled nil))
         (unwind-protect
-            (with-temp-buffer
-              (set-buffer-multibyte nil)
-              (if (kitty-gfx--sixel-run-encoder
-                   path kitty-gfx-sixel-encoder-timeout
-                   (current-buffer) args)
-                  (let ((data (buffer-string)))
-                    (kitty-gfx--log "sixel-encode: success (%d bytes)" (length data))
-                    data)
-                nil))
+            (progn
+              (when (eq kind 'img2sixel)
+                (setq prescaled
+                      (kitty-gfx--sixel-prescale png-file pixel-w pixel-h)))
+              (let* ((base (file-name-nondirectory path))
+                     (input (or prescaled png-file))
+                     (args (pcase kind
+                             ('img2sixel
+                              (append (kitty-gfx--sixel-img2sixel-tuning-args)
+                                      kitty-gfx-sixel-encoder-args
+                                      (unless prescaled
+                                        (list "-w" (number-to-string pixel-w)
+                                              "-h" (number-to-string pixel-h)))
+                                      (list input)))
+                             ('imagemagick
+                              (append (list input)
+                                      (list "-geometry"
+                                            (format "%dx%d" pixel-w pixel-h))
+                                      (kitty-gfx--sixel-imagemagick-tuning-args)
+                                      kitty-gfx-sixel-encoder-args
+                                      (list "sixel:-"))))))
+                (when (string-prefix-p "convert" (downcase base))
+                  (kitty-gfx--log "sixel-encode: WARNING deprecated `convert' resolved (%s); install `magick' or `img2sixel'" path))
+                (kitty-gfx--log "sixel-encode: %s -> %dx%d pixels via %s (%s%s)"
+                                input pixel-w pixel-h base kind
+                                (if prescaled ", pre-scaled" ""))
+                (with-temp-buffer
+                  (set-buffer-multibyte nil)
+                  (if (kitty-gfx--sixel-run-encoder
+                       path kitty-gfx-sixel-encoder-timeout
+                       (current-buffer) args)
+                      (let ((data (buffer-string)))
+                        (kitty-gfx--log "sixel-encode: success (%d bytes)" (length data))
+                        data)
+                    nil))))
           (when prescaled
             (ignore-errors (delete-file prescaled))))))))
 
@@ -1777,13 +1782,43 @@ Returns non-nil on success."
       (puthash file png kitty-gfx--sixel-cache)
       t)))
 
+(defun kitty-gfx--sixel-file-stamp (file)
+  "Return FILE's modification time, or t when FILE is unreadable.
+Stored in the `kitty-gfx-sixel-failed' overlay property so a failed
+encode is retried once the file changes on disk."
+  (or (file-attribute-modification-time (file-attributes file)) t))
+
+(defun kitty-gfx--sixel-failure-current-p (ov file)
+  "Return non-nil when OV's recorded Sixel encode failure still applies.
+The failure marker stores FILE's mtime at failure time; when FILE has
+changed on disk since, the marker is cleared, OV's blank display cells
+are restored, and nil is returned so the caller re-runs the encoder.
+Returns nil when OV carries no failure marker."
+  (let ((failed (overlay-get ov 'kitty-gfx-sixel-failed)))
+    (cond
+     ((null failed) nil)
+     ((equal failed (kitty-gfx--sixel-file-stamp file)) t)
+     (t
+      (overlay-put ov 'kitty-gfx-sixel-failed nil)
+      (overlay-put ov 'display
+                   (concat (kitty-gfx--make-blank-display
+                            (overlay-get ov 'kitty-gfx-cols)
+                            (overlay-get ov 'kitty-gfx-rows))
+                           "\n"))
+      (kitty-gfx--log "sixel-place: %s changed on disk, retrying failed overlay"
+                      file)
+      nil))))
+
 (defun kitty-gfx--sixel-report-encode-failure (ov file)
   "Surface a Sixel encode failure for FILE on overlay OV.
 Replaces OV's blank display cells with a visible failure marker and
-marks OV so subsequent refreshes stop retrying the encoder.  Shows a
-one-time echo-area message (per file, per session) naming the encoder
-and whether the timeout watchdog killed it."
-  (overlay-put ov 'kitty-gfx-sixel-failed t)
+marks OV so subsequent refreshes stop retrying the encoder.  The
+marker records FILE's current mtime; a change on disk clears it (see
+`kitty-gfx--sixel-failure-current-p'), as does removing or
+re-displaying the image.  Shows a one-time echo-area message (per
+file, per session) naming the encoder and whether the timeout
+watchdog killed it."
+  (overlay-put ov 'kitty-gfx-sixel-failed (kitty-gfx--sixel-file-stamp file))
   (overlay-put ov 'display "[sixel: encode failed]\n")
   (let ((encoder (kitty-gfx--sixel-resolve-encoder)))
     (kitty-gfx--message-once
@@ -1799,13 +1834,14 @@ and whether the timeout watchdog killed it."
   "Place Sixel image at terminal position.
 Encodes on-demand if not cached, then emits DCS sequence.  An overlay
 whose encode already failed shows a text marker and is skipped, so a
-broken or hanging encoder is not re-run on every refresh."
+broken or hanging encoder is not re-run on every refresh; the failure
+sticks until the file changes on disk or the image is re-displayed."
   (let* ((file (overlay-get ov 'kitty-gfx-file))
          (png (gethash file kitty-gfx--sixel-cache))
          (cache-path (kitty-gfx--sixel-cache-path file cols rows))
          (sixel-data nil))
     (cond
-     ((overlay-get ov 'kitty-gfx-sixel-failed)
+     ((kitty-gfx--sixel-failure-current-p ov file)
       (kitty-gfx--log "sixel-place: skipping failed overlay for %s" file))
      ((not png)
       (kitty-gfx--log "sixel-place: no PNG cached for %s" file))
