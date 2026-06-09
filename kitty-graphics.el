@@ -691,6 +691,12 @@ Emacs transmitting its whole backlog inside one refresh.")
 (defvar kitty-gfx--transmit-drain-timer nil
   "Repeating timer that drains `kitty-gfx--transmit-queue'.")
 
+(defvar kitty-gfx--transmit-drain-succeeded nil
+  "Non-nil when the current drain cycle transmitted at least one image.
+Gates the trailing forced refresh in `kitty-gfx--transmit-drain': a
+cycle of pure failures must not force a refresh, because that refresh
+would re-queue the same failing transmit and spin forever.")
+
 (defvar kitty-gfx--base64-cache (make-hash-table :test 'equal)
   "Maps file paths to (MTIME . BASE64-STRING) for transmitted images.
 Bounded by `kitty-gfx-base64-cache-bytes'; see
@@ -1174,14 +1180,18 @@ Returns IMAGE-ID on success, nil on failure."
   (when kitty-gfx--transmit-drain-timer
     (cancel-timer kitty-gfx--transmit-drain-timer))
   (setq kitty-gfx--transmit-drain-timer nil
-        kitty-gfx--transmit-queue nil))
+        kitty-gfx--transmit-queue nil
+        kitty-gfx--transmit-drain-succeeded nil))
 
 (defun kitty-gfx--transmit-drain ()
   "Transmit one queued image, then stop and force a refresh when done.
 Each tick pops a single (TERMINAL FILE IMAGE-ID) entry and runs the
 Kitty prepare with output routed to that entry's terminal.  When the
-queue empties the timer cancels itself and a forced refresh is
-scheduled so the freshly transmitted images get placed."
+queue empties the timer cancels itself, and a forced refresh is
+scheduled so the freshly transmitted images get placed — but only when
+at least one transmit in the cycle succeeded; a failing transmit stays
+untransmitted and would be re-queued by the forced refresh, looping
+forever."
   (let ((entry (pop kitty-gfx--transmit-queue)))
     (when entry
       (let ((term (nth 0 entry))
@@ -1191,13 +1201,16 @@ scheduled so the freshly transmitted images get placed."
             (kitty-gfx--log "transmit-drain: dropped id=%d (dead terminal)" id)
           (kitty-gfx--log "transmit-drain: id=%d term=%s (queued=%d)"
                           id term (length kitty-gfx--transmit-queue))
-          (kitty-gfx--with-terminal term
-            (kitty-gfx--kitty-prepare file id))))))
+          (when (kitty-gfx--with-terminal term
+                  (kitty-gfx--kitty-prepare file id))
+            (setq kitty-gfx--transmit-drain-succeeded t))))))
   (unless kitty-gfx--transmit-queue
     (when kitty-gfx--transmit-drain-timer
       (cancel-timer kitty-gfx--transmit-drain-timer)
       (setq kitty-gfx--transmit-drain-timer nil))
-    (kitty-gfx--schedule-refresh t)))
+    (when kitty-gfx--transmit-drain-succeeded
+      (setq kitty-gfx--transmit-drain-succeeded nil)
+      (kitty-gfx--schedule-refresh t))))
 
 (defun kitty-gfx--transmit-enqueue (term file image-id)
   "Queue IMAGE-ID/FILE for transmission to TERM and ensure the drain runs.
@@ -2715,20 +2728,30 @@ A clean result means nothing an image placement depends on has changed
 since the last successful refresh, so `kitty-gfx--on-redisplay' can
 skip scheduling one.  Windows showing an mpv or browser overlay are
 never considered clean — their terminal-side frames move independently
-of any buffer-visible state the signature captures."
-  (catch 'dirty
-    (walk-windows
-     (lambda (w)
-       (let ((buf (window-buffer w)))
-         (when (or (buffer-local-value 'kitty-gfx--mpv-overlay buf)
-                   (buffer-local-value 'kitty-gfx--browser-overlay buf))
-           (throw 'dirty nil))
-         (when (buffer-local-value 'kitty-gfx--overlays buf)
-           (unless (equal (kitty-gfx--window-signature w)
-                          (window-parameter w 'kitty-gfx-sig))
-             (throw 'dirty nil)))))
-     nil 'visible)
-    t))
+of any buffer-visible state the signature captures.  Overlay windows on
+the selected frame's terminal are also dirty while that terminal's cell
+size is still unqueried: `kitty-gfx--refresh' can only run the
+capability queries while their terminal is the selected one, so
+skipping here would leave a late-attaching client on fallback geometry
+forever."
+  (let ((selected-term (unless (display-graphic-p) (frame-terminal))))
+    (catch 'dirty
+      (walk-windows
+       (lambda (w)
+         (let ((buf (window-buffer w)))
+           (when (or (buffer-local-value 'kitty-gfx--mpv-overlay buf)
+                     (buffer-local-value 'kitty-gfx--browser-overlay buf))
+             (throw 'dirty nil))
+           (when (buffer-local-value 'kitty-gfx--overlays buf)
+             (when (and selected-term
+                        (eq (frame-terminal (window-frame w)) selected-term)
+                        (not (terminal-parameter selected-term 'kitty-gfx-cell-w)))
+               (throw 'dirty nil))
+             (unless (equal (kitty-gfx--window-signature w)
+                            (window-parameter w 'kitty-gfx-sig))
+               (throw 'dirty nil)))))
+       nil 'visible)
+      t)))
 
 (defun kitty-gfx--update-window-signatures ()
   "Store the current signature on every visible overlay window.
@@ -3267,7 +3290,8 @@ matching the synchronous path's no-overlay-on-failure behaviour."
              (with-current-buffer buf
                (dolist (ov (copy-sequence kitty-gfx--overlays))
                  (when (equal (overlay-get ov 'kitty-gfx-file) file)
-                   (kitty-gfx--remove-overlay ov))))))
+                   (kitty-gfx--remove-overlay ov)))))
+           (kitty-gfx--schedule-refresh t))
        (puthash file png kitty-gfx--sixel-cache)
        (kitty-gfx--schedule-refresh t)))))
 
