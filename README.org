@@ -1,4 +1,4 @@
-#+TITLE: kitty-graphics.el
++TITLE: kitty-graphics.el
 #+AUTHOR: cashmere
 
 Display images, video, and scaled text directly in terminal Emacs (~emacs -nw~) using the [[https://sw.kovidgoyal.net/kitty/graphics-protocol/][Kitty graphics protocol]] or [[https://en.wikipedia.org/wiki/Sixel][Sixel]]. Beyond inline images it also does inline [[https://mpv.io/][mpv]] video playback, org-mode heading text sizing (OSC 66), and [[https://typst.app/][typst]] math previews.
@@ -62,6 +62,23 @@ Integrations and capabilities:
 TERM=xterm-256color emacsclient -nw
 #+end_src
 
+** Daemon and multiple clients
+
+The package works under ~emacs --daemon~ with several ~emacsclient -t~
+clients attached to different terminals at the same time. Each client's
+graphics are routed to its own tty, and capabilities are detected per
+client, so one client in Kitty and another in a Sixel terminal both
+render correctly and concurrently. New clients are picked up
+automatically; a client's terminal capabilities are probed the first time
+that client is focused.
+
+Inline video (mpv) and the inline browser (casty) are the exception: each
+streams a single byte stream to one terminal, so playback is bound to the
+client it was started on. If you display that buffer on a second client,
+the video/browser keeps rendering only on the launching client and the
+other client shows the reserved blank area. Closing the launching client
+stops its playback.
+
 * Installation
 
 ** straight.el
@@ -69,10 +86,9 @@ TERM=xterm-256color emacsclient -nw
 #+begin_src emacs-lisp
 (use-package kitty-graphics
   :straight (:local-repo "~/projects/kitty-graphics")
-  :if (not (display-graphic-p))
   :config
   (setq kitty-gfx-enable-video t)   ; optional: inline mpv playback
-  (kitty-graphics-mode 1))
+  (kitty-graphics-setup))
 #+end_src
 
 ** Manual
@@ -80,17 +96,18 @@ TERM=xterm-256color emacsclient -nw
 #+begin_src emacs-lisp
 (add-to-list 'load-path "~/projects/kitty-graphics")
 (require 'kitty-graphics)
-(when (not (display-graphic-p))
-  (kitty-graphics-mode 1))
+(kitty-graphics-setup)
 #+end_src
 
 * Usage
 
-Enable the global minor mode:
+Enable the package with ~kitty-graphics-setup~. It works the same whether you run a plain terminal Emacs or a daemon: under ~emacs --daemon~ there is no terminal at startup, so it defers enabling to the first ~emacsclient -t~ frame and then detects every later client automatically. No extra daemon configuration is needed.
 
 #+begin_src emacs-lisp
-(kitty-graphics-mode 1)
+(kitty-graphics-setup)
 #+end_src
+
+For a one-off interactive terminal session you can also toggle the global minor mode directly with ~kitty-graphics-mode~.
 
 Then:
 - In org-mode: toggle inline images with =C-c C-x C-v=
@@ -110,6 +127,7 @@ Then:
 
 | Command                   | Description                        |
 |---------------------------+------------------------------------|
+| ~kitty-graphics-setup~    | Enable, daemon- and tty-aware      |
 | ~kitty-graphics-mode~     | Toggle the global minor mode       |
 | ~kitty-gfx-display-image~ | Display an image file at point     |
 | ~kitty-gfx-remove-images~ | Remove images in region or buffer  |
@@ -178,6 +196,30 @@ The =SPC= / =q= / =?= keys are active on the video overlay while a video plays.
 | ~kitty-gfx-cache-size~         |      64 | Max images kept in the terminal-side cache |
 | ~kitty-gfx-debug~              |     nil | Log debug info to the debug buffer / log   |
 
+*** shr images (eww, elfeed, mu4e, gnus)
+
+| Variable                    | Default | Description                                              |
+|-----------------------------+---------+----------------------------------------------------------|
+| ~kitty-gfx-shr-scale~       | nil     | Image sizing for shr backends: nil, a float, or ~fit~    |
+| ~kitty-gfx-shr-fit-width~   | 0.6     | Fraction of the window width under ~fit~ sizing          |
+| ~kitty-gfx-shr-fit-height~  | 20      | Maximum image height in rows under ~fit~ sizing          |
+
+By default shr images render at natural size, shrinking only to fit ~kitty-gfx-max-width~ / ~kitty-gfx-max-height~ — which often leaves feed images dominating the buffer. ~kitty-gfx-shr-scale~ tames them:
+
+- ~nil~ — natural size (shrink-to-fit the max dimensions), the default.
+- a float such as ~0.25~ — render every image at that fraction of its natural width and height, still capped at the max dimensions.
+- ~fit~ — dynamically scale each image into a box derived from the *live* window: at most ~kitty-gfx-shr-fit-width~ of the window's width and ~kitty-gfx-shr-fit-height~ rows tall, preserving aspect ratio and never enlarging images that already fit. The box follows the window, so narrowing the window shrinks the images with it.
+
+#+begin_src emacs-lisp
+;; Quarter-size feed images:
+(setq kitty-gfx-shr-scale 0.25)
+
+;; Or: dynamic, window-relative sizing (recommended for elfeed/eww):
+(setq kitty-gfx-shr-scale 'fit
+      kitty-gfx-shr-fit-width 0.6
+      kitty-gfx-shr-fit-height 20)
+#+end_src
+
 *** Sixel encoder
 
 | Variable                          | Default | Description                                          |
@@ -220,7 +262,7 @@ The =SPC= / =q= / =?= keys are active on the video overlay while a video plays.
 | ~kitty-gfx-typst-text-size~ | 11      | Text size in points for rendered math fragments  |
 | ~kitty-gfx-typst-preamble~  | nil     | Extra typst code prepended to each math fragment |
 
-The image-sizing defaults (~kitty-gfx-max-width~ / ~kitty-gfx-max-height~) govern inline images in org-mode, eww, and dired previews. Doc-view ignores these and fills the window, with =+= / =-= / =0= for zoom.
+The image-sizing defaults (~kitty-gfx-max-width~ / ~kitty-gfx-max-height~) govern inline images in org-mode, eww, and dired previews; the shr backends (eww, elfeed, mu4e, gnus) can shrink further via ~kitty-gfx-shr-scale~ (see above). Doc-view ignores these and fills the window, with =+= / =-= / =0= for zoom.
 
 * How It Works
 
@@ -241,6 +283,7 @@ PNG is sent directly to the terminal. Other formats (JPEG, GIF, WebP, SVG, TIFF,
 
 - *tmux*: Kitty graphics now work inside tmux via DCS passthrough (~kitty-gfx-tmux-passthrough~), with a Unicode-placeholder placement mode (~kitty-gfx-kitty-placement-mode~) to survive pane switches. Sixel also works inside tmux >= 3.4 (foot/Konsole/mintty/mlterm/WezTerm as the outer terminal; ~kitty-gfx-tmux-allow-sixel~ to opt out). Because tmux's cell buffer is not pixel-aware, images may stick to old positions after scrolling, an upstream tmux limitation
 - Inline video is *Kitty backend only*: the Sixel re-emit cost per frame makes playback impractical
+- Under a daemon, inline video and the casty browser are *bound to the client they were launched on* (a single subprocess streams to one terminal); other clients showing the same buffer see only the reserved blank area. Static images have no such limit and render on every client at once
 - Animated GIFs display only the first frame (they route through the image pipeline as static images)
 - Sixel is limited to 256 colors (vs truecolor on Kitty) and is stateless, so images are re-emitted on every scroll, which may be slower on large images
 - The Sixel backend needs a Sixel encoder on ~PATH~. ~img2sixel~ (libsixel) is strongly recommended; ~magick~ / ~convert~ work as fallback but are noticeably slower. With no encoder on ~PATH~, the backend silently produces no output and only logs ~no encoder found~ when ~kitty-gfx-debug~ is non-nil
