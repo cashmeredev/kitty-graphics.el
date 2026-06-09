@@ -5,6 +5,8 @@
 
 set shell := ["bash", "-cu"]
 
+export KITTY_GFX_DEBUG := "1"
+
 EMACS  := env_var_or_default("EMACS", "emacs")
 TERM_  := env_var_or_default("KGFX_TERM", "xterm-256color")
 SRC    := "kitty-graphics.el"

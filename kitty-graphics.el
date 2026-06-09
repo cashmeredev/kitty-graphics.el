@@ -162,8 +162,9 @@ When nil, conversion blocks Emacs as before."
   :type 'boolean
   :group 'kitty-graphics)
 
-(defcustom kitty-gfx-debug nil
-  "When non-nil, log debug info to *kitty-gfx-debug* buffer."
+(defcustom kitty-gfx-debug (and (getenv "KITTY_GFX_DEBUG") t)
+  "When non-nil, log debug info to *kitty-gfx-debug* buffer.
+Defaults to t when the KITTY_GFX_DEBUG environment variable is set."
   :type 'boolean
   :group 'kitty-graphics)
 
