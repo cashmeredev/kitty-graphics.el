@@ -830,6 +830,10 @@ multicell block and clip its leading glyphs.")
 (defvar-local kitty-gfx--mpv-ipc-connection nil
   "Network process connected to mpv's IPC socket.")
 
+(defvar-local kitty-gfx--mpv-ipc-timer nil
+  "Pending socket-poll timer of `kitty-gfx--mpv-ipc-connect'.
+Stored so `kitty-gfx--mpv-cleanup' can cancel an in-flight poll.")
+
 (defvar-local kitty-gfx--mpv-overlay nil
   "The overlay reserving space for the video.")
 
@@ -865,6 +869,10 @@ across window hide/show.")
 
 (defvar-local kitty-gfx--browser-ipc-connection nil
   "Network process connected to casty's IPC socket.")
+
+(defvar-local kitty-gfx--browser-ipc-timer nil
+  "Pending socket-poll timer of `kitty-gfx--browser-ipc-connect'.
+Stored so `kitty-gfx--browser-cleanup' can cancel an in-flight poll.")
 
 (defvar-local kitty-gfx--browser-overlay nil
   "The overlay reserving space for the browser frame.")
@@ -1660,6 +1668,7 @@ Returns t on success, nil on failure (failures are logged, not signalled)."
                                   ""
                                 (concat ": " stderr)))
               nil))))
+      (when (process-live-p proc) (delete-process proc))
       (when timer (cancel-timer timer))
       (when (buffer-live-p stderr-buf) (kill-buffer stderr-buf)))))
 
@@ -3406,6 +3415,26 @@ second terminal skips the read+encode cost."
            (cons (file-attribute-modification-time (file-attributes file)) png)
            kitty-gfx--png-cache)
   png)
+
+(defun kitty-gfx--cleanup-temp-files ()
+  "Delete converted temp PNGs and any leftover mpv/casty IPC socket files.
+Runs from `kill-emacs-hook' so the `kitty-gfx--png-cache' temp files do
+not accumulate in /tmp across sessions.  Cache entries whose PNG path is
+the source file itself are skipped — that is user data, not ours."
+  (maphash (lambda (file entry)
+             (let ((png (cdr entry)))
+               (unless (string= png file)
+                 (ignore-errors (delete-file png)))))
+           kitty-gfx--png-cache)
+  (clrhash kitty-gfx--png-cache)
+  (dolist (buf (buffer-list))
+    (when (buffer-live-p buf)
+      (dolist (sock (list (buffer-local-value 'kitty-gfx--mpv-ipc-socket buf)
+                          (buffer-local-value 'kitty-gfx--browser-ipc-socket buf)))
+        (when sock
+          (ignore-errors (delete-file sock)))))))
+
+(add-hook 'kill-emacs-hook #'kitty-gfx--cleanup-temp-files)
 
 (defun kitty-gfx--convert-program ()
   "Return the ImageMagick binary to use for PNG conversion, or nil."
@@ -5546,14 +5575,37 @@ COMMAND is encoded as {\"command\": COMMAND}."
         (error
          (kitty-gfx--log "mpv-ipc-send error: %s" (error-message-string err)))))))
 
-(defun kitty-gfx--mpv-ipc-connect (socket-path callback)
-  "Poll for SOCKET-PATH existence, then connect and call CALLBACK.
-Polls every 50ms, times out after 2 seconds."
+(defun kitty-gfx--mpv-ipc-connect (socket-path buffer)
+  "Poll for SOCKET-PATH existence, then connect and store the process in BUFFER.
+Polls every 50ms, times out after 2 seconds.  The poll timer is stored
+buffer-locally in BUFFER so `kitty-gfx--mpv-cleanup' can cancel it, and
+polling stops on its own when BUFFER no longer records SOCKET-PATH as
+its mpv IPC socket (the session was torn down or replaced)."
   (let ((attempts 0)
         (max-attempts 40))
     (cl-labels
-        ((try-connect ()
+        ((session-live-p ()
+           (and (buffer-live-p buffer)
+                (with-current-buffer buffer
+                  (equal kitty-gfx--mpv-ipc-socket socket-path))))
+         (retry ()
+           (cl-incf attempts)
+           (if (>= attempts max-attempts)
+               (progn
+                 (kitty-gfx--log "mpv: IPC socket timeout after 2s")
+                 (message "kitty-gfx: mpv IPC connection timed out"))
+             (let ((timer (run-at-time 0.05 nil #'try-connect)))
+               (when (buffer-live-p buffer)
+                 (with-current-buffer buffer
+                   (setq kitty-gfx--mpv-ipc-timer timer))))))
+         (try-connect ()
+           (when (buffer-live-p buffer)
+             (with-current-buffer buffer
+               (setq kitty-gfx--mpv-ipc-timer nil)))
            (cond
+            ((not (session-live-p))
+             (kitty-gfx--log "mpv: IPC poll abandoned, session gone (%s)"
+                             socket-path))
             ((file-exists-p socket-path)
              (condition-case err
                  (let ((proc (make-network-process
@@ -5564,20 +5616,13 @@ Polls every 50ms, times out after 2 seconds."
                               :noquery t
                               :filter (lambda (_proc output)
                                         (kitty-gfx--log "mpv-ipc: %s" output)))))
-                   (setq kitty-gfx--mpv-ipc-connection proc)
-                   (kitty-gfx--log "mpv: IPC connected to %s" socket-path)
-                   (when callback (funcall callback)))
+                   (with-current-buffer buffer
+                     (setq kitty-gfx--mpv-ipc-connection proc))
+                   (kitty-gfx--log "mpv: IPC connected to %s" socket-path))
                (error
                 (kitty-gfx--log "mpv: IPC connect failed: %s" (error-message-string err))
-                (cl-incf attempts)
-                (when (< attempts max-attempts)
-                  (run-at-time 0.05 nil #'try-connect)))))
-            ((< attempts max-attempts)
-             (cl-incf attempts)
-             (run-at-time 0.05 nil #'try-connect))
-            (t
-             (kitty-gfx--log "mpv: IPC socket timeout after 2s")
-             (message "kitty-gfx: mpv IPC connection timed out")))))
+                (retry))))
+            (t (retry)))))
       (try-connect))))
 
 (defun kitty-gfx--mpv-compute-geometry ()
@@ -5721,6 +5766,9 @@ PROC is the mpv process, EVENT describes the state change."
 
 (defun kitty-gfx--mpv-cleanup ()
   "Clean up mpv state in the current buffer."
+  (when kitty-gfx--mpv-ipc-timer
+    (cancel-timer kitty-gfx--mpv-ipc-timer)
+    (setq kitty-gfx--mpv-ipc-timer nil))
   (when kitty-gfx--mpv-ipc-connection
     (ignore-errors (delete-process kitty-gfx--mpv-ipc-connection))
     (setq kitty-gfx--mpv-ipc-connection nil))
@@ -5860,7 +5908,7 @@ Requires `kitty-gfx-enable-video' to be non-nil and mpv installed."
       (process-put proc 'kitty-gfx-terminal kitty-gfx--mpv-terminal)
       (kitty-gfx--log "mpv: started pid=%s file=%s" (process-id proc) file)
       ;; Connect IPC after mpv creates the socket
-      (kitty-gfx--mpv-ipc-connect socket-path nil))))
+      (kitty-gfx--mpv-ipc-connect socket-path (current-buffer)))))
 
 (defun kitty-gfx--mpv-filter (proc chunk)
   "Forward mpv/casty stdout CHUNK to the terminal PROC was launched on.
@@ -5869,8 +5917,12 @@ to stdout.  When spawned as a subprocess of Emacs, those bytes land here.
 Writing them back out with `send-string-to-terminal' makes the terminal
 paint the frames inline.  The target terminal is the one recorded on PROC
 at launch, so under a daemon only the launching client is painted; nil
-falls back to the selected terminal for the single-client case."
-  (when (and chunk (> (length chunk) 0))
+falls back to the selected terminal for the single-client case.
+Chunks are dropped while the process carries the `kitty-gfx-suppress'
+flag, set by `kitty-gfx--refresh-browser-overlay' while no window shows
+the browser buffer."
+  (when (and chunk (> (length chunk) 0)
+             (not (process-get proc 'kitty-gfx-suppress)))
     (condition-case err
         (send-string-to-terminal chunk (process-get proc 'kitty-gfx-terminal))
       (error
@@ -6002,12 +6054,35 @@ process.  A reply with `hintActive' false clears the owning buffer's
 
 (defun kitty-gfx--browser-ipc-connect (socket-path buffer)
   "Poll for SOCKET-PATH, then connect and store the process in BUFFER.
-Polls every 50ms, times out after 2 seconds (mirrors the mpv path)."
+Polls every 50ms, times out after 2 seconds (mirrors the mpv path).
+The poll timer is stored buffer-locally in BUFFER so
+`kitty-gfx--browser-cleanup' can cancel it, and polling stops on its
+own when BUFFER no longer records SOCKET-PATH as its casty socket."
   (let ((attempts 0)
         (max-attempts 40))
     (cl-labels
-        ((try-connect ()
+        ((session-live-p ()
+           (and (buffer-live-p buffer)
+                (with-current-buffer buffer
+                  (equal kitty-gfx--browser-ipc-socket socket-path))))
+         (retry ()
+           (cl-incf attempts)
+           (if (>= attempts max-attempts)
+               (progn
+                 (kitty-gfx--log "browser: IPC socket timeout after 2s")
+                 (message "kitty-gfx: casty IPC connection timed out"))
+             (let ((timer (run-at-time 0.05 nil #'try-connect)))
+               (when (buffer-live-p buffer)
+                 (with-current-buffer buffer
+                   (setq kitty-gfx--browser-ipc-timer timer))))))
+         (try-connect ()
+           (when (buffer-live-p buffer)
+             (with-current-buffer buffer
+               (setq kitty-gfx--browser-ipc-timer nil)))
            (cond
+            ((not (session-live-p))
+             (kitty-gfx--log "browser: IPC poll abandoned, session gone (%s)"
+                             socket-path))
             ((file-exists-p socket-path)
              (condition-case err
                  (let ((proc (make-network-process
@@ -6018,21 +6093,13 @@ Polls every 50ms, times out after 2 seconds (mirrors the mpv path)."
                               :noquery t
                               :filter #'kitty-gfx--browser-ipc-filter)))
                    (process-put proc 'kitty-gfx-buffer buffer)
-                   (when (buffer-live-p buffer)
-                     (with-current-buffer buffer
-                       (setq kitty-gfx--browser-ipc-connection proc)))
+                   (with-current-buffer buffer
+                     (setq kitty-gfx--browser-ipc-connection proc))
                    (kitty-gfx--log "browser: IPC connected to %s" socket-path))
                (error
                 (kitty-gfx--log "browser: IPC connect failed: %s" (error-message-string err))
-                (cl-incf attempts)
-                (when (< attempts max-attempts)
-                  (run-at-time 0.05 nil #'try-connect)))))
-            ((< attempts max-attempts)
-             (cl-incf attempts)
-             (run-at-time 0.05 nil #'try-connect))
-            (t
-             (kitty-gfx--log "browser: IPC socket timeout after 2s")
-             (message "kitty-gfx: casty IPC connection timed out")))))
+                (retry))))
+            (t (retry)))))
       (try-connect))))
 
 (defun kitty-gfx--browser-compute-geometry ()
@@ -6080,33 +6147,54 @@ in WIN or while a minibuffer is active (mirrors the mpv logic)."
 (defun kitty-gfx--refresh-browser-overlay ()
   "Send a `set-geometry' IPC command when the browser overlay has moved.
 No IPC is sent while a minibuffer is active so prompts do not yank the
-frame to the top of the screen."
+frame to the top of the screen.  When no window shows the browser
+buffer, frame forwarding is suppressed (mirroring the mpv auto-pause):
+a flag on the casty process makes `kitty-gfx--mpv-filter' drop frames,
+and the on-screen image is deleted on the launch terminal so it does
+not paint over unrelated content.  When a window shows the buffer
+again the flag is cleared and the geometry is re-emitted, which makes
+casty repaint the frame."
   (when (and kitty-gfx--browser-process
              (process-live-p kitty-gfx--browser-process)
-             kitty-gfx--browser-overlay
-             (not (active-minibuffer-window)))
-    (let ((win (kitty-gfx--browser-canonical-window)))
-      (when win
-        (let ((pos (kitty-gfx--browser-overlay-position win)))
-          (when pos
-            (let ((row (car pos))
-                  (col (cdr pos)))
-              (cond
-               ;; Unchanged -- nothing to do.
-               ((and (eql row kitty-gfx--browser-last-row)
-                     (eql col kitty-gfx--browser-last-col)))
-               ;; Drop a suspicious (1,1) reposition when we already had a
-               ;; real position (transient-window mishap during prompts).
-               ((and kitty-gfx--browser-last-row
-                     (not (and (eql kitty-gfx--browser-last-row 1)
-                               (eql kitty-gfx--browser-last-col 1)))
-                     (eql row 1) (eql col 1))
-                (kitty-gfx--log "browser: ignoring suspicious origin reposition"))
-               (t
-                (kitty-gfx--log "browser: reposition row=%d col=%d" row col)
-                (kitty-gfx--browser-send (list :cmd "set-geometry" :top row :left col))
-                (setq kitty-gfx--browser-last-row row
-                      kitty-gfx--browser-last-col col))))))))))
+             kitty-gfx--browser-overlay)
+    (cond
+     ((active-minibuffer-window)
+      (kitty-gfx--log "browser: minibuffer active, holding position"))
+     (t
+      (let ((win (kitty-gfx--browser-canonical-window))
+            (proc kitty-gfx--browser-process))
+        (if (not win)
+            (unless (process-get proc 'kitty-gfx-suppress)
+              (kitty-gfx--log "browser: buffer hidden, suppressing frames")
+              (process-put proc 'kitty-gfx-suppress t)
+              (setq kitty-gfx--browser-last-row nil
+                    kitty-gfx--browser-last-col nil)
+              (when (and kitty-gfx--browser-image-id
+                         (terminal-live-p kitty-gfx--browser-terminal))
+                (kitty-gfx--with-terminal kitty-gfx--browser-terminal
+                  (kitty-gfx--delete-by-id kitty-gfx--browser-image-id))))
+          (when (process-get proc 'kitty-gfx-suppress)
+            (kitty-gfx--log "browser: buffer visible again, resuming frames")
+            (process-put proc 'kitty-gfx-suppress nil)
+            (setq kitty-gfx--browser-last-row nil
+                  kitty-gfx--browser-last-col nil))
+          (let ((pos (kitty-gfx--browser-overlay-position win)))
+            (when pos
+              (let ((row (car pos))
+                    (col (cdr pos)))
+                (cond
+                 ((and (eql row kitty-gfx--browser-last-row)
+                       (eql col kitty-gfx--browser-last-col)))
+                 ((and kitty-gfx--browser-last-row
+                       (not (and (eql kitty-gfx--browser-last-row 1)
+                                 (eql kitty-gfx--browser-last-col 1)))
+                       (eql row 1) (eql col 1))
+                  (kitty-gfx--log "browser: ignoring suspicious origin reposition"))
+                 (t
+                  (kitty-gfx--log "browser: reposition row=%d col=%d" row col)
+                  (kitty-gfx--browser-send (list :cmd "set-geometry" :top row :left col))
+                  (setq kitty-gfx--browser-last-row row
+                        kitty-gfx--browser-last-col col))))))))))))
 
 (defun kitty-gfx--browser-process-sentinel (proc event)
   "Clean up when the casty PROC exits.  EVENT describes the change."
@@ -6120,6 +6208,9 @@ frame to the top of the screen."
 (defun kitty-gfx--browser-cleanup ()
   "Tear down the casty browser in the current buffer.
 Safe to call more than once."
+  (when kitty-gfx--browser-ipc-timer
+    (cancel-timer kitty-gfx--browser-ipc-timer)
+    (setq kitty-gfx--browser-ipc-timer nil))
   (when kitty-gfx--browser-ipc-connection
     (ignore-errors (delete-process kitty-gfx--browser-ipc-connection))
     (setq kitty-gfx--browser-ipc-connection nil))
@@ -6130,6 +6221,15 @@ Safe to call more than once."
   (when kitty-gfx--browser-ipc-socket
     (ignore-errors (delete-file kitty-gfx--browser-ipc-socket))
     (setq kitty-gfx--browser-ipc-socket nil))
+  (let ((log (get-buffer "*kitty-casty-log*")))
+    (when (and log
+               (not (cl-some
+                     (lambda (b)
+                       (let ((p (buffer-local-value 'kitty-gfx--browser-process b)))
+                         (and p (process-live-p p))))
+                     (buffer-list))))
+      (let ((kill-buffer-query-functions nil))
+        (ignore-errors (kill-buffer log)))))
   ;; Free the kitty image casty was drawing into.
   (when kitty-gfx--browser-image-id
     (ignore-errors (kitty-gfx--delete-by-id kitty-gfx--browser-image-id))
