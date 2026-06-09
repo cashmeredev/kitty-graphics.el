@@ -30,6 +30,18 @@ The minor modes disabled while heading sizes are active are now customizable via
 
 When the same org buffer is shown in several windows or terminals, one canonical window per buffer (preferring the selected window) renders the scaled headings; all other windows show plain heading text instead of flickering. Per-window heading rendering is a known limitation.
 
+*** Sixel and tmux
+
+Sixel encoding gained tuning knobs: new ~kitty-gfx-sixel-dither~ (nil for the encoder default, ~"none"~, ~"fs"~, or ~"atkinson"~) and ~kitty-gfx-sixel-colors~ (palette size, default 256) map onto img2sixel's ~-d~/~-p~ and ImageMagick's ~-dither~/~-colors~ flags; ~kitty-gfx-sixel-encoder-args~ remains the raw escape hatch appended after them. ImageMagick now resizes before quantizing, so the palette reduction actually sticks. Dropping to 16 colors with dithering off cuts the test-image payload from 2042 to 1412 bytes (img2sixel) and 4904 to 1712 (magick).
+
+When img2sixel encodes a source image larger than the target pixel box and ImageMagick is available, the image is first pre-scaled to a temp PNG (bounded by the same timeout watchdog as encoder runs) and img2sixel encodes that without ~-w~/~-h~, so quantization runs on the small image instead of the full-size one. The temp PNG is deleted after encoding; cache keys are unchanged.
+
+A failed or timed-out Sixel encode is no longer silent blank cells: the overlay shows a visible =[sixel: encode failed]= marker, a one-time message (per file, per session) names the encoder and whether the timeout watchdog killed it, and the failing overlay is not retried on every refresh.
+
+tmux detection is now per terminal: the tmux version cache moved from a global to a terminal parameter, and the version is asked from each client's own tmux server (socket derived from that frame's TMUX env var) so daemon clients sitting in different tmux servers detect independently. When Sixel inside tmux is refused for an old tmux, the message names the detected version and the 3.4 minimum.
+
+New ~kitty-gfx--tmux-passthrough-p~ queries =#{allow-passthrough}= on the client's tmux socket (cached per terminal, ~on~/~all~ count as enabled). When the outer terminal speaks the Kitty protocol but tmux passthrough is off, the Kitty backend is no longer selected blindly — detection emits a one-time message with the exact fix (=tmux set -g allow-passthrough on=) and falls through to Sixel when available.
+
 *** Features
 
 **** Multi-tty daemon support

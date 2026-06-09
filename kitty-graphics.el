@@ -273,6 +273,21 @@ Useful for debugging and batch testing without a real terminal.")
               (forward-line 500)
               (delete-region (point-min) (point)))))))))
 
+(defvar kitty-gfx--messaged-once (make-hash-table :test 'equal)
+  "Keys of one-time user messages already shown this session.
+Used by `kitty-gfx--message-once' so recurring conditions (encode
+failures, tmux misconfiguration) surface exactly one echo-area
+message instead of spamming on every refresh.")
+
+(defun kitty-gfx--message-once (key msg)
+  "Show MSG in the echo area at most once per session for KEY.
+Repeat calls with the same KEY only log MSG.  Returns MSG."
+  (if (gethash key kitty-gfx--messaged-once)
+      (kitty-gfx--log "message-once: suppressed %s" key)
+    (puthash key t kitty-gfx--messaged-once)
+    (message "%s" msg))
+  msg)
+
 (defcustom kitty-gfx-tmux-passthrough t
   "When non-nil, wrap Kitty graphics APC sequences with the tmux DCS
 passthrough envelope inside tmux.  Required for the Kitty protocol to
@@ -339,13 +354,16 @@ nil target means the selected frame's terminal.  Returns VALUE."
 
 (defun kitty-gfx--clear-terminal-state (term)
   "Drop all kitty-graphics per-client state stored on terminal TERM.
-Clears the detected backend, queried cell size, text-sizing level, and
-the query/transmission bookkeeping so the terminal is treated as fresh."
+Clears the detected backend, queried cell size, text-sizing level,
+tmux probe results, and the query/transmission bookkeeping so the
+terminal is treated as fresh."
   (when (terminal-live-p term)
     (set-terminal-parameter term 'kitty-gfx-backend nil)
     (set-terminal-parameter term 'kitty-gfx-cell-w nil)
     (set-terminal-parameter term 'kitty-gfx-cell-h nil)
     (set-terminal-parameter term 'kitty-gfx-text-sizing nil)
+    (set-terminal-parameter term 'kitty-gfx-tmux-version nil)
+    (set-terminal-parameter term 'kitty-gfx-tmux-passthrough nil)
     (set-terminal-parameter term 'kitty-gfx-transmitted nil)))
 
 ;; Kitty stores transmitted image data per terminal: an `a=t' transmit to
@@ -613,8 +631,32 @@ unless the basename is `magick' or `convert'."
 
 (defcustom kitty-gfx-sixel-encoder-args nil
   "Extra arguments passed to `kitty-gfx-sixel-encoder-program'.
-These come before the per-invocation size flags and the input file."
+The raw escape hatch: appended after the dither/palette arguments
+derived from `kitty-gfx-sixel-dither' and `kitty-gfx-sixel-colors'.
+For img2sixel these come before the per-invocation size flags and the
+input file; for ImageMagick they come after the `-geometry' resize and
+before the `sixel:-' output."
   :type '(repeat string)
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-sixel-dither nil
+  "Dithering algorithm for Sixel encoding, or nil for the encoder default.
+\"none\" disables dithering, \"fs\" selects Floyd-Steinberg, and
+\"atkinson\" selects Atkinson.  img2sixel supports all three via
+`-d'; ImageMagick maps \"none\" to `+dither' and both \"fs\" and
+\"atkinson\" to `-dither FloydSteinberg' (Atkinson is img2sixel-only)."
+  :type '(choice (const :tag "Encoder default" nil)
+                 (const :tag "No dithering" "none")
+                 (const :tag "Floyd-Steinberg" "fs")
+                 (const :tag "Atkinson (img2sixel only)" "atkinson"))
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-sixel-colors 256
+  "Number of palette colors for Sixel encoding.
+Passed as `-p N' to img2sixel and `-colors N' to ImageMagick.
+Lower values shrink the Sixel payload at the cost of color fidelity;
+nil leaves the palette size to the encoder."
+  :type '(choice (const :tag "Encoder default" nil) integer)
   :group 'kitty-graphics)
 
 (defcustom kitty-gfx-sixel-encoder-timeout 5.0
@@ -1174,17 +1216,29 @@ clients see the attached terminal's environment.
 
 Inside tmux `TERM_PROGRAM' is masked to \"tmux\", so we also accept
 terminal-specific env markers (e.g. `GHOSTTY_RESOURCES_DIR') as
-evidence that the outer terminal speaks the Kitty protocol."
+evidence that the outer terminal speaks the Kitty protocol.
+
+When inside tmux with `allow-passthrough' off, the Kitty APC escapes
+would be swallowed by tmux, so the backend reports unsupported (with
+a one-time message naming the fix) and detection falls through to
+Sixel when available."
   (let* ((frame (selected-frame))
          (kitty-pid (kitty-gfx--frame-getenv "KITTY_PID" frame))
          (term-prog (kitty-gfx--frame-getenv "TERM_PROGRAM" frame))
          (ghostty (or (kitty-gfx--frame-getenv "GHOSTTY_RESOURCES_DIR" frame)
                       (kitty-gfx--frame-getenv "GHOSTTY_BIN_DIR" frame)))
          (wezterm (kitty-gfx--frame-getenv "WEZTERM_EXECUTABLE" frame))
+         (in-tmux (kitty-gfx--frame-getenv "TMUX" frame))
          (supported (or kitty-pid
                         ghostty
                         wezterm
                         (member term-prog '("kitty" "WezTerm" "ghostty")))))
+    (when (and supported in-tmux (not (kitty-gfx--tmux-passthrough-p frame)))
+      (kitty-gfx--log "kitty-detect: disabled, tmux allow-passthrough is off")
+      (kitty-gfx--message-once
+       "tmux-passthrough-off"
+       "kitty-gfx: tmux blocks Kitty graphics (allow-passthrough is off); run: tmux set -g allow-passthrough on")
+      (setq supported nil))
     (kitty-gfx--log "kitty-detect: %s (KITTY_PID=%s TERM_PROGRAM=%s GHOSTTY=%s WEZTERM=%s)"
                      supported kitty-pid term-prog
                      (if ghostty "set" "no") (if wezterm "set" "no"))
@@ -1376,27 +1430,88 @@ is cheap."
 (defvar kitty-gfx--sixel-cache (make-hash-table :test 'equal)
   "Maps (file . dims-string) to temp sixel file paths.")
 
-(defvar kitty-gfx--tmux-version-cache 'unset
-  "Cached `kitty-gfx--tmux-version' result.
-Sentinel `unset' means the probe has not run yet; nil means tmux was
-absent or its version could not be parsed; otherwise a list (MAJOR MINOR).")
+(defun kitty-gfx--tmux-socket (&optional frame)
+  "Return the tmux server socket path for FRAME, or nil outside tmux.
+Parsed from FRAME's TMUX env var, whose format is
+\"SOCKET-PATH,SERVER-PID,SESSION-ID\".  Read via
+`kitty-gfx--frame-getenv' so each daemon client resolves the tmux
+server it is actually attached to."
+  (let ((tmux (kitty-gfx--frame-getenv "TMUX" frame)))
+    (when (and tmux (not (string-empty-p tmux)))
+      (let ((sock (car (split-string tmux ","))))
+        (and sock (not (string-empty-p sock)) sock)))))
 
-(defun kitty-gfx--tmux-version ()
+(defun kitty-gfx--tmux-display-message (format-spec &optional frame)
+  "Run tmux `display-message -p FORMAT-SPEC' against FRAME's server.
+Targets the socket derived from FRAME's TMUX env var via `tmux -S',
+so daemon clients sitting in different tmux servers each query their
+own.  Returns the trimmed output string, or nil on failure."
+  (when (executable-find "tmux")
+    (let ((sock (kitty-gfx--tmux-socket frame)))
+      (with-temp-buffer
+        (let* ((args (append (when sock (list "-S" sock))
+                             (list "display-message" "-p" format-spec)))
+               (exit (ignore-errors
+                       (apply #'call-process "tmux" nil '(t nil) nil args))))
+          (when (eq exit 0)
+            (string-trim (buffer-string))))))))
+
+(defun kitty-gfx--tmux-version (&optional frame)
   "Return tmux version as (MAJOR MINOR) integers, or nil when unavailable.
-Memoised in `kitty-gfx--tmux-version-cache'."
-  (when (eq kitty-gfx--tmux-version-cache 'unset)
-    (setq kitty-gfx--tmux-version-cache
-          (when (executable-find "tmux")
-            (with-temp-buffer
-              (when (zerop (ignore-errors
-                             (call-process "tmux" nil t nil "-V")))
-                (goto-char (point-min))
-                (when (re-search-forward
-                       "tmux\\(?:[[:space:]]+next-\\)?[[:space:]]+\\([0-9]+\\)\\.\\([0-9]+\\)"
-                       nil t)
-                  (list (string-to-number (match-string 1))
-                        (string-to-number (match-string 2)))))))))
-  kitty-gfx--tmux-version-cache)
+Asks FRAME's tmux server for `#{version}' (falling back to the local
+`tmux -V' client binary when the server query fails), since daemon
+clients can sit in different tmux servers running different versions.
+Cached per terminal under the `kitty-gfx-tmux-version' parameter;
+sentinel `none' records a failed probe so it is not retried."
+  (let* ((term (frame-terminal (or frame (selected-frame))))
+         (cached (terminal-parameter term 'kitty-gfx-tmux-version)))
+    (if cached
+        (and (consp cached) cached)
+      (let* ((raw (or (kitty-gfx--tmux-display-message "#{version}" frame)
+                      (kitty-gfx--tmux-client-version)))
+             (ver (when (and raw
+                             (string-match
+                              "\\(?:next-\\)?\\([0-9]+\\)\\.\\([0-9]+\\)" raw))
+                    (list (string-to-number (match-string 1 raw))
+                          (string-to-number (match-string 2 raw))))))
+        (kitty-gfx--log "tmux-version: %S (raw=%S term=%s)" ver raw term)
+        (set-terminal-parameter term 'kitty-gfx-tmux-version (or ver 'none))
+        ver))))
+
+(defun kitty-gfx--tmux-client-version ()
+  "Return the raw output of `tmux -V', or nil when tmux is unavailable."
+  (when (executable-find "tmux")
+    (with-temp-buffer
+      (when (eq (ignore-errors
+                  (call-process "tmux" nil '(t nil) nil "-V"))
+                0)
+        (string-trim (buffer-string))))))
+
+(defun kitty-gfx--tmux-passthrough-state (&optional frame)
+  "Return FRAME's tmux `allow-passthrough' state: `on', `off', or `unknown'.
+Queries `#{allow-passthrough}' on the socket from FRAME's TMUX env
+var; \"on\" and \"all\" count as `on'.  An empty or failed reply maps
+to `unknown' (tmux < 3.3 has no such option and always passes DCS
+through).  Cached per terminal under `kitty-gfx-tmux-passthrough'."
+  (let* ((term (frame-terminal (or frame (selected-frame))))
+         (cached (terminal-parameter term 'kitty-gfx-tmux-passthrough)))
+    (or cached
+        (let* ((raw (kitty-gfx--tmux-display-message "#{allow-passthrough}" frame))
+               (state (cond ((member raw '("on" "all")) 'on)
+                            ((member raw '(nil "")) 'unknown)
+                            (t 'off))))
+          (kitty-gfx--log "tmux-passthrough: %s (raw=%S term=%s)" state raw term)
+          (set-terminal-parameter term 'kitty-gfx-tmux-passthrough state)
+          state))))
+
+(defun kitty-gfx--tmux-passthrough-p (&optional frame)
+  "Return non-nil when FRAME runs inside tmux with `allow-passthrough' enabled.
+Returns nil outside tmux and nil when tmux reports the option as off;
+an unknown state (old tmux, failed query) counts as enabled because
+those servers pass DCS through unconditionally."
+  (and (kitty-gfx--frame-getenv "TMUX" frame)
+       (memq (kitty-gfx--tmux-passthrough-state frame) '(on unknown))
+       t))
 
 (defun kitty-gfx--tmux-sixel-supported-p (&optional frame)
   "Return non-nil when running under tmux >= 3.4 with Sixel allowed.
@@ -1406,7 +1521,7 @@ TMUX is read via `kitty-gfx--frame-getenv' so this works under
 emacs --daemon clients; FRAME defaults to the selected frame."
   (and (kitty-gfx--frame-getenv "TMUX" frame)
        kitty-gfx-tmux-allow-sixel
-       (let ((ver (kitty-gfx--tmux-version)))
+       (let ((ver (kitty-gfx--tmux-version frame)))
          (and ver
               (or (> (car ver) 3)
                   (and (= (car ver) 3) (>= (cadr ver) 4)))))))
@@ -1429,7 +1544,7 @@ is typical for daemons launched from a non-tty service unit."
                      (t (or frame-term env-term))))
          (term-prog (kitty-gfx--frame-getenv "TERM_PROGRAM" frame))
          (in-tmux (kitty-gfx--frame-getenv "TMUX" frame))
-         (tmux-ver (and in-tmux (kitty-gfx--tmux-version)))
+         (tmux-ver (and in-tmux (kitty-gfx--tmux-version frame)))
          (tmux-ok (kitty-gfx--tmux-sixel-supported-p frame))
          ;; Windows Terminal's TERM value is not stable enough to rely on
          ;; alone, so accept its session markers when present.
@@ -1455,6 +1570,13 @@ is typical for daemons launched from a non-tty service unit."
      (if tmux-ver (format "%d.%d" (car tmux-ver) (cadr tmux-ver)) "n/a")
      (if tmux-ok "yes" "no")
      (if windows-terminal "yes" "no"))
+    (when (and in-tmux (not tmux-ok) kitty-gfx-tmux-allow-sixel)
+      (kitty-gfx--message-once
+       "sixel-tmux-version"
+       (if tmux-ver
+           (format "kitty-gfx: tmux %d.%d cannot render Sixel; tmux >= 3.4 is required"
+                   (car tmux-ver) (cadr tmux-ver))
+         "kitty-gfx: tmux version unknown; Sixel inside tmux requires tmux >= 3.4")))
     supported))
 
 (defun kitty-gfx--sixel-cache-path (file cols rows)
@@ -1484,11 +1606,18 @@ is available."
                (t 'img2sixel))
               path)))))
 
+(defvar kitty-gfx--sixel-encode-timed-out nil
+  "Non-nil when the most recent `kitty-gfx--sixel-run-encoder' timed out.
+Reset at the start of every run; consulted by the failure-feedback
+path so the user message can distinguish a hung encoder (watchdog
+fired) from a plain non-zero exit.")
+
 (defun kitty-gfx--sixel-run-encoder (program timeout dest-buffer args)
   "Run PROGRAM with ARGS, writing stdout into DEST-BUFFER.
 TIMEOUT, when a positive number, terminates the process after that many
 seconds and signals an error.  Errors include captured stderr.
 Returns t on success, nil on failure (failures are logged, not signalled)."
+  (setq kitty-gfx--sixel-encode-timed-out nil)
   (let* ((stderr-buf (generate-new-buffer " *kitty-gfx-sixel-stderr*"))
          (process-connection-type nil)
          (proc (make-process :name "kitty-gfx-sixel-encoder"
@@ -1518,6 +1647,7 @@ Returns t on success, nil on failure (failures are logged, not signalled)."
                           (with-current-buffer stderr-buf (buffer-string)))))
             (cond
              (timed-out
+              (setq kitty-gfx--sixel-encode-timed-out t)
               (kitty-gfx--log
                "sixel-encode: TIMEOUT after %.1fs (%s killed)"
                (float timeout) program)
@@ -1533,12 +1663,59 @@ Returns t on success, nil on failure (failures are logged, not signalled)."
       (when timer (cancel-timer timer))
       (when (buffer-live-p stderr-buf) (kill-buffer stderr-buf)))))
 
+(defun kitty-gfx--sixel-img2sixel-tuning-args ()
+  "Return img2sixel arguments for the dither and palette defcustoms."
+  (append (when kitty-gfx-sixel-dither
+            (list "-d" kitty-gfx-sixel-dither))
+          (when kitty-gfx-sixel-colors
+            (list "-p" (number-to-string kitty-gfx-sixel-colors)))))
+
+(defun kitty-gfx--sixel-imagemagick-tuning-args ()
+  "Return ImageMagick arguments for the dither and palette defcustoms.
+\"atkinson\" falls back to Floyd-Steinberg since ImageMagick has no
+Atkinson dither."
+  (append (pcase kitty-gfx-sixel-dither
+            ("none" (list "+dither"))
+            ((or "fs" "atkinson") (list "-dither" "FloydSteinberg"))
+            (_ nil))
+          (when kitty-gfx-sixel-colors
+            (list "-colors" (number-to-string kitty-gfx-sixel-colors)))))
+
+(defun kitty-gfx--sixel-prescale (png-file pixel-w pixel-h)
+  "Resize PNG-FILE to fit PIXEL-W x PIXEL-H, returning a temp PNG path.
+Returns nil when the source already fits, when no ImageMagick binary
+is available, or when the resize fails — callers then encode the
+original file.  The resize is bounded by the same watchdog as the
+encoder runs (`kitty-gfx--sixel-run-encoder').  The caller owns and
+must delete the returned file."
+  (let ((magick (or (executable-find "magick")
+                    (executable-find "convert")))
+        (px (kitty-gfx--image-pixel-size png-file)))
+    (when (and magick px
+               (or (> (car px) pixel-w) (> (cdr px) pixel-h)))
+      (let ((out (make-temp-file "kitty-gfx-prescale-" nil ".png")))
+        (if (with-temp-buffer
+              (kitty-gfx--sixel-run-encoder
+               magick kitty-gfx-sixel-encoder-timeout (current-buffer)
+               (list png-file "-resize" (format "%dx%d" pixel-w pixel-h) out)))
+            (progn
+              (kitty-gfx--log "sixel-prescale: %s %dx%d -> %s (fit %dx%d)"
+                              png-file (car px) (cdr px) out pixel-w pixel-h)
+              out)
+          (ignore-errors (delete-file out))
+          nil)))))
+
 (defun kitty-gfx--sixel-encode (png-file cols rows)
   "Encode PNG-FILE as Sixel data for COLS x ROWS cells.
 Returns Sixel data string or nil on failure.
 Computes pixel dimensions from cell size.  The encoder is selected via
 `kitty-gfx-sixel-encoder-program' (auto-detected when nil) and bounded
-by `kitty-gfx-sixel-encoder-timeout'."
+by `kitty-gfx-sixel-encoder-timeout'.  Dither and palette size come
+from `kitty-gfx-sixel-dither' and `kitty-gfx-sixel-colors', with
+`kitty-gfx-sixel-encoder-args' appended as the raw escape hatch.
+When img2sixel encodes a source larger than the target pixel box and
+ImageMagick is available, the image is pre-scaled to a temp PNG first
+so img2sixel quantizes the small image instead of the full-size one."
   (let* ((cw (or kitty-gfx--cell-pixel-width 8))
          (ch (or kitty-gfx--cell-pixel-height 16))
          (pixel-w (* cols cw))
@@ -1552,31 +1729,41 @@ by `kitty-gfx-sixel-encoder-timeout'."
       (let* ((kind (car resolved))
              (path (cdr resolved))
              (base (file-name-nondirectory path))
+             (prescaled (when (eq kind 'img2sixel)
+                          (kitty-gfx--sixel-prescale png-file pixel-w pixel-h)))
+             (input (or prescaled png-file))
              (args (pcase kind
                      ('img2sixel
-                      (append kitty-gfx-sixel-encoder-args
-                              (list "-w" (number-to-string pixel-w)
-                                    "-h" (number-to-string pixel-h))
-                              (list png-file)))
-                     ('imagemagick
-                      (append (list png-file)
+                      (append (kitty-gfx--sixel-img2sixel-tuning-args)
                               kitty-gfx-sixel-encoder-args
+                              (unless prescaled
+                                (list "-w" (number-to-string pixel-w)
+                                      "-h" (number-to-string pixel-h)))
+                              (list input)))
+                     ('imagemagick
+                      (append (list input)
                               (list "-geometry"
                                     (format "%dx%d" pixel-w pixel-h))
+                              (kitty-gfx--sixel-imagemagick-tuning-args)
+                              kitty-gfx-sixel-encoder-args
                               (list "sixel:-"))))))
         (when (string-prefix-p "convert" (downcase base))
           (kitty-gfx--log "sixel-encode: WARNING deprecated `convert' resolved (%s); install `magick' or `img2sixel'" path))
-        (kitty-gfx--log "sixel-encode: %s -> %dx%d pixels via %s (%s)"
-                        png-file pixel-w pixel-h base kind)
-        (with-temp-buffer
-          (set-buffer-multibyte nil)
-          (if (kitty-gfx--sixel-run-encoder
-               path kitty-gfx-sixel-encoder-timeout
-               (current-buffer) args)
-              (let ((data (buffer-string)))
-                (kitty-gfx--log "sixel-encode: success (%d bytes)" (length data))
-                data)
-            nil))))))
+        (kitty-gfx--log "sixel-encode: %s -> %dx%d pixels via %s (%s%s)"
+                        input pixel-w pixel-h base kind
+                        (if prescaled ", pre-scaled" ""))
+        (unwind-protect
+            (with-temp-buffer
+              (set-buffer-multibyte nil)
+              (if (kitty-gfx--sixel-run-encoder
+                   path kitty-gfx-sixel-encoder-timeout
+                   (current-buffer) args)
+                  (let ((data (buffer-string)))
+                    (kitty-gfx--log "sixel-encode: success (%d bytes)" (length data))
+                    data)
+                nil))
+          (when prescaled
+            (ignore-errors (delete-file prescaled))))))))
 
 (defun kitty-gfx--sixel-prepare (file _image-id)
   "Prepare FILE for Sixel display.
@@ -1590,42 +1777,67 @@ Returns non-nil on success."
       (puthash file png kitty-gfx--sixel-cache)
       t)))
 
+(defun kitty-gfx--sixel-report-encode-failure (ov file)
+  "Surface a Sixel encode failure for FILE on overlay OV.
+Replaces OV's blank display cells with a visible failure marker and
+marks OV so subsequent refreshes stop retrying the encoder.  Shows a
+one-time echo-area message (per file, per session) naming the encoder
+and whether the timeout watchdog killed it."
+  (overlay-put ov 'kitty-gfx-sixel-failed t)
+  (overlay-put ov 'display "[sixel: encode failed]\n")
+  (let ((encoder (kitty-gfx--sixel-resolve-encoder)))
+    (kitty-gfx--message-once
+     (concat "sixel-encode-failed:" file)
+     (format "kitty-gfx: Sixel encode %s for %s (encoder: %s)"
+             (if kitty-gfx--sixel-encode-timed-out
+                 (format "timed out after %gs" kitty-gfx-sixel-encoder-timeout)
+               "failed")
+             (file-name-nondirectory file)
+             (if encoder (cdr encoder) "none found")))))
+
 (defun kitty-gfx--sixel-place (ov _image-id _placement-id cols rows term-row term-col)
   "Place Sixel image at terminal position.
-Encodes on-demand if not cached, then emits DCS sequence."
+Encodes on-demand if not cached, then emits DCS sequence.  An overlay
+whose encode already failed shows a text marker and is skipped, so a
+broken or hanging encoder is not re-run on every refresh."
   (let* ((file (overlay-get ov 'kitty-gfx-file))
          (png (gethash file kitty-gfx--sixel-cache))
          (cache-path (kitty-gfx--sixel-cache-path file cols rows))
          (sixel-data nil))
-    (if (not png)
-        (kitty-gfx--log "sixel-place: no PNG cached for %s" file)
-    ;; Check if sixel encoding is cached
-    (if (file-exists-p cache-path)
-        (progn
-          (kitty-gfx--log "sixel-place: using cached sixel %s" cache-path)
-          (with-temp-buffer
-            (set-buffer-multibyte nil)
-            (insert-file-contents-literally cache-path)
-            (setq sixel-data (buffer-string))))
-      ;; Encode on-demand
-      (kitty-gfx--log "sixel-place: encoding %s at %dx%d" png cols rows)
-      (setq sixel-data (kitty-gfx--sixel-encode png cols rows))
-      (when sixel-data
-        ;; Cache the encoding
-        (ignore-errors
-          (with-temp-file cache-path
-            (set-buffer-multibyte nil)
-            (insert sixel-data)))
-        (push cache-path kitty-gfx--sixel-temp-files)
-        ;; LRU eviction: cap temp files at kitty-gfx-cache-size
-        (when (> (length kitty-gfx--sixel-temp-files) kitty-gfx-cache-size)
-          (let ((victim (car (last kitty-gfx--sixel-temp-files))))
-            (kitty-gfx--log "sixel-cache-evict: %s (count=%d max=%d)"
-                            victim (length kitty-gfx--sixel-temp-files)
-                            kitty-gfx-cache-size)
-            (ignore-errors (delete-file victim))
-            (setq kitty-gfx--sixel-temp-files
-                  (butlast kitty-gfx--sixel-temp-files))))))
+    (cond
+     ((overlay-get ov 'kitty-gfx-sixel-failed)
+      (kitty-gfx--log "sixel-place: skipping failed overlay for %s" file))
+     ((not png)
+      (kitty-gfx--log "sixel-place: no PNG cached for %s" file))
+     (t
+      ;; Check if sixel encoding is cached
+      (if (file-exists-p cache-path)
+          (progn
+            (kitty-gfx--log "sixel-place: using cached sixel %s" cache-path)
+            (with-temp-buffer
+              (set-buffer-multibyte nil)
+              (insert-file-contents-literally cache-path)
+              (setq sixel-data (buffer-string))))
+        ;; Encode on-demand
+        (kitty-gfx--log "sixel-place: encoding %s at %dx%d" png cols rows)
+        (setq sixel-data (kitty-gfx--sixel-encode png cols rows))
+        (if (not sixel-data)
+            (kitty-gfx--sixel-report-encode-failure ov file)
+          ;; Cache the encoding
+          (ignore-errors
+            (with-temp-file cache-path
+              (set-buffer-multibyte nil)
+              (insert sixel-data)))
+          (push cache-path kitty-gfx--sixel-temp-files)
+          ;; LRU eviction: cap temp files at kitty-gfx-cache-size
+          (when (> (length kitty-gfx--sixel-temp-files) kitty-gfx-cache-size)
+            (let ((victim (car (last kitty-gfx--sixel-temp-files))))
+              (kitty-gfx--log "sixel-cache-evict: %s (count=%d max=%d)"
+                              victim (length kitty-gfx--sixel-temp-files)
+                              kitty-gfx-cache-size)
+              (ignore-errors (delete-file victim))
+              (setq kitty-gfx--sixel-temp-files
+                    (butlast kitty-gfx--sixel-temp-files))))))
       ;; Emit Sixel sequence if we have data
       (when sixel-data
         (let* ((cw (or kitty-gfx--cell-pixel-width 8))
@@ -1633,7 +1845,7 @@ Encodes on-demand if not cached, then emits DCS sequence."
           (kitty-gfx--log "sixel-place: emitting at row=%d col=%d data-len=%d pixel-target=%dx%d"
                           term-row term-col (length sixel-data) (* cols cw) (* rows ch)))
         (kitty-gfx--terminal-send
-         (format "\e7\e[%d;%dH%s\e8" term-row term-col sixel-data))))))
+         (format "\e7\e[%d;%dH%s\e8" term-row term-col sixel-data)))))))
 
 (defun kitty-gfx--sixel-delete (ov _image-id _placement-id)
   "Delete Sixel placement by overwriting with spaces.
