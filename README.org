@@ -32,7 +32,7 @@ Integrations and capabilities:
 - *org heading text sizing*: render headings at scaled sizes via the Kitty text sizing protocol (OSC 66)
 - *org LaTeX preview*: render LaTeX fragments as images via =C-c C-x C-l=
 - *typst math preview*: render inline =$...$= math fragments as images
-- *inline video*: play video files inline with [[https://mpv.io/][mpv]] (Kitty backend only)
+- *inline video*: play video files inline with [[https://mpv.io/][mpv]] (Kitty backend, plus experimental Sixel via ~--vo=sixel~)
 - *doc-view*: PDF/DVI/PS viewing with page navigation and zoom
 - *image-mode*: terminal-aware image file viewing with zoom
 - *shr/eww*: inline images in HTML rendering (eww, mu4e, gnus)
@@ -52,7 +52,7 @@ Integrations and capabilities:
   - Override the auto-detect order via ~kitty-gfx-sixel-encoder-program~. If neither is on ~PATH~ the Sixel backend logs ~no encoder found~ and silently produces no image, so make sure one is installed before launching Emacs.
 - ImageMagick (~magick~ / ~identify~) is still needed for non-PNG formats on the Kitty backend (JPEG/WebP/SVG/TIFF/BMP -> PNG conversion) and for the dimension probe
 - For org heading text sizing (OSC 66): [[https://sw.kovidgoyal.net/kitty/][Kitty]] >= 0.40.0, currently the only terminal implementing OSC 66 with scale support
-- For inline video: [[https://mpv.io/][mpv]] >= 0.36.0 with ~--vo=kitty~ support (enable with ~kitty-gfx-enable-video~)
+- For inline video: [[https://mpv.io/][mpv]] >= 0.36.0 with ~--vo=kitty~ support (enable with ~kitty-gfx-enable-video~); on the Sixel backend, an mpv built with libsixel (~--vo=sixel~, experimental)
 - For typst math preview: the [[https://typst.app/][~typst~]] CLI on ~PATH~
 - For LaTeX preview: a TeX distribution with ~dvipng~ (e.g. ~texlive~)
 - For doc-view: ~ghostscript~ (for PDF), ~dvipng~ (for DVI); the same tools as GUI Emacs
@@ -240,7 +240,7 @@ By default shr images render at natural size, shrinking only to fit ~kitty-gfx-m
 
 | Variable                                 | Default                  | Description                                       |
 |------------------------------------------+--------------------------+---------------------------------------------------|
-| ~kitty-gfx-enable-video~                 | nil                      | Enable inline mpv video (mpv 0.36.0+, --vo=kitty) |
+| ~kitty-gfx-enable-video~                 | nil                      | Enable inline mpv video (mpv 0.36.0+)             |
 | ~kitty-gfx-video-file-extensions~        | mp4 mkv webm mov m4v avi | Extensions handled by inline mpv preview          |
 | ~kitty-gfx-video-thumbnail-seek~         | "0.5"                    | Seconds offset for thumbnail extraction           |
 | ~kitty-gfx-dired-preview-debounce~       | 0.3                      | Idle seconds before dired auto-preview            |
@@ -271,18 +271,18 @@ The image-sizing defaults (~kitty-gfx-max-width~ / ~kitty-gfx-max-height~) gover
 3. *Kitty path*: image data is transmitted once via APC escape sequences (~a=t~, store only). Direct placements (~a=p~) position the image at overlay screen coordinates after each redisplay, using unique placement IDs (~p=PID~).
 4. *Sixel path*: images are encoded to Sixel via the external encoder and emitted directly at overlay screen coordinates. Since Sixel is stateless, images are re-emitted whenever they scroll to a new position.
 5. *Text sizing*: org heading overlays emit OSC 66 (~\e]66;s=SCALE;TEXT\a~) at the heading position; the protocol is stateless, so headings are re-emitted on refresh.
-6. *Video*: mpv runs on a PTY with ~--vo=kitty~; its graphics stream is captured and forwarded to the terminal, while a JSON IPC socket drives pause/resume. Only one video plays at a time, and it auto-pauses when scrolled out of view. Kitty backend only.
+6. *Video*: mpv runs on a PTY with ~--vo=kitty~ (or ~--vo=sixel~ on the Sixel backend); its graphics stream is captured and forwarded to the terminal, while a JSON IPC socket drives pause/resume. Only one video plays at a time, and it auto-pauses when scrolled out of view.
 7. Overlays with a ~display~ property reserve blank space in Emacs buffers.
 8. All output is wrapped in synchronized output (~BSU/ESU~, =DEC mode 2026=) to prevent partial rendering and flicker; position caching skips redundant re-placements, and placements are deleted when overlays scroll out of view.
 
 * Supported Formats
 
-PNG is sent directly to the terminal. Other formats (JPEG, GIF, WebP, SVG, TIFF, BMP) are converted to PNG via ImageMagick before transmission. Video files (mp4, mkv, webm, mov, m4v, avi) are played via mpv on the Kitty backend.
+PNG is sent directly to the terminal. Other formats (JPEG, GIF, WebP, SVG, TIFF, BMP) are converted to PNG via ImageMagick before transmission. Video files (mp4, mkv, webm, mov, m4v, avi) are played via mpv on the Kitty backend, or experimentally on the Sixel backend with an mpv built with libsixel.
 
 * Known Limitations
 
 - *tmux*: Kitty graphics now work inside tmux via DCS passthrough (~kitty-gfx-tmux-passthrough~), with a Unicode-placeholder placement mode (~kitty-gfx-kitty-placement-mode~) to survive pane switches. Sixel also works inside tmux >= 3.4 (foot/Konsole/mintty/mlterm/WezTerm as the outer terminal; ~kitty-gfx-tmux-allow-sixel~ to opt out). Because tmux's cell buffer is not pixel-aware, images may stick to old positions after scrolling, an upstream tmux limitation
-- Inline video is *Kitty backend only*: the Sixel re-emit cost per frame makes playback impractical
+- Inline video on the Sixel backend is *experimental*: it needs an mpv built with libsixel (~--vo=sixel~), every frame is a full DCS payload (expect higher CPU than the Kitty backend), and it is excluded inside tmux like the Kitty path
 - Under a daemon, inline video and the casty browser are *bound to the client they were launched on* (a single subprocess streams to one terminal); other clients showing the same buffer see only the reserved blank area. Static images have no such limit and render on every client at once
 - Animated GIFs display only the first frame (they route through the image pipeline as static images)
 - Sixel is limited to 256 colors (vs truecolor on Kitty) and is stateless, so images are re-emitted on every scroll, which may be slower on large images

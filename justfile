@@ -391,6 +391,7 @@ test-mpv video="":
     #!/usr/bin/env bash
     set -eu
     echo ">> Requires Kitty terminal + mpv on PATH."
+    echo ">> Sixel terminals work too (experimental) when mpv is built with libsixel (--vo=sixel)."
     echo ">> Stop: M-x kitty-gfx-stop-video     Pause: M-x kitty-gfx-toggle-video"
     video={{video}}
     # Tolerate `just test-mpv video=PATH' (just treats it as a positional

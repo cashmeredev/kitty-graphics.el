@@ -170,7 +170,9 @@ Defaults to t when the KITTY_GFX_DEBUG environment variable is set."
 
 (defcustom kitty-gfx-enable-video nil
   "When non-nil, enable inline video playback via mpv.
-Requires mpv with --vo=kitty support (mpv 0.36.0+)."
+Requires mpv with --vo=kitty support (mpv 0.36.0+) on the Kitty
+backend; on the Sixel backend it needs an mpv built with libsixel
+(--vo=sixel, experimental)."
   :type 'boolean
   :group 'kitty-graphics)
 
@@ -853,6 +855,17 @@ mpv writes one Kitty VO byte stream to a single fd, so it cannot fan out
 to several daemon clients; its frames are bound to the terminal that
 started playback.  The process filter routes output here and the
 canonical-window search is restricted to this terminal's windows.")
+
+(defvar-local kitty-gfx--mpv-vo nil
+  "The mpv video output the current playback was spawned with.
+\"kitty\" or \"sixel\", chosen from the launching terminal's backend by
+`kitty-gfx--mpv-backend-vo' at spawn time, so reposition IPC and
+cleanup address the right vo without re-deriving the backend.")
+
+(defvar kitty-gfx--mpv-vo-sixel-cache 'unknown
+  "Cached result of the `mpv --vo=help' sixel probe.
+The symbol `unknown' until `kitty-gfx--mpv-vo-sixel-p' runs the
+probe, then t or nil for the rest of the session.")
 
 (defvar-local kitty-gfx--mpv-last-row nil
   "Last known terminal row of the video overlay.")
@@ -1969,6 +1982,17 @@ sticks until the file changes on disk or the image is re-displayed."
         (kitty-gfx--terminal-send
          (format "\e7\e[%d;%dH%s\e8" term-row term-col sixel-data)))))))
 
+(defun kitty-gfx--blank-rect-string (row col cols rows)
+  "Return an escape string overwriting a COLS x ROWS cell rectangle with spaces.
+ROW and COL are 1-based terminal coordinates of the top-left corner.
+The cursor position is saved and restored around the writes."
+  (format "\e7%s\e8"
+          (mapconcat
+           (lambda (r)
+             (format "\e[%d;%dH%s" (+ row r) col (make-string cols ?\s)))
+           (number-sequence 0 (1- rows))
+           "")))
+
 (defun kitty-gfx--sixel-delete (ov _image-id _placement-id)
   "Delete Sixel placement by overwriting with spaces.
 Sixel has no placement IDs — erase by writing spaces over the region."
@@ -1980,12 +2004,7 @@ Sixel has no placement IDs — erase by writing spaces over the region."
       (kitty-gfx--log "sixel-delete: erase row=%d col=%d %dx%d"
                        last-row last-col cols rows)
       (kitty-gfx--terminal-send
-       (format "\e7%s\e8"
-               (mapconcat
-                (lambda (r)
-                  (format "\e[%d;%dH%s" (+ last-row r) last-col (make-string cols ?\s)))
-                (number-sequence 0 (1- rows))
-                ""))))))
+       (kitty-gfx--blank-rect-string last-row last-col cols rows)))))
 
 (defun kitty-gfx--sixel-cleanup (file _image-id)
   "Cleanup Sixel resources for FILE."
@@ -2344,6 +2363,61 @@ Signals error on failure, prints success message otherwise."
           (cl-assert (and (integerp width) (>= width 0))
                      nil "line-number width must be a non-negative integer"))
       (kill-local-variable 'display-line-numbers)))
+  (cl-letf (((symbol-function 'executable-find)
+             (lambda (_) "/usr/bin/mpv"))
+            ((symbol-function 'call-process)
+             (lambda (&rest _)
+               (insert "Available video outputs:\n"
+                       "  gpu : Shader-based GPU Renderer\n"
+                       "  sixel : terminal graphics using sixels\n"
+                       "  kitty : Kitty terminal graphics protocol\n")
+               0)))
+    (let ((kitty-gfx--mpv-vo-sixel-cache 'unknown))
+      (cl-assert (kitty-gfx--mpv-vo-sixel-p)
+                 nil "probe should find a listed sixel vo")))
+  (cl-letf (((symbol-function 'executable-find)
+             (lambda (_) "/usr/bin/mpv"))
+            ((symbol-function 'call-process)
+             (lambda (&rest _)
+               (insert "Available video outputs:\n"
+                       "  gpu : Shader-based GPU Renderer\n"
+                       "  kitty : Kitty terminal graphics protocol\n"
+                       "  tct : true-color terminals\n")
+               0)))
+    (let ((kitty-gfx--mpv-vo-sixel-cache 'unknown))
+      (cl-assert (not (kitty-gfx--mpv-vo-sixel-p))
+                 nil "probe should miss when no sixel vo is listed")))
+  (let ((kitty-gfx-sixel-dither "fs")
+        (kitty-gfx-sixel-colors 16))
+    (let ((args (kitty-gfx--mpv-vo-args "sixel" 3 5 640 320 80 20)))
+      (dolist (expected '("--vo=sixel"
+                          "--vo-sixel-cols=80"
+                          "--vo-sixel-rows=20"
+                          "--vo-sixel-width=640"
+                          "--vo-sixel-height=320"
+                          "--vo-sixel-left=3"
+                          "--vo-sixel-top=5"
+                          "--vo-sixel-config-clear=no"
+                          "--vo-sixel-dither=fs"
+                          "--vo-sixel-fixedpalette=no"
+                          "--vo-sixel-reqcolors=16"))
+        (cl-assert (member expected args)
+                   nil (format "sixel vo args should contain %s" expected)))))
+  (let ((kitty-gfx-sixel-dither nil)
+        (kitty-gfx-sixel-colors 256))
+    (let ((args (kitty-gfx--mpv-vo-args "sixel" 1 1 100 100 10 10)))
+      (cl-assert (not (seq-find (lambda (a) (string-prefix-p "--vo-sixel-dither" a)) args))
+                 nil "default dither should not be passed to mpv")
+      (cl-assert (not (seq-find (lambda (a) (string-prefix-p "--vo-sixel-reqcolors" a)) args))
+                 nil "default 256 colors should not be passed to mpv")))
+  (let ((args (kitty-gfx--mpv-vo-args "kitty" 3 5 640 320 80 20)))
+    (dolist (expected '("--vo=kitty"
+                        "--vo-kitty-cols=80"
+                        "--vo-kitty-rows=20"
+                        "--vo-kitty-left=3"
+                        "--vo-kitty-top=5"))
+      (cl-assert (member expected args)
+                 nil (format "kitty vo args should contain %s" expected))))
   (message "kitty-gfx: all self-tests passed"))
 
 ;;;; Heading overlay management
@@ -4490,7 +4564,7 @@ whether playback is actually wired up."
 (defun kitty-gfx--video-file-p (file)
   "Return non-nil if FILE is a video that the mpv preview can handle.
 Requires `kitty-gfx-enable-video' to be enabled, mpv on PATH, and
-the Kitty backend active -- the same gates as
+a backend with a usable mpv video output -- the same gates as
 `kitty-gfx--mpv-available-p'."
   (and (kitty-gfx--mpv-available-p)
        (kitty-gfx--video-extension-p file)))
@@ -5722,17 +5796,50 @@ Falls back to ORIG-FN in GUI."
 
 ;;;; mpv video integration
 
+(defun kitty-gfx--mpv-vo-sixel-p ()
+  "Return non-nil when the mpv binary was built with the sixel video output.
+Runs `mpv --vo=help' once per session and caches the result in
+`kitty-gfx--mpv-vo-sixel-cache'; vo_sixel is only compiled in when
+mpv was built against libsixel."
+  (when (eq kitty-gfx--mpv-vo-sixel-cache 'unknown)
+    (setq kitty-gfx--mpv-vo-sixel-cache
+          (let ((mpv (executable-find "mpv")))
+            (and mpv
+                 (with-temp-buffer
+                   (ignore-errors (call-process mpv nil t nil "--vo=help"))
+                   (goto-char (point-min))
+                   (and (re-search-forward "^  sixel" nil t) t))))))
+  kitty-gfx--mpv-vo-sixel-cache)
+
+(defun kitty-gfx--mpv-backend ()
+  "Return the graphics backend for the terminal mpv would play on.
+Reads the per-terminal backend parameter for the target terminal
+and falls back to the global `kitty-gfx--active-backend', the same
+resolution `kitty-gfx--with-terminal' applies."
+  (or (kitty-gfx--tparam 'kitty-gfx-backend) kitty-gfx--active-backend))
+
+(defun kitty-gfx--mpv-backend-vo ()
+  "Return the mpv video output name for the active backend, or nil.
+The Kitty backend plays through vo_kitty; the Sixel backend plays
+through vo_sixel when the mpv binary has it (`kitty-gfx--mpv-vo-sixel-p').
+nil means the active backend has no usable mpv video output."
+  (pcase (kitty-gfx--mpv-backend)
+    ('kitty "kitty")
+    ('sixel (and (kitty-gfx--mpv-vo-sixel-p) "sixel"))))
+
 (defun kitty-gfx--mpv-available-p ()
   "Return non-nil if mpv video playback is available.
-Unavailable inside tmux: mpv's raw Kitty frame stream is forwarded
-verbatim and bypasses the tmux passthrough wrapper, so tmux would eat
-every frame."
+Available on the Kitty backend, and on the Sixel backend when mpv was
+built with libsixel.  Unavailable inside tmux: mpv's raw frame stream
+is forwarded verbatim and bypasses the tmux passthrough wrapper, so
+tmux would eat every frame."
   (and kitty-gfx-enable-video
        kitty-graphics-mode
        (not (display-graphic-p))
        (not (kitty-gfx--frame-getenv "TMUX"))
-       (eq kitty-gfx--active-backend 'kitty)
-       (executable-find "mpv")))
+       (executable-find "mpv")
+       (kitty-gfx--mpv-backend-vo)
+       t))
 
 (defun kitty-gfx--mpv-unavailable-reason ()
   "Return a user-facing string explaining why mpv playback is unavailable.
@@ -5746,10 +5853,12 @@ Returns nil when mpv playback is available."
     "running in GUI Emacs (inline mpv is a terminal feature)")
    ((kitty-gfx--frame-getenv "TMUX")
     "running inside tmux (mpv's raw frame stream bypasses the tmux passthrough wrapper)")
-   ((not (eq kitty-gfx--active-backend 'kitty))
-    "Kitty backend not active")
+   ((not (memq (kitty-gfx--mpv-backend) '(kitty sixel)))
+    "no Kitty or Sixel backend active")
    ((not (executable-find "mpv"))
-    "mpv executable not found on PATH")))
+    "mpv executable not found on PATH")
+   ((not (kitty-gfx--mpv-backend-vo))
+    "mpv was built without libsixel so it has no --vo=sixel; on Nix use an mpv built with sixel support, e.g. wrapMpv (mpv-unwrapped.override { sixelSupport = true; }) { }")))
 
 (defun kitty-gfx--mpv-ipc-send (command)
   "Send COMMAND (a list) to mpv via JSON IPC.
@@ -5941,10 +6050,11 @@ the video to the top of the screen."
                   (kitty-gfx--log "mpv: ignoring suspicious origin reposition"))
                  (t
                   (kitty-gfx--log "mpv: reposition to row=%d col=%d" row col)
-                  (kitty-gfx--mpv-ipc-send
-                   (list "set_property" "vo-kitty-top" row))
-                  (kitty-gfx--mpv-ipc-send
-                   (list "set_property" "vo-kitty-left" col))
+                  (let ((vo (or kitty-gfx--mpv-vo "kitty")))
+                    (kitty-gfx--mpv-ipc-send
+                     (list "set_property" (format "vo-%s-top" vo) row))
+                    (kitty-gfx--mpv-ipc-send
+                     (list "set_property" (format "vo-%s-left" vo) col)))
                   (kitty-gfx--record-image-placement ov win row col 0 0 0)
                   (setq kitty-gfx--mpv-last-row row
                         kitty-gfx--mpv-last-col col))))))))))))
@@ -5974,6 +6084,18 @@ PROC is the mpv process, EVENT describes the state change."
   (when kitty-gfx--mpv-ipc-socket
     (ignore-errors (delete-file kitty-gfx--mpv-ipc-socket))
     (setq kitty-gfx--mpv-ipc-socket nil))
+  (when (and (equal kitty-gfx--mpv-vo "sixel")
+             kitty-gfx--mpv-overlay
+             kitty-gfx--mpv-last-row
+             kitty-gfx--mpv-last-col)
+    (let ((cols (overlay-get kitty-gfx--mpv-overlay 'kitty-gfx-cols))
+          (rows (overlay-get kitty-gfx--mpv-overlay 'kitty-gfx-rows)))
+      (when (and cols rows)
+        (ignore-errors
+          (send-string-to-terminal
+           (kitty-gfx--blank-rect-string
+            kitty-gfx--mpv-last-row kitty-gfx--mpv-last-col cols rows)
+           kitty-gfx--mpv-terminal)))))
   (when kitty-gfx--mpv-overlay
     ;; Drop the per-window placement records before deleting the
     ;; overlay, mirroring image-overlay cleanup.
@@ -5997,7 +6119,8 @@ PROC is the mpv process, EVENT describes the state change."
   (setq kitty-gfx--mpv-last-row nil
         kitty-gfx--mpv-last-col nil
         kitty-gfx--mpv-paused nil
-        kitty-gfx--mpv-auto-paused nil)
+        kitty-gfx--mpv-auto-paused nil
+        kitty-gfx--mpv-vo nil)
   ;; mpv's kitty VO may hide the cursor; restore it on the terminal that
   ;; played the video.  Also force a full redisplay so Emacs repaints the
   ;; region mpv was occupying.
@@ -6006,19 +6129,62 @@ PROC is the mpv process, EVENT describes the state change."
   (force-mode-line-update t)
   (when (fboundp 'redraw-display) (redraw-display)))
 
+(defun kitty-gfx--mpv-vo-args (vo col row width-px height-px video-cols video-rows)
+  "Return the mpv argument list selecting and configuring video output VO.
+VO is \"kitty\" or \"sixel\".  COL and ROW are the 1-based terminal
+cell coordinates of the video's top-left corner, WIDTH-PX and
+HEIGHT-PX its pixel bounds, VIDEO-COLS and VIDEO-ROWS its size in
+cells.  vo_kitty sends frames via shared memory rather than base64
+inside APC escapes -- orders of magnitude less data through the pty
+filter.  vo_sixel maps `kitty-gfx-sixel-dither' onto mpv's libsixel
+dither names and a non-default `kitty-gfx-sixel-colors' onto
+--vo-sixel-reqcolors (with the fixed palette disabled, which
+reqcolors requires to take effect)."
+  (pcase vo
+    ("kitty"
+     (list "--vo=kitty"
+           "--vo-kitty-use-shm=yes"
+           (format "--vo-kitty-cols=%d" video-cols)
+           (format "--vo-kitty-rows=%d" video-rows)
+           (format "--vo-kitty-width=%d" width-px)
+           (format "--vo-kitty-height=%d" height-px)
+           (format "--vo-kitty-left=%d" col)
+           (format "--vo-kitty-top=%d" row)
+           "--vo-kitty-config-clear=no"
+           "--vo-kitty-alt-screen=no"))
+    ("sixel"
+     (append
+      (list "--vo=sixel"
+            (format "--vo-sixel-cols=%d" video-cols)
+            (format "--vo-sixel-rows=%d" video-rows)
+            (format "--vo-sixel-width=%d" width-px)
+            (format "--vo-sixel-height=%d" height-px)
+            (format "--vo-sixel-left=%d" col)
+            (format "--vo-sixel-top=%d" row)
+            "--vo-sixel-config-clear=no"
+            "--vo-sixel-alt-screen=no")
+      (when kitty-gfx-sixel-dither
+        (list (format "--vo-sixel-dither=%s" kitty-gfx-sixel-dither)))
+      (when (and kitty-gfx-sixel-colors (/= kitty-gfx-sixel-colors 256))
+        (list "--vo-sixel-fixedpalette=no"
+              (format "--vo-sixel-reqcolors=%d" kitty-gfx-sixel-colors)))))))
+
 ;;;###autoload
 (defun kitty-gfx-play-video (file)
   "Play video FILE inline in the current buffer via mpv.
-Requires `kitty-gfx-enable-video' to be non-nil and mpv installed."
+Requires `kitty-gfx-enable-video' to be non-nil and mpv installed.
+Plays through vo_kitty on the Kitty backend and vo_sixel on the
+Sixel backend (mpv built with libsixel)."
   (interactive "fVideo file: ")
   (unless kitty-gfx-enable-video
     (user-error "Video playback disabled; set kitty-gfx-enable-video to t"))
-  (unless (kitty-gfx--mpv-available-p)
-    (user-error "mpv video requires Kitty backend and mpv installed"))
+  (when-let* ((reason (kitty-gfx--mpv-unavailable-reason)))
+    (user-error "kitty-gfx: cannot play video: %s" reason))
   ;; Stop any existing video in this buffer
   (when kitty-gfx--mpv-process
     (kitty-gfx--mpv-cleanup))
   (let* ((file (expand-file-name file))
+         (vo (kitty-gfx--mpv-backend-vo))
          (geom (kitty-gfx--mpv-compute-geometry))
          (col (nth 0 geom))
          (row (nth 1 geom))
@@ -6062,9 +6228,10 @@ Requires `kitty-gfx-enable-video' to be non-nil and mpv installed."
               kitty-gfx--mpv-last-col col)))
     ;; Store socket path
     (setq kitty-gfx--mpv-ipc-socket socket-path)
-    ;; Spawn mpv on a pty so its kitty VO escape stream can be captured.
-    ;; mpv writes APC graphics sequences to stdout; we forward each chunk
-    ;; to the Emacs controlling terminal via `send-string-to-terminal'.
+    ;; Spawn mpv on a pty so its VO escape stream can be captured.
+    ;; mpv writes graphics sequences (APC for kitty, DCS for sixel) to
+    ;; stdout; we forward each chunk to the Emacs controlling terminal
+    ;; via `send-string-to-terminal'.
     (let* ((process-connection-type t) ; pty so mpv sees a tty for VO
            (proc (make-process
                   :name "kitty-gfx-mpv"
@@ -6073,48 +6240,39 @@ Requires `kitty-gfx-enable-video' to be non-nil and mpv installed."
                   :connection-type 'pty
                   :coding '(binary . binary)
                   :command
-                  (list "mpv"
-                        ;; Ignore user's mpv.conf and scripts: keeps
-                        ;; embed playback predictable and avoids loading
-                        ;; heavy scripts (thumbfast, uosc, mpris, …) that
-                        ;; spike CPU and pollute IPC with `client-message'
-                        ;; events.
-                        ;;
-                        ;; Three flags are needed for distro builds that
-                        ;; wrap mpv with prepended `--script=…' args (Nix
-                        ;; `mpv-with-scripts', some Flatpaks):
-                        ;;   --no-config        skip mpv.conf
-                        ;;   --load-scripts=no  skip auto-discovered scripts
-                        ;;   --scripts-clr      clear the list option, so
-                        ;;                      wrapper-injected `--script='
-                        ;;                      entries are dropped too
-                        ;;                      (explicit `--script=' loads
-                        ;;                      regardless of `--load-scripts').
-                        "--no-config"
-                        "--load-scripts=no"
-                        "--scripts-clr"
-                        ;; Hardware-decode to keep CPU down.
-                        "--hwdec=auto-safe"
-                        "--vo=kitty"
-                        ;; Send frames via shared memory rather than
-                        ;; base64 inside APC escapes -- orders of
-                        ;; magnitude less data through the pty filter.
-                        "--vo-kitty-use-shm=yes"
-                        (format "--vo-kitty-cols=%d" video-cols)
-                        (format "--vo-kitty-rows=%d" video-rows)
-                        (format "--vo-kitty-width=%d" width-px)
-                        (format "--vo-kitty-height=%d" height-px)
-                        (format "--vo-kitty-left=%d" col)
-                        (format "--vo-kitty-top=%d" row)
-                        "--vo-kitty-config-clear=no"
-                        "--vo-kitty-alt-screen=no"
-                        "--really-quiet"
-                        "--no-input-terminal"
-                        (format "--input-ipc-server=%s" socket-path)
-                        file)
+                  (append
+                   (list "mpv"
+                         ;; Ignore user's mpv.conf and scripts: keeps
+                         ;; embed playback predictable and avoids loading
+                         ;; heavy scripts (thumbfast, uosc, mpris, …) that
+                         ;; spike CPU and pollute IPC with `client-message'
+                         ;; events.
+                         ;;
+                         ;; Three flags are needed for distro builds that
+                         ;; wrap mpv with prepended `--script=…' args (Nix
+                         ;; `mpv-with-scripts', some Flatpaks):
+                         ;;   --no-config        skip mpv.conf
+                         ;;   --load-scripts=no  skip auto-discovered scripts
+                         ;;   --scripts-clr      clear the list option, so
+                         ;;                      wrapper-injected `--script='
+                         ;;                      entries are dropped too
+                         ;;                      (explicit `--script=' loads
+                         ;;                      regardless of `--load-scripts').
+                         "--no-config"
+                         "--load-scripts=no"
+                         "--scripts-clr"
+                         ;; Hardware-decode to keep CPU down.
+                         "--hwdec=auto-safe")
+                   (kitty-gfx--mpv-vo-args vo col row width-px height-px
+                                           video-cols video-rows)
+                   (list "--really-quiet"
+                         "--no-input-terminal"
+                         (format "--input-ipc-server=%s" socket-path)
+                         file))
                   :filter #'kitty-gfx--mpv-filter
                   :sentinel #'kitty-gfx--mpv-process-sentinel)))
       (setq kitty-gfx--mpv-process proc)
+      (setq kitty-gfx--mpv-vo vo)
       ;; Bind playback to the launching terminal: the filter forwards mpv's
       ;; VO bytes only there, so other daemon clients are not painted over.
       (setq kitty-gfx--mpv-terminal (frame-terminal (selected-frame)))
@@ -6126,7 +6284,8 @@ Requires `kitty-gfx-enable-video' to be non-nil and mpv installed."
 (defun kitty-gfx--mpv-filter (proc chunk)
   "Forward mpv/casty stdout CHUNK to the terminal PROC was launched on.
 mpv with `--vo=kitty' (and casty in embed mode) emit APC graphics escapes
-to stdout.  When spawned as a subprocess of Emacs, those bytes land here.
+to stdout; mpv with `--vo=sixel' emits raw DCS sixel frames instead.
+When spawned as a subprocess of Emacs, those bytes land here.
 Writing them back out with `send-string-to-terminal' makes the terminal
 paint the frames inline.  The target terminal is the one recorded on PROC
 at launch, so under a daemon only the launching client is painted; nil

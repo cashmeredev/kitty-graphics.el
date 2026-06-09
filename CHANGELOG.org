@@ -44,6 +44,10 @@ New ~kitty-gfx--tmux-passthrough-p~ queries =#{allow-passthrough}= on the client
 
 *** Features
 
+**** Inline mpv video on the Sixel backend (experimental)
+
+~kitty-gfx-play-video~ now also works on the Sixel backend via mpv's native ~--vo=sixel~ output, sharing the whole kitty-vo pipeline (PTY frame forwarding, IPC pause/seek/reposition, hidden-buffer auto-pause). Requires an mpv built with libsixel (probed once via =mpv --vo=help=, with a Nix override hint when missing); the existing ~kitty-gfx-sixel-dither~ and ~kitty-gfx-sixel-colors~ defcustoms tune the frame encoding.
+
 **** Multi-tty daemon support
 
 Graphics now work under =emacs --daemon= with several =emacsclient -t= clients at once. Placements, image transmissions, and cleanup are routed per client terminal: each terminal keeps its own backend detection, cell size, text-sizing level, and transmitted-image set, and every refresh batch runs in its own synchronized-output block on the right tty. Inline video (mpv) and the casty browser stay bound to the terminal they were launched on. New ~kitty-graphics-setup~ is the daemon-aware entry point, and =just test-daemon*= recipes drive an isolated daemon for multi-client testing.
