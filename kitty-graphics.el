@@ -5488,19 +5488,15 @@ buffer to close it."
 
 (defun kitty-gfx--dired-auto-preview-now (buf)
   "Run `kitty-gfx-dired-preview' in BUF if cursor is on a known file.
-When a dirvish session shows its full layout for BUF, dirvish's
-own preview pane handles the rendering -- skip so the cursor move
-does not spawn a second, redundant side window.  A session-bound
-buffer without the layout (collapsed or left over after quitting)
-still gets the auto preview."
+When dirvish is managing BUF, dirvish's own preview pane handles
+the rendering -- skip so the cursor move does not spawn a second,
+redundant side window."
   (when (buffer-live-p buf)
     (with-current-buffer buf
       (when (and (derived-mode-p 'dired-mode)
                  (eq buf (window-buffer (selected-window)))
-                 ;; Skip only when dirvish has a visible preview pane.
-                 (not (and (fboundp 'dirvish-curr)
-                           (when-let* ((dv (dirvish-curr)))
-                             (dv-curr-layout dv)))))
+                 ;; Skip when dirvish has its own preview running.
+                 (not (and (fboundp 'dirvish-curr) (dirvish-curr))))
         (let ((file (ignore-errors (dired-get-file-for-visit))))
           (when (and file
                      (file-regular-p file)
@@ -5626,7 +5622,6 @@ buffer briefly going full-frame before mpv starts."
      (t (kitty-gfx-dired-play-video)))))
 
 (declare-function dirvish-curr "dirvish" ())
-(declare-function dv-curr-layout "dirvish" (dv))
 (declare-function dv-preview-window "dirvish" (dv))
 (declare-function dirvish--clear-session "dirvish" (dv &optional from-quit))
 
