@@ -2,6 +2,24 @@
 
 ** Unreleased
 
+*** Features
+
+**** Multi-tty daemon support
+
+Graphics now work under =emacs --daemon= with several =emacsclient -t= clients at once. Placements, image transmissions, and cleanup are routed per client terminal: each terminal keeps its own backend detection, cell size, text-sizing level, and transmitted-image set, and every refresh batch runs in its own synchronized-output block on the right tty. Inline video (mpv) and the casty browser stay bound to the terminal they were launched on. New ~kitty-graphics-setup~ is the daemon-aware entry point, and =just test-daemon*= recipes drive an isolated daemon for multi-client testing.
+
+**** shr image scaling (eww, elfeed, mu4e, gnus)
+
+New ~kitty-gfx-shr-scale~ controls how images render through shr, so feed
+images no longer dominate the buffer at full natural size. Set it to a
+float (e.g. ~0.25~) to render every image at a fraction of its natural
+size, or to ~fit~ for dynamic, window-relative sizing: each image is
+scaled into a box of ~kitty-gfx-shr-fit-width~ (fraction of the window
+width, default 0.6) by ~kitty-gfx-shr-fit-height~ rows (default 20),
+preserving aspect ratio and never enlarging images that already fit. The
+box tracks the live window. Default ~nil~ keeps the previous behaviour
+(natural size, shrink-to-fit ~kitty-gfx-max-width~ / ~kitty-gfx-max-height~).
+
 ** kitty-graphics 0.6.0
 
 Three headline additions land in =0.6.0=: inline video playback, an

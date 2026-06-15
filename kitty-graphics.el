@@ -18,20 +18,37 @@
 ;; Display images in terminal Emacs (emacs -nw) using the Kitty graphics
 ;; protocol with direct placements.
 ;;
-;; Architecture: image data is transmitted once via `a=t' (stored in the
-;; terminal without display).  Overlays reserve blank space in Emacs
-;; buffers.  After each redisplay, direct placements (`a=p' with cursor
-;; positioning) are emitted via `send-string-to-terminal' at the correct
-;; screen positions.  Each placement uses a unique placement ID (`p=PID')
-;; so repeated placements replace rather than accumulate.
+;; Architecture: image data is transmitted once per terminal via `a=t'
+;; (stored in the terminal without display).  Overlays reserve blank space
+;; in Emacs buffers.  After each redisplay, direct placements (`a=p' with
+;; cursor positioning) are emitted via `send-string-to-terminal' at the
+;; correct screen positions.  Each placement uses a unique placement ID
+;; (`p=PID') so repeated placements replace rather than accumulate.
+;;
+;; Multiple terminals (emacs --daemon + several `emacsclient -t'): output
+;; is routed per window to that window's own terminal, and per-client state
+;; (backend, cell size, text-sizing level, and which image ids have been
+;; transmitted) lives in terminal parameters, so clients on different
+;; terminals - even mixed Kitty and Sixel - render correctly at once.
+;; Capability probes run lazily, once per terminal, while it is selected.
+;; Inline video (mpv) and the casty browser stream a single byte stream to
+;; one fd and are therefore bound to the terminal they were launched on;
+;; the same buffer shown on a second client renders only its reserved
+;; blank area there.
 ;;
 ;; Requires: Kitty >= 0.20.0 (direct placement support).
 ;; Important: Launch Emacs with TERM=xterm-256color for proper color support.
 ;;
 ;; Usage:
 ;;   (require 'kitty-graphics)
-;;   (kitty-graphics-mode 1)
+;;   (kitty-graphics-setup)
 ;;   ;; Then org-mode C-c C-x C-v, image-mode, eww images all work.
+;;
+;; `kitty-graphics-setup' enables the mode the right way for both plain
+;; `emacs -nw' and `emacs --daemon': under a daemon there is no terminal
+;; at startup, so it defers enabling to the first `emacsclient -t' frame.
+;; For a one-off interactive terminal you can also just call
+;; `kitty-graphics-mode' directly.
 
 ;;; Code:
 
@@ -86,6 +103,33 @@ For full-window modes like doc-view, the window size is used instead."
 (defcustom kitty-gfx-max-height 40
   "Maximum image height in terminal rows for inline images.
 For full-window modes like doc-view, the window size is used instead."
+  :type 'integer
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-shr-scale nil
+  "Image sizing for the shr backends (eww, elfeed, mu4e, gnus).
+nil renders images at natural size, shrinking only to fit
+`kitty-gfx-max-width' and `kitty-gfx-max-height'.
+A float (e.g. 0.25) renders every image at that fraction of its
+natural size, still capped at the max dimensions.
+The symbol `fit' dynamically scales each image into a box derived
+from the live window: `kitty-gfx-shr-fit-width' of the window width
+and `kitty-gfx-shr-fit-height' rows tall, preserving aspect ratio and
+never enlarging images that already fit."
+  :type '(choice (const :tag "Natural size (shrink to fit max)" nil)
+                 (number :tag "Fraction of natural size")
+                 (const :tag "Dynamic window-relative fit" fit))
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-shr-fit-width 0.6
+  "Fraction of the window width an image may occupy under `fit' sizing.
+Only consulted when `kitty-gfx-shr-scale' is `fit'."
+  :type 'number
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-shr-fit-height 20
+  "Maximum image height in rows under `fit' sizing.
+Only consulted when `kitty-gfx-shr-scale' is `fit'."
   :type 'integer
   :group 'kitty-graphics)
 
@@ -192,7 +236,14 @@ Useful for debugging and batch testing without a real terminal.")
   (when kitty-gfx-debug
     (let ((msg (concat (format-time-string "%H:%M:%S.%3N ")
                        (apply #'format fmt args) "\n")))
-      (ignore-errors (append-to-file msg nil kitty-gfx--log-file))
+      ;; Write silently: `append-to-file' echoes "Added to <file>" to the echo
+      ;; area, which would set `current-message' and make
+      ;; `kitty-gfx--refresh-inhibited-p' treat every debug-log write as user
+      ;; feedback — permanently inhibiting the refresh that paints images.
+      (ignore-errors
+        (let ((inhibit-message t)
+              (message-log-max nil))
+          (write-region msg nil kitty-gfx--log-file 'append 'silent)))
       (ignore-errors
         (let ((buf (get-buffer-create "*kitty-gfx-debug*")))
           (with-current-buffer buf
@@ -241,6 +292,96 @@ because tmux 3.4+ renders Sixel itself.  Set to nil to disable entirely."
                  (const :tag "Unicode placeholder (U=1)" placeholder))
   :group 'kitty-gfx)
 
+(defvar kitty-gfx--target-terminal nil
+  "Terminal object `kitty-gfx--terminal-send' should write to.
+nil means the selected frame's terminal — the historical default and
+the only behaviour outside a multi-client daemon.  `kitty-gfx--refresh'
+binds this per window so each client's escapes reach its own tty, and
+the mpv/casty filters bind it to the terminal playback started on.")
+
+(defun kitty-gfx--target-frame ()
+  "Return a live frame for `kitty-gfx--target-terminal', else the selected frame.
+Resolves per-client environment (e.g. TMUX) for the terminal that
+`kitty-gfx--terminal-send' is currently writing to."
+  (or (and kitty-gfx--target-terminal
+           (terminal-live-p kitty-gfx--target-terminal)
+           (car (frames-on-display-list kitty-gfx--target-terminal)))
+      (selected-frame)))
+
+(defun kitty-gfx--tparam (key)
+  "Read terminal-parameter KEY for `kitty-gfx--target-terminal'.
+nil target means the selected frame's terminal."
+  (terminal-parameter kitty-gfx--target-terminal key))
+
+(defun kitty-gfx--set-tparam (key value)
+  "Set terminal-parameter KEY to VALUE for `kitty-gfx--target-terminal'.
+nil target means the selected frame's terminal.  Returns VALUE."
+  (set-terminal-parameter kitty-gfx--target-terminal key value)
+  value)
+
+(defun kitty-gfx--clear-terminal-state (term)
+  "Drop all kitty-graphics per-client state stored on terminal TERM.
+Clears the detected backend, queried cell size, text-sizing level, and
+the query/transmission bookkeeping so the terminal is treated as fresh."
+  (when (terminal-live-p term)
+    (set-terminal-parameter term 'kitty-gfx-backend nil)
+    (set-terminal-parameter term 'kitty-gfx-cell-w nil)
+    (set-terminal-parameter term 'kitty-gfx-cell-h nil)
+    (set-terminal-parameter term 'kitty-gfx-text-sizing nil)
+    (set-terminal-parameter term 'kitty-gfx-transmitted nil)))
+
+;; Kitty stores transmitted image data per terminal: an `a=t' transmit to
+;; client A's tty does not exist on client B's tty.  The global file->id
+;; cache assigns one id per file for all clients, but whether that id's
+;; bytes have actually reached a given terminal is tracked here, per
+;; terminal, so each new client re-transmits on first use.
+(defun kitty-gfx--transmitted-p (id)
+  "Non-nil if image ID was transmitted to `kitty-gfx--target-terminal'."
+  (let ((h (kitty-gfx--tparam 'kitty-gfx-transmitted)))
+    (and h (gethash id h))))
+
+(defun kitty-gfx--mark-transmitted (id)
+  "Record that image ID has been transmitted to `kitty-gfx--target-terminal'."
+  (let ((h (or (kitty-gfx--tparam 'kitty-gfx-transmitted)
+               (kitty-gfx--set-tparam 'kitty-gfx-transmitted
+                                      (make-hash-table)))))
+    (puthash id t h)))
+
+(defun kitty-gfx--terminal-transmitted-p (term id)
+  "Non-nil if image ID was transmitted to terminal TERM."
+  (let ((h (terminal-parameter term 'kitty-gfx-transmitted)))
+    (and h (gethash id h))))
+
+(defun kitty-gfx--terminal-unmark-transmitted (term id)
+  "Forget that image ID was transmitted to terminal TERM."
+  (let ((h (terminal-parameter term 'kitty-gfx-transmitted)))
+    (when h (remhash id h))))
+
+(defmacro kitty-gfx--with-terminal (term &rest body)
+  "Evaluate BODY with output routed to TERM and per-terminal state bound.
+Shadows the backend, cell-size, and text-sizing globals with TERM's
+stored terminal parameters (falling back to the current global default),
+so the render-path read sites observe per-terminal values without each
+needing terminal awareness.  The globals are special variables, so these
+`let*' bindings are dynamic and visible throughout BODY's call tree."
+  (declare (indent 1) (debug (form body)))
+  (let ((tv (make-symbol "term")))
+    `(let* ((,tv ,term)
+            (kitty-gfx--target-terminal ,tv)
+            (kitty-gfx--active-backend
+             (or (terminal-parameter ,tv 'kitty-gfx-backend)
+                 kitty-gfx--active-backend))
+            (kitty-gfx--cell-pixel-width
+             (or (terminal-parameter ,tv 'kitty-gfx-cell-w)
+                 kitty-gfx--cell-pixel-width))
+            (kitty-gfx--cell-pixel-height
+             (or (terminal-parameter ,tv 'kitty-gfx-cell-h)
+                 kitty-gfx--cell-pixel-height))
+            (kitty-gfx--text-sizing-support
+             (or (terminal-parameter ,tv 'kitty-gfx-text-sizing)
+                 kitty-gfx--text-sizing-support)))
+       ,@body)))
+
 (defun kitty-gfx--wrap-tmux-passthrough (str)
   "Wrap STR with tmux DCS passthrough envelope.
 Doubles every ESC in STR and surrounds with `\\ePtmux;' ... `\\e\\\\'.
@@ -257,7 +398,7 @@ need the passthrough wrapper; plain CSI movement, SGR, OSC, and raw
 text all pass through tmux untouched and must NOT be wrapped (tmux
 needs them to update its own grid for tmux-window-switch correctness)."
   (and kitty-gfx-tmux-passthrough
-       (kitty-gfx--frame-getenv "TMUX")
+       (kitty-gfx--frame-getenv "TMUX" (kitty-gfx--target-frame))
        (string-match-p "\e_G" str)))
 
 (defun kitty-gfx--terminal-send (str)
@@ -272,7 +413,8 @@ is emitted raw."
                    str)))
     (if kitty-gfx--dry-run
         (kitty-gfx--log "DRY-RUN-SEND: %S" payload)
-      (ignore-errors (send-string-to-terminal payload)))))
+      (ignore-errors
+        (send-string-to-terminal payload kitty-gfx--target-terminal)))))
 
 ;;;; Unicode placeholder protocol constants
 
@@ -545,6 +687,13 @@ calls when multiple characters are typed rapidly.")
 (defvar-local kitty-gfx--mpv-overlay nil
   "The overlay reserving space for the video.")
 
+(defvar-local kitty-gfx--mpv-terminal nil
+  "Terminal object the mpv playback was launched on.
+mpv writes one Kitty VO byte stream to a single fd, so it cannot fan out
+to several daemon clients; its frames are bound to the terminal that
+started playback.  The process filter routes output here and the
+canonical-window search is restricted to this terminal's windows.")
+
 (defvar-local kitty-gfx--mpv-last-row nil
   "Last known terminal row of the video overlay.")
 
@@ -573,6 +722,11 @@ across window hide/show.")
 
 (defvar-local kitty-gfx--browser-overlay nil
   "The overlay reserving space for the browser frame.")
+
+(defvar-local kitty-gfx--browser-terminal nil
+  "Terminal object the casty browser was launched on.
+Like `kitty-gfx--mpv-terminal', casty emits a single byte stream and is
+bound to its launching terminal; output is routed here.")
 
 (defvar-local kitty-gfx--browser-image-id nil
   "Kitty image id allocated for this buffer's casty frames.")
@@ -635,6 +789,7 @@ Sets `kitty-gfx--active-backend' to the detected backend symbol."
       (progn
         (kitty-gfx--log "detect-protocol: GUI frame, no terminal graphics")
         (setq kitty-gfx--active-backend nil)
+        (kitty-gfx--set-tparam 'kitty-gfx-backend nil)
         nil)
       (let ((pref kitty-gfx-preferred-protocol)
             (detected nil))
@@ -658,6 +813,7 @@ Sets `kitty-gfx--active-backend' to the detected backend symbol."
                 (when (and sixel-fn (funcall sixel-fn))
                   (setq detected 'sixel)))))))
         (setq kitty-gfx--active-backend detected)
+        (kitty-gfx--set-tparam 'kitty-gfx-backend detected)
         (kitty-gfx--log "detect-protocol: result=%s" detected)
         detected)))
 
@@ -665,39 +821,43 @@ Sets `kitty-gfx--active-backend' to the detected backend symbol."
   "Query terminal for cell size in pixels using CSI 16 t (XTWINOPS).
 The terminal responds with CSI 6 ; HEIGHT ; WIDTH t.
 Falls back to reasonable defaults if query fails or times out."
-  (unless (and kitty-gfx--cell-pixel-width kitty-gfx--cell-pixel-height)
-    (condition-case nil
-        (let ((response "")
-              (done nil)
-              (deadline (+ (float-time) 0.5)))  ; 500ms timeout
-          ;; Send CSI 16 t — request cell size in pixels
-          (send-string-to-terminal "\e[16t")
-          ;; Read response characters until we get the full sequence
-          ;; Expected: ESC [ 6 ; HEIGHT ; WIDTH t
-          (while (and (not done) (< (float-time) deadline))
-            (let ((ch (with-timeout (0.1 nil)
-                        (read-event nil nil 0.1))))
-              (when ch
-                (setq response (concat response (string ch)))
-                ;; Check if response ends with 't' (end of CSI response)
-                (when (string-suffix-p "t" response)
-                  (setq done t)))))
-          ;; Parse the response: ESC [ 6 ; HEIGHT ; WIDTH t
-          (when (string-match "\e\\[6;\\([0-9]+\\);\\([0-9]+\\)t" response)
-            (let ((h (string-to-number (match-string 1 response)))
-                  (w (string-to-number (match-string 2 response))))
-              (when (and (> w 0) (> h 0))
-                (setq kitty-gfx--cell-pixel-width w
-                      kitty-gfx--cell-pixel-height h)
-                (kitty-gfx--log "cell-size query: %dx%d pixels" w h)))))
-      (error nil))
-    ;; Fallback if query failed
-    (unless kitty-gfx--cell-pixel-width
-      (setq kitty-gfx--cell-pixel-width 8))
-    (unless kitty-gfx--cell-pixel-height
-      (setq kitty-gfx--cell-pixel-height 16))
-    (kitty-gfx--log "cell-size final: %dx%d"
-                     kitty-gfx--cell-pixel-width kitty-gfx--cell-pixel-height)))
+  ;; Guard on the per-terminal parameter, not the global, so every client
+  ;; terminal queries its own cell size exactly once even when another
+  ;; terminal already populated the global default.
+  (unless (terminal-parameter nil 'kitty-gfx-cell-w)
+    (let ((w nil) (h nil))
+      (condition-case nil
+          (let ((response "")
+                (done nil)
+                (deadline (+ (float-time) 0.5)))  ; 500ms timeout
+            ;; Send CSI 16 t — request cell size in pixels
+            (send-string-to-terminal "\e[16t")
+            ;; Read response characters until we get the full sequence
+            ;; Expected: ESC [ 6 ; HEIGHT ; WIDTH t
+            (while (and (not done) (< (float-time) deadline))
+              (let ((ch (with-timeout (0.1 nil)
+                          (read-event nil nil 0.1))))
+                (when ch
+                  (setq response (concat response (string ch)))
+                  ;; Check if response ends with 't' (end of CSI response)
+                  (when (string-suffix-p "t" response)
+                    (setq done t)))))
+            ;; Parse the response: ESC [ 6 ; HEIGHT ; WIDTH t
+            (when (string-match "\e\\[6;\\([0-9]+\\);\\([0-9]+\\)t" response)
+              (let ((rh (string-to-number (match-string 1 response)))
+                    (rw (string-to-number (match-string 2 response))))
+                (when (and (> rw 0) (> rh 0))
+                  (setq w rw h rh)
+                  (kitty-gfx--log "cell-size query: %dx%d pixels" w h)))))
+        (error nil))
+      ;; Fallback if query failed, then publish to both the global default
+      ;; and this terminal's parameter.
+      (setq w (or w 8) h (or h 16))
+      (setq kitty-gfx--cell-pixel-width w
+            kitty-gfx--cell-pixel-height h)
+      (set-terminal-parameter nil 'kitty-gfx-cell-w w)
+      (set-terminal-parameter nil 'kitty-gfx-cell-h h)
+      (kitty-gfx--log "cell-size final: %dx%d" w h))))
 
 (defun kitty-gfx--query-text-sizing-support ()
   "Detect terminal text sizing protocol support via CPR probing.
@@ -714,10 +874,13 @@ Compare column positions:
   no advancement            → no support
 
 Uses DSR (device status report) as a sentinel to avoid hanging."
-  (if kitty-gfx--text-sizing-support
-      ;; Already detected — return cached result
-      (kitty-gfx--log "text-sizing: cached result=%s"
-                       kitty-gfx--text-sizing-support)
+  (if (terminal-parameter nil 'kitty-gfx-text-sizing)
+      ;; Already detected for this terminal — reuse the cached result
+      (progn
+        (setq kitty-gfx--text-sizing-support
+              (terminal-parameter nil 'kitty-gfx-text-sizing))
+        (kitty-gfx--log "text-sizing: cached result=%s"
+                        kitty-gfx--text-sizing-support))
     (condition-case err
         (let ((response "")
               (done nil)
@@ -778,6 +941,7 @@ Uses DSR (device status report) as a sentinel to avoid hanging."
        (kitty-gfx--log "text-sizing: query error: %s"
                         (error-message-string err))
        (setq kitty-gfx--text-sizing-support 'none))))
+  (set-terminal-parameter nil 'kitty-gfx-text-sizing kitty-gfx--text-sizing-support)
   kitty-gfx--text-sizing-support)
 
 ;;;; Synchronized output
@@ -946,9 +1110,28 @@ Returns IMAGE-ID on success, nil on failure."
             (kitty-gfx--log "kitty-prepare: transmit id=%d b64-len=%d png=%s"
                              image-id (length b64) png)
             (kitty-gfx--transmit-image image-id b64)
+            ;; The bytes now live on the terminal output was routed to;
+            ;; record it so this client is not re-transmitted needlessly and
+            ;; other clients still re-transmit on their own first use.
+            (kitty-gfx--mark-transmitted image-id)
             image-id))
       (when temp-p
         (ignore-errors (delete-file png))))))
+
+(defun kitty-gfx--ensure-transmitted (file image-id)
+  "Ensure IMAGE-ID's data is present on `kitty-gfx--target-terminal'.
+Called from the refresh path, where the target terminal is bound, so a
+client that has not yet received this id gets a fresh `a=t' transmit (and,
+in placeholder mode, a fresh virtual placement) before placement.  No-op
+for the Sixel backend, which re-emits pixels on every placement and keeps
+no per-terminal image store.  `kitty-gfx--kitty-prepare' marks the
+terminal transmitted on success, so this runs at most once per (id,
+terminal)."
+  (when (and (eq kitty-gfx--active-backend 'kitty)
+             file image-id
+             (not (kitty-gfx--transmitted-p image-id)))
+    (kitty-gfx--log "ensure-transmitted: id=%d not yet on target terminal" image-id)
+    (funcall (kitty-gfx--backend-fn 'prepare) file image-id)))
 
 (defun kitty-gfx--kitty-place (ov image-id placement-id cols rows term-row term-col)
   "Place Kitty image at (TERM-ROW, TERM-COL) using the active placement mode.
@@ -1889,49 +2072,63 @@ range, inside a folded region, or not visible on screen."
 
 ;;;; Refresh cycle
 
-(defun kitty-gfx--emit-heading-overlays ()
-  "Phase 2: emit OSC 66 for visible heading overlays that need it.
-Skips headings already emitted at their current position and
-detects row collisions — if two headings would occupy overlapping
-terminal rows, the later one is skipped to prevent multicell
-block corruption."
+(defun kitty-gfx--emit-heading-overlays (term)
+  "Phase 2: emit OSC 66 for visible heading overlays on terminal TERM.
+Runs inside the caller's `kitty-gfx--with-terminal' + synchronized-output
+block, so phase-1 placement and phase-2 emission stay in one terminal
+frame (interleaved Emacs redisplay would otherwise corrupt freshly-placed
+multicell blocks).  Only buffers with a visible window on TERM are
+processed.  Skips headings already emitted at their current position and
+detects row collisions — if two headings would occupy overlapping terminal
+rows, the later one is skipped to prevent multicell block corruption."
   (dolist (buf (buffer-list))
     (when (buffer-live-p buf)
       (with-current-buffer buf
-        (let ((occupied (make-hash-table :test 'eql)))
-          ;; First pass: mark rows occupied by already-emitted headings
-          (dolist (ov kitty-gfx--overlays)
-            (when (and (overlay-get ov 'kitty-gfx-heading)
-                       (overlay-get ov 'kitty-gfx-heading-emitted)
-                       (overlay-get ov 'kitty-gfx-last-row))
-              (let ((row (overlay-get ov 'kitty-gfx-last-row))
-                    (rows (or (overlay-get ov 'kitty-gfx-rows) 1)))
-                (dotimes (r rows)
-                  (puthash (+ row r) t occupied)))))
-          ;; Second pass: emit new headings, checking for row conflicts
-          (dolist (ov kitty-gfx--overlays)
-            (when (and (overlay-get ov 'kitty-gfx-heading)
-                       (overlay-get ov 'kitty-gfx-last-row)
-                       (not (overlay-get ov 'kitty-gfx-heading-emitted)))
-              (let* ((row (overlay-get ov 'kitty-gfx-last-row))
-                     (rows (or (overlay-get ov 'kitty-gfx-rows) 1))
-                     (conflict nil))
-                ;; Check if any target row is already occupied
-                (dotimes (r rows)
-                  (when (gethash (+ row r) occupied)
-                    (setq conflict t)))
-                (if conflict
-                    (kitty-gfx--log "emit-heading: SKIP L%d row=%d (row conflict)"
-                                     (overlay-get ov 'kitty-gfx-heading-level) row)
-                  ;; No conflict — place and mark rows
+        (when (and kitty-gfx--overlays
+                   (cl-find-if (lambda (w)
+                                 (eq (frame-terminal (window-frame w)) term))
+                               (get-buffer-window-list buf nil 'visible)))
+          (let ((occupied (make-hash-table :test 'eql)))
+            ;; First pass: mark rows occupied by already-emitted headings
+            (dolist (ov kitty-gfx--overlays)
+              (when (and (overlay-get ov 'kitty-gfx-heading)
+                         (overlay-get ov 'kitty-gfx-heading-emitted)
+                         (overlay-get ov 'kitty-gfx-last-row))
+                (let ((row (overlay-get ov 'kitty-gfx-last-row))
+                      (rows (or (overlay-get ov 'kitty-gfx-rows) 1)))
                   (dotimes (r rows)
-                    (puthash (+ row r) t occupied))
-                  (kitty-gfx--place-heading ov))))))))))
+                    (puthash (+ row r) t occupied)))))
+            ;; Second pass: emit new headings, checking for row conflicts
+            (dolist (ov kitty-gfx--overlays)
+              (when (and (overlay-get ov 'kitty-gfx-heading)
+                         (overlay-get ov 'kitty-gfx-last-row)
+                         (not (overlay-get ov 'kitty-gfx-heading-emitted)))
+                (let* ((row (overlay-get ov 'kitty-gfx-last-row))
+                       (rows (or (overlay-get ov 'kitty-gfx-rows) 1))
+                       (conflict nil))
+                  ;; Check if any target row is already occupied
+                  (dotimes (r rows)
+                    (when (gethash (+ row r) occupied)
+                      (setq conflict t)))
+                  (if conflict
+                      (kitty-gfx--log "emit-heading: SKIP L%d row=%d (row conflict)"
+                                      (overlay-get ov 'kitty-gfx-heading-level) row)
+                    ;; No conflict — place and mark rows
+                    (dotimes (r rows)
+                      (puthash (+ row r) t occupied))
+                    (kitty-gfx--place-heading ov)))))))))))
 
 (defun kitty-gfx--refresh-inhibited-p ()
-  "Return non-nil if refreshing now would disturb user feedback."
-  (or (active-minibuffer-window)
-      (current-message)))
+  "Return non-nil if painting now would disturb user feedback.
+Only an active minibuffer inhibits the actual paint: placing images
+writes cursor-saved/restored escape sequences to the tty and never
+touches the echo area, so a lingering `current-message' (e.g. doc-view's
+\"Type ... to toggle\" or a mode-enable notice) must NOT block an
+explicitly scheduled refresh — in an idle daemon client that message
+never clears and the image would never appear.  The high-frequency
+`post-command-hook' scheduler still backs off on `current-message' (see
+`kitty-gfx--on-redisplay') to avoid flicker over transient feedback."
+  (active-minibuffer-window))
 
 (defun kitty-gfx--refresh ()
   "Re-place all visible images after redisplay using direct placements.
@@ -1939,10 +2136,10 @@ Relies on placement IDs (p=PID) — re-placing with the same PID
 replaces the previous placement without needing to delete first.
 Caches last position per overlay to skip redundant re-placements.
 Deletes placements for overlays that scrolled out of view.
-All terminal output is wrapped in synchronized output (BSU/ESU)
-to prevent flicker."
+Output is routed per window to that window's terminal and wrapped in a
+per-terminal synchronized-output pair (BSU/ESU) to prevent flicker, so
+several daemon clients on different ttys render correctly at once."
   (when (and kitty-graphics-mode
-             (not (display-graphic-p))
              (kitty-gfx--any-visible-overlays-p)
              (not (kitty-gfx--refresh-inhibited-p)))
     ;; Force redisplay only when a caller flagged that display properties
@@ -1952,73 +2149,109 @@ to prevent flicker."
     (when kitty-gfx--force-redisplay
       (setq kitty-gfx--force-redisplay nil)
       (redisplay t))
-    ;; Re-query cell size if invalidated (e.g., after terminal resize)
-    (unless (and kitty-gfx--cell-pixel-width kitty-gfx--cell-pixel-height)
-      (kitty-gfx--query-cell-size))
     (let ((total-overlays 0)
           (placed 0)
           (hidden 0)
-          (pruned 0))
+          (pruned 0)
+          (by-term nil))
       (kitty-gfx--log "refresh: begin")
-      (kitty-gfx--sync-begin)
+      ;; Group visible windows by their tty terminal in one pass, so each
+      ;; terminal gets exactly ONE synchronized-output block spanning both
+      ;; phase 1 (image placement + heading erase) and phase 2 (heading
+      ;; emit).  Splitting those phases into separate sync blocks lets Emacs
+      ;; redisplay interleave and leaves image/heading artifacts on screen.
+      ;; GUI and dead frames are skipped — `send-string-to-terminal' errors
+      ;; on a graphical display.
+      (walk-windows
+       (lambda (win)
+         (let* ((frame (window-frame win))
+                (term (and (frame-live-p frame)
+                           (not (display-graphic-p frame))
+                           (frame-terminal frame))))
+           (when (and term (terminal-live-p term))
+             (let ((cell (assq term by-term)))
+               (if cell
+                   (setcdr cell (cons win (cdr cell)))
+                 (push (list term win) by-term))))))
+       nil 'visible)
       (unwind-protect
-          (walk-windows
-           (lambda (win)
-             (with-current-buffer (window-buffer win)
-               (when kitty-gfx--overlays
-                 ;; A single overlay can be visible in multiple windows showing
-                 ;; the same buffer.  Its legacy last-row/last-col properties
-                 ;; mirror the placement for the window currently being
-                 ;; refreshed; per-window placement tracking below keeps the
-                 ;; individual terminal regions deletable when one window later
-                 ;; disappears.
-                 (dolist (ov kitty-gfx--overlays)
-                   (let ((placement (kitty-gfx--image-placement ov win)))
-                     (unless (overlay-get ov 'kitty-gfx-heading)
-                       (overlay-put ov 'kitty-gfx-last-row
-                                    (plist-get (cdr placement) :row))
-                       (overlay-put ov 'kitty-gfx-last-col
-                                    (plist-get (cdr placement) :col)))))
-                 ;; Prune dead overlays (overlay-buffer returns nil)
-                 (let ((before (length kitty-gfx--overlays)))
-                   (setq kitty-gfx--overlays
-                         (cl-delete-if-not #'overlay-buffer kitty-gfx--overlays))
-                   (let ((removed (- before (length kitty-gfx--overlays))))
-                     (when (> removed 0)
-                       (cl-incf pruned removed)
-                       (kitty-gfx--log "refresh: pruned %d dead overlays from %s"
-                                       removed (buffer-name)))))
-                 (let* ((edges (window-edges win))
-                        (win-bottom (nth 3 edges)))
-                   (kitty-gfx--log "refresh: win=%s buf=%s overlays=%d bottom=%d"
-                                   win (buffer-name) (length kitty-gfx--overlays) win-bottom)
-                   (dolist (ov kitty-gfx--overlays)
-                     (cl-incf total-overlays)
-                     (kitty-gfx--refresh-overlay ov win win-bottom)
-                     (if (overlay-get ov 'kitty-gfx-last-row)
-                         (cl-incf placed)
-                       (cl-incf hidden)))))))
-           nil 'visible)
-        ;; Refresh mpv video overlay position.  This runs after the
-        ;; per-window image loop because the mpv refresh picks its own
-        ;; canonical window via `kitty-gfx--mpv-canonical-window' and
-        ;; should fire at most once per refresh cycle (regardless of
-        ;; how many windows show the buffer).
+          (dolist (entry by-term)
+            (let ((term (car entry))
+                  (wins (cdr entry)))
+              ;; Lazily detect + probe this client's capabilities the first
+              ;; time it is the selected frame.  `read-event' (used by the
+              ;; queries) can only safely read the selected terminal, so
+              ;; other clients keep fallback values until focused.  Both
+              ;; query functions self-guard on their stored terminal
+              ;; parameter, so this is cheap on later refreshes.
+              (when (eq (frame-terminal (selected-frame)) term)
+                (unless (terminal-parameter term 'kitty-gfx-backend)
+                  (kitty-gfx--detect-protocol))
+                (kitty-gfx--query-cell-size)
+                (when (eq (terminal-parameter term 'kitty-gfx-backend) 'kitty)
+                  (kitty-gfx--query-text-sizing-support)))
+              (kitty-gfx--with-terminal term
+                (kitty-gfx--sync-begin)
+                (unwind-protect
+                    (progn
+                      ;; Phase 1: image placement + heading position/erase
+                      ;; for every window on this terminal.
+                      (dolist (win wins)
+                        (with-current-buffer (window-buffer win)
+                          (when kitty-gfx--overlays
+                            ;; A single overlay can be visible in multiple
+                            ;; windows showing the same buffer.  Its legacy
+                            ;; last-row/last-col mirror the placement for the
+                            ;; window currently refreshed; per-window tracking
+                            ;; keeps individual terminal regions deletable
+                            ;; when one window later disappears.
+                            (dolist (ov kitty-gfx--overlays)
+                              (let ((placement (kitty-gfx--image-placement ov win)))
+                                (unless (overlay-get ov 'kitty-gfx-heading)
+                                  (overlay-put ov 'kitty-gfx-last-row
+                                               (plist-get (cdr placement) :row))
+                                  (overlay-put ov 'kitty-gfx-last-col
+                                               (plist-get (cdr placement) :col)))))
+                            ;; Prune dead overlays (overlay-buffer returns nil)
+                            (let ((before (length kitty-gfx--overlays)))
+                              (setq kitty-gfx--overlays
+                                    (cl-delete-if-not #'overlay-buffer kitty-gfx--overlays))
+                              (let ((removed (- before (length kitty-gfx--overlays))))
+                                (when (> removed 0)
+                                  (cl-incf pruned removed)
+                                  (kitty-gfx--log "refresh: pruned %d dead overlays from %s"
+                                                  removed (buffer-name)))))
+                            (let* ((edges (window-edges win))
+                                   (win-bottom (nth 3 edges)))
+                              (kitty-gfx--log "refresh: win=%s buf=%s overlays=%d bottom=%d term=%s"
+                                              win (buffer-name) (length kitty-gfx--overlays)
+                                              win-bottom term)
+                              (dolist (ov kitty-gfx--overlays)
+                                (cl-incf total-overlays)
+                                (kitty-gfx--refresh-overlay ov win win-bottom)
+                                (if (overlay-get ov 'kitty-gfx-last-row)
+                                    (cl-incf placed)
+                                  (cl-incf hidden)))))))
+                      ;; Phase 2: emit OSC 66 for heading overlays whose
+                      ;; buffer is shown on this terminal, inside the SAME
+                      ;; sync block as phase 1 so mini-redraws cannot corrupt
+                      ;; the freshly-placed multicell blocks.
+                      (kitty-gfx--emit-heading-overlays term))
+                  (kitty-gfx--sync-end)))))
+        ;; mpv/casty repositioning runs once, after all terminals.  These
+        ;; send no direct terminal escapes (frames arrive via the routed
+        ;; process filter), so they need not sit inside a sync block.  Each
+        ;; picks its own canonical window, constrained to its launch
+        ;; terminal, and fires at most once per refresh regardless of how
+        ;; many windows show the buffer.
         (dolist (buf (buffer-list))
           (with-current-buffer buf
             (when kitty-gfx--mpv-overlay
               (kitty-gfx--refresh-mpv-overlay))))
-        ;; Reposition inline casty browser frames the same way.
         (dolist (buf (buffer-list))
           (with-current-buffer buf
             (when kitty-gfx--browser-overlay
-              (kitty-gfx--refresh-browser-overlay))))
-        ;; Phase 2: emit OSC 66 for all visible heading overlays.
-        ;; This runs AFTER all posn-at-point queries (phase 1) to
-        ;; prevent Emacs mini-redraws from destroying freshly-placed
-        ;; multicell blocks.  Headings are stateless — always re-emit.
-        (kitty-gfx--emit-heading-overlays)
-        (kitty-gfx--sync-end))
+              (kitty-gfx--refresh-browser-overlay)))))
       (kitty-gfx--log "refresh: done total=%d placed=%d hidden=%d pruned=%d"
                        total-overlays placed hidden pruned))))
 
@@ -2105,9 +2338,16 @@ refresh based on overlay type."
                                ov id win-pid))))))
               (overlay-put ov 'kitty-gfx-last-row new-row)
               (overlay-put ov 'kitty-gfx-last-col new-col)
-              (kitty-gfx--record-image-placement ov win new-row new-col cols rows pid)
-              (setq placement (kitty-gfx--image-placement ov win)
-                    pid (plist-get (cdr placement) :pid))
+              ;; Pass nil so a brand-new (overlay, window) placement gets its
+              ;; own unique id instead of the shared overlay base pid; reuse
+              ;; the recorded id on a move.  Use the returned effective id for
+              ;; the terminal placement so record and emit never diverge.
+              (setq pid (kitty-gfx--record-image-placement
+                         ov win new-row new-col cols rows nil))
+              ;; This window's terminal may be a client that has never
+              ;; received this image (the global cache only tracks that some
+              ;; terminal has it).  Transmit to it before placing.
+              (kitty-gfx--ensure-transmitted (overlay-get ov 'kitty-gfx-file) id)
               (funcall (kitty-gfx--backend-fn 'place)
                        ov id pid cols rows new-row new-col)))
         ;; Not visible or overflows — delete if was placed in this window
@@ -2245,16 +2485,21 @@ then invalidates position caches and schedules a refresh."
                 ;; Image overlay — delete all terminal placements, including
                 ;; multiple windows that were showing this buffer.
                 (kitty-gfx--delete-image-placements ov))))))))
-  ;; Reset cache for visible buffers so they re-place correctly.
+  ;; Reset cache for visible buffers so they re-place correctly.  Delete the
+  ;; terminal placements FIRST (via `kitty-gfx--delete-image-placements',
+  ;; which also clears the record + last-row/col) — nil-ing the record
+  ;; without deleting would orphan the on-screen copy at its old position
+  ;; (a ghost) because the next refresh allocates a fresh placement id.
   ;; Heading overlays preserve cache (same rationale as on-window-change).
-  (dolist (buf (buffer-list))
-    (with-current-buffer buf
-      (dolist (ov kitty-gfx--overlays)
-        (when (and (overlay-buffer ov)
-                   (not (overlay-get ov 'kitty-gfx-heading)))
-          (overlay-put ov 'kitty-gfx-placements nil)
-          (overlay-put ov 'kitty-gfx-last-row nil)
-          (overlay-put ov 'kitty-gfx-last-col nil)))))
+  (kitty-gfx--sync-begin)
+  (unwind-protect
+      (dolist (buf (buffer-list))
+        (with-current-buffer buf
+          (dolist (ov kitty-gfx--overlays)
+            (when (and (overlay-buffer ov)
+                       (not (overlay-get ov 'kitty-gfx-heading)))
+              (kitty-gfx--delete-image-placements ov)))))
+    (kitty-gfx--sync-end))
   ;; Longer debounce: cancel any fast leading-edge cooldown and
   ;; schedule a 0.1s delayed refresh to let buffer switch settle.
   (when kitty-gfx--render-timer
@@ -2267,7 +2512,7 @@ then invalidates position caches and schedules a refresh."
                              kitty-gfx--force-redisplay t)
                        (kitty-gfx--refresh)))))
 
-(defun kitty-gfx--on-window-change (_frame)
+(defun kitty-gfx--on-window-change (frame)
   "Handle window configuration change for image refresh.
 Invalidates cell pixel size, deletes stale image placements, then
 clears image position caches so the refresh cycle re-places images
@@ -2278,6 +2523,13 @@ settling to one)."
   (kitty-gfx--log "on-window-change: deleting stale placements and invalidating cell size")
   (setq kitty-gfx--cell-pixel-width nil
         kitty-gfx--cell-pixel-height nil)
+  ;; Invalidate FRAME's terminal cell-size parameter too, so the
+  ;; per-terminal query guard re-queries it (a resize can change the
+  ;; pixel cell size, and the guard keys on the parameter, not the global).
+  (let ((term (and (frame-live-p frame) (frame-terminal frame))))
+    (when (and term (terminal-live-p term))
+      (set-terminal-parameter term 'kitty-gfx-cell-w nil)
+      (set-terminal-parameter term 'kitty-gfx-cell-h nil)))
   ;; Clear stale per-window records on any mpv overlay so the next
   ;; refresh recomputes coordinates against the new layout.  The mpv
   ;; overlay is NEVER pushed onto `kitty-gfx--overlays' (mpv has no
@@ -2339,7 +2591,8 @@ Early-exits when no visible window has any kitty-gfx overlays so
 unrelated buffers (dired, magit, scratch, ...) pay no timer or
 redisplay cost, and skips while user feedback is in the echo area."
   (when (and (kitty-gfx--any-visible-overlays-p)
-             (not (kitty-gfx--refresh-inhibited-p)))
+             (not (active-minibuffer-window))
+             (not (current-message)))
     (kitty-gfx--schedule-refresh)))
 
 ;;;; Image processing
@@ -2412,6 +2665,12 @@ conversion fails — callers must handle nil gracefully."
               (ignore-errors (delete-file out))
               nil)))))))
 
+(defvar kitty-gfx--dim-scale nil
+  "When a positive float, multiply natural image cell dims by this factor.
+Bound dynamically by callers (e.g. the shr integration) to render images
+at a fraction of their natural size.  The result is still clamped to the
+max cols/rows.  nil means shrink-to-fit the max dimensions (the default).")
+
 (defun kitty-gfx--compute-cell-dims (pixel-w pixel-h max-cols max-rows)
   "Compute (COLS . ROWS) in terminal cells for image placement.
 With direct placements, COLS and ROWS map directly to terminal columns/rows."
@@ -2419,10 +2678,14 @@ With direct placements, COLS and ROWS map directly to terminal columns/rows."
          (ch (or kitty-gfx--cell-pixel-height 16))
          (img-cols (max 1 (ceiling (/ (float pixel-w) cw))))
          (img-rows (max 1 (ceiling (/ (float pixel-h) ch))))
-         (scale (min (if (> img-cols max-cols)
-                         (/ (float max-cols) img-cols) 1.0)
-                     (if (> img-rows max-rows)
-                         (/ (float max-rows) img-rows) 1.0)))
+         (fit (min (if (> img-cols max-cols)
+                       (/ (float max-cols) img-cols) 1.0)
+                   (if (> img-rows max-rows)
+                       (/ (float max-rows) img-rows) 1.0)))
+         (scale (if (and (numberp kitty-gfx--dim-scale)
+                         (> kitty-gfx--dim-scale 0))
+                    kitty-gfx--dim-scale
+                  fit))
          (cols (max 1 (min (round (* img-cols scale)) max-cols)))
          (rows (max 1 (min (round (* img-rows scale)) max-rows))))
     (kitty-gfx--log "cell-dims: pixel=%dx%d cw=%d ch=%d img=%dx%d scale=%.2f result=%dx%d"
@@ -2448,6 +2711,36 @@ With direct placements, COLS and ROWS map directly to terminal columns/rows."
   (kitty-gfx--log "cache-touch: %s (lru-len=%d)" (file-name-nondirectory file)
                    (length kitty-gfx--cache-lru)))
 
+(defun kitty-gfx--evict-image-everywhere (file id)
+  "Free image FILE/ID on every terminal that holds it.
+Each Kitty terminal that received ID gets a delete APC and has ID dropped
+from its transmitted set; per-file Sixel temp data is removed once.  Run
+on cache eviction so a later id reuse cannot collide with stale terminal
+data and the per-terminal transmitted sets do not grow without bound."
+  (when id
+    (dolist (term (terminal-list))
+      (when (and (terminal-live-p term)
+                 (kitty-gfx--terminal-transmitted-p term id))
+        (kitty-gfx--with-terminal term
+          (kitty-gfx--delete-by-id id))
+        (kitty-gfx--terminal-unmark-transmitted term id)))
+    (let ((sixel-cleanup (alist-get 'cleanup (alist-get 'sixel kitty-gfx--backends))))
+      (when sixel-cleanup (funcall sixel-cleanup file id)))))
+
+(defun kitty-gfx--cleanup-all-terminals ()
+  "Delete every transmitted image on every terminal and reset their sets.
+Also runs the Sixel backend's global cleanup for per-file temp data.  Used
+where a single-terminal `cleanup-all' would leave images stranded on the
+other daemon clients."
+  (dolist (term (terminal-list))
+    (when (and (terminal-live-p term)
+               (terminal-parameter term 'kitty-gfx-transmitted))
+      (kitty-gfx--with-terminal term
+        (kitty-gfx--delete-all-images))
+      (set-terminal-parameter term 'kitty-gfx-transmitted nil)))
+  (let ((sixel-ca (alist-get 'cleanup-all (alist-get 'sixel kitty-gfx--backends))))
+    (when sixel-ca (funcall sixel-ca))))
+
 (defun kitty-gfx--cache-put (file image-id)
   "Store IMAGE-ID for FILE in cache, evicting LRU entries if needed."
   (kitty-gfx--log "cache-put: %s id=%d (cache-count=%d max=%d)"
@@ -2459,8 +2752,8 @@ With direct placements, COLS and ROWS map directly to terminal columns/rows."
               kitty-gfx--cache-lru)
     (let* ((victim (car (last kitty-gfx--cache-lru)))
            (victim-id (gethash victim kitty-gfx--image-cache)))
-      (when (and victim-id kitty-gfx--active-backend)
-        (funcall (kitty-gfx--backend-fn 'cleanup) victim victim-id))
+      (when victim-id
+        (kitty-gfx--evict-image-everywhere victim victim-id))
       (remhash victim kitty-gfx--image-cache)
       (setq kitty-gfx--cache-lru (butlast kitty-gfx--cache-lru))
       (kitty-gfx--log "cache-evict: %s id=%s (remaining=%d)"
@@ -2533,16 +2826,26 @@ delete step, avoiding visual glitches in some terminals."
   (assq win (overlay-get ov 'kitty-gfx-placements)))
 
 (defun kitty-gfx--record-image-placement (ov win row col cols rows pid)
-  "Record that OV is placed in WIN at ROW COL with COLS ROWS and PID."
-  (unless (kitty-gfx--image-placement ov win)
-    (setq pid (kitty-gfx--alloc-placement-id)))
-  (let ((placements (assq-delete-all win (copy-sequence
-                                          (overlay-get ov 'kitty-gfx-placements)))))
+  "Record that OV is placed in WIN at ROW COL with COLS ROWS.
+Returns the effective placement id, which the caller must use for the
+terminal placement so the recorded and emitted ids never diverge.
+Reuses WIN's existing placement id when one is recorded (a move is an
+atomic same-id re-place); otherwise uses PID when non-nil, else
+allocates a fresh id.  Each (overlay, window) pair thus owns a stable,
+unique id — a single overlay shown in N windows needs N distinct
+on-screen copies."
+  (let* ((existing (cdr (kitty-gfx--image-placement ov win)))
+         (pid (or (plist-get existing :pid)
+                  pid
+                  (kitty-gfx--alloc-placement-id)))
+         (placements (assq-delete-all win (copy-sequence
+                                           (overlay-get ov 'kitty-gfx-placements)))))
     (overlay-put ov 'kitty-gfx-placements
                  (cons (cons win (list :row row :col col
                                        :cols cols :rows rows
                                        :pid pid))
-                       placements))))
+                       placements))
+    pid))
 
 (defun kitty-gfx--forget-image-placement (ov win)
   "Forget OV's recorded image placement for WIN."
@@ -2752,8 +3055,7 @@ The buffer should be writable (caller handles `inhibit-read-only')."
     (with-current-buffer buf
       (when kitty-gfx--overlays
         (kitty-gfx-remove-images))))
-  (when kitty-gfx--active-backend
-    (funcall (kitty-gfx--backend-fn 'cleanup-all)))
+  (kitty-gfx--cleanup-all-terminals)
   (clrhash kitty-gfx--image-cache)
   (setq kitty-gfx--cache-lru nil)
   (setq kitty-gfx--next-id 1)
@@ -2935,15 +3237,43 @@ will render even though detection reports Sixel as supported."
     (kitty-gfx--stop-all-browsers)
     (kitty-gfx--uninstall-hooks)
     (kitty-gfx--uninstall-integrations)
-    (when kitty-gfx--active-backend
-      (funcall (kitty-gfx--backend-fn 'cleanup-all)))
+    (kitty-gfx--cleanup-all-terminals)
     (when kitty-gfx--render-timer
       (cancel-timer kitty-gfx--render-timer))
     (setq kitty-gfx--render-timer nil
           kitty-gfx--refresh-pending nil
           kitty-gfx--active-backend nil
           kitty-gfx--text-sizing-support nil)
+    ;; The mode is global; drop every terminal's per-client state so a
+    ;; later re-enable re-detects and re-queries each client cleanly.
+    (dolist (term (terminal-list))
+      (when (terminal-live-p term)
+        (kitty-gfx--clear-terminal-state term)))
     (kitty-gfx--log "mode: disabled")))
+
+(defun kitty-gfx--on-new-frame (&optional frame)
+  "Detect graphics support for a newly created client FRAME's terminal.
+Runs on `server-after-make-frame-hook' (a normal hook that passes no
+argument, so FRAME defaults to the selected frame) and on
+`after-make-frame-functions' (which passes the new frame), so each
+`emacsclient' terminal gets its own backend detected.  Capability queries
+are deferred to the first refresh in which FRAME is the selected frame
+\(see `kitty-gfx--refresh'), since they read the selected terminal."
+  (let ((frame (or frame (selected-frame))))
+    (when (and kitty-graphics-mode
+               (frame-live-p frame)
+               (not (display-graphic-p frame)))
+      (with-selected-frame frame
+        (kitty-gfx--detect-protocol)))))
+
+(defun kitty-gfx--on-delete-terminal (term)
+  "Free kitty-graphics state bound to TERM as it is being deleted.
+Runs on `delete-terminal-functions': stops any video/browser launched on
+TERM and drops its per-client parameters (backend, cell size, text-sizing,
+transmitted set).  The terminal's stored images need no explicit deletion
+- they vanish with the terminal."
+  (kitty-gfx--stop-terminal-processes term)
+  (kitty-gfx--clear-terminal-state term))
 
 (defun kitty-gfx--install-hooks ()
   "Install redisplay hooks for image refresh."
@@ -2951,7 +3281,10 @@ will render even though detection reports Sixel as supported."
   (add-hook 'window-size-change-functions #'kitty-gfx--on-window-change)
   (add-hook 'window-buffer-change-functions #'kitty-gfx--on-buffer-change)
   (add-hook 'post-command-hook #'kitty-gfx--on-redisplay)
-  (add-hook 'kill-buffer-hook #'kitty-gfx--kill-buffer-hook))
+  (add-hook 'kill-buffer-hook #'kitty-gfx--kill-buffer-hook)
+  (add-hook 'server-after-make-frame-hook #'kitty-gfx--on-new-frame)
+  (add-hook 'after-make-frame-functions #'kitty-gfx--on-new-frame)
+  (add-hook 'delete-terminal-functions #'kitty-gfx--on-delete-terminal))
 
 (defun kitty-gfx--uninstall-hooks ()
   "Remove redisplay hooks."
@@ -2959,7 +3292,39 @@ will render even though detection reports Sixel as supported."
   (remove-hook 'window-size-change-functions #'kitty-gfx--on-window-change)
   (remove-hook 'window-buffer-change-functions #'kitty-gfx--on-buffer-change)
   (remove-hook 'post-command-hook #'kitty-gfx--on-redisplay)
-  (remove-hook 'kill-buffer-hook #'kitty-gfx--kill-buffer-hook))
+  (remove-hook 'kill-buffer-hook #'kitty-gfx--kill-buffer-hook)
+  (remove-hook 'server-after-make-frame-hook #'kitty-gfx--on-new-frame)
+  (remove-hook 'after-make-frame-functions #'kitty-gfx--on-new-frame)
+  (remove-hook 'delete-terminal-functions #'kitty-gfx--on-delete-terminal))
+
+(defun kitty-gfx--enable-on-tty-frame (&optional frame)
+  "Enable `kitty-graphics-mode' once a text-terminal FRAME connects.
+Used as a `server-after-make-frame-hook' / `after-make-frame-functions'
+entry by `kitty-graphics-setup'.  No-op once the mode is already on or
+when FRAME is graphical; after the mode enables itself it installs its
+own per-frame detection, so later clients are handled automatically."
+  (when (and (not kitty-graphics-mode)
+             (not (display-graphic-p frame)))
+    (with-selected-frame (or frame (selected-frame))
+      (kitty-graphics-mode 1))))
+
+;;;###autoload
+(defun kitty-graphics-setup ()
+  "Enable `kitty-graphics-mode' for both `emacs -nw' and `emacs --daemon'.
+
+The global mode self-disables if it cannot detect a graphics-capable
+terminal when enabled, and a daemon has no terminal attached at startup.
+So instead of enabling unconditionally, register a hook that turns the
+mode on at the first text-terminal client frame, and additionally enable
+it right away when Emacs is already running in a terminal.
+
+Put a single `(kitty-graphics-setup)' in your init; it is safe to call in
+a daemon, a GUI Emacs running a server, or a plain `emacs -nw'."
+  (interactive)
+  (add-hook 'server-after-make-frame-hook #'kitty-gfx--enable-on-tty-frame)
+  (add-hook 'after-make-frame-functions #'kitty-gfx--enable-on-tty-frame)
+  (unless (or (daemonp) (display-graphic-p))
+    (kitty-graphics-mode 1)))
 
 ;;;; Org-mode integration
 
@@ -3540,6 +3905,21 @@ can otherwise remain over newly-created window separators."
 
 ;;;; shr integration (eww, mu4e, gnus)
 
+(defun kitty-gfx--shr-display-image (file start end)
+  "Display FILE for the shr backends, honoring `kitty-gfx-shr-scale'."
+  (pcase kitty-gfx-shr-scale
+    ('fit
+     (let* ((win (get-buffer-window (current-buffer)))
+            (win-w (if win (window-body-width win) kitty-gfx-max-width))
+            (max-c (max 1 (min kitty-gfx-max-width
+                               (round (* win-w kitty-gfx-shr-fit-width)))))
+            (max-r (max 1 (min kitty-gfx-max-height kitty-gfx-shr-fit-height))))
+       (kitty-gfx-display-image file start end max-c max-r)))
+    ((and (pred numberp) factor)
+     (let ((kitty-gfx--dim-scale factor))
+       (kitty-gfx-display-image file start end)))
+    (_ (kitty-gfx-display-image file start end))))
+
 (defun kitty-gfx--shr-put-image-advice (orig-fn spec alt &rest args)
   "Around advice for `shr-put-image'.
 SPEC is an image descriptor — typically a create-image result.
@@ -3578,7 +3958,7 @@ We extract the :file or :data from the image properties."
                  (temp-p (and data file)))
             (condition-case err
                 (when file
-                  (let ((ov (kitty-gfx-display-image file start end)))
+                  (let ((ov (kitty-gfx--shr-display-image file start end)))
                     (if (and ov temp-p)
                         (overlay-put ov 'kitty-gfx-delete-file file)
                       (when temp-p
@@ -4391,10 +4771,18 @@ otherwise the first visible window displaying that buffer."
   (when (and kitty-gfx--mpv-overlay
              (overlay-buffer kitty-gfx--mpv-overlay))
     (let* ((buf (overlay-buffer kitty-gfx--mpv-overlay))
+           (term kitty-gfx--mpv-terminal)
+           ;; Only windows on the launching terminal count: mpv paints there
+           ;; alone, so a copy of the buffer on another client must not pull
+           ;; the video to that client's coordinates.
+           (on-term (lambda (w)
+                      (and (window-live-p w)
+                           (or (null term)
+                               (eq (frame-terminal (window-frame w)) term)))))
            (sel (selected-window)))
-      (if (and (window-live-p sel) (eq (window-buffer sel) buf))
+      (if (and (funcall on-term sel) (eq (window-buffer sel) buf))
           sel
-        (car (get-buffer-window-list buf nil 'visible))))))
+        (seq-find on-term (get-buffer-window-list buf nil 'visible))))))
 
 (defun kitty-gfx--refresh-mpv-overlay ()
   "Update mpv position if the overlay has moved.
@@ -4495,9 +4883,11 @@ PROC is the mpv process, EVENT describes the state change."
         kitty-gfx--mpv-last-col nil
         kitty-gfx--mpv-paused nil
         kitty-gfx--mpv-auto-paused nil)
-  ;; mpv's kitty VO may hide the cursor; restore it.  Also force a full
-  ;; redisplay so Emacs repaints the region mpv was occupying.
-  (ignore-errors (send-string-to-terminal "\e[?25h"))
+  ;; mpv's kitty VO may hide the cursor; restore it on the terminal that
+  ;; played the video.  Also force a full redisplay so Emacs repaints the
+  ;; region mpv was occupying.
+  (ignore-errors (send-string-to-terminal "\e[?25h" kitty-gfx--mpv-terminal))
+  (setq kitty-gfx--mpv-terminal nil)
   (force-mode-line-update t)
   (when (fboundp 'redraw-display) (redraw-display)))
 
@@ -4606,19 +4996,25 @@ Requires `kitty-gfx-enable-video' to be non-nil and mpv installed."
                   :filter #'kitty-gfx--mpv-filter
                   :sentinel #'kitty-gfx--mpv-process-sentinel)))
       (setq kitty-gfx--mpv-process proc)
+      ;; Bind playback to the launching terminal: the filter forwards mpv's
+      ;; VO bytes only there, so other daemon clients are not painted over.
+      (setq kitty-gfx--mpv-terminal (frame-terminal (selected-frame)))
+      (process-put proc 'kitty-gfx-terminal kitty-gfx--mpv-terminal)
       (kitty-gfx--log "mpv: started pid=%s file=%s" (process-id proc) file)
       ;; Connect IPC after mpv creates the socket
       (kitty-gfx--mpv-ipc-connect socket-path nil))))
 
-(defun kitty-gfx--mpv-filter (_proc chunk)
-  "Forward mpv stdout CHUNK to the Emacs controlling terminal.
-mpv with `--vo=kitty' emits APC graphics escapes to its stdout.
-When spawned as a subprocess of Emacs, those bytes land here.
-Writing them straight back out with `send-string-to-terminal'
-makes the terminal paint the frames inline."
+(defun kitty-gfx--mpv-filter (proc chunk)
+  "Forward mpv/casty stdout CHUNK to the terminal PROC was launched on.
+mpv with `--vo=kitty' (and casty in embed mode) emit APC graphics escapes
+to stdout.  When spawned as a subprocess of Emacs, those bytes land here.
+Writing them back out with `send-string-to-terminal' makes the terminal
+paint the frames inline.  The target terminal is the one recorded on PROC
+at launch, so under a daemon only the launching client is painted; nil
+falls back to the selected terminal for the single-client case."
   (when (and chunk (> (length chunk) 0))
     (condition-case err
-        (send-string-to-terminal chunk)
+        (send-string-to-terminal chunk (process-get proc 'kitty-gfx-terminal))
       (error
        (kitty-gfx--log "mpv-filter error: %s" (error-message-string err))))))
 
@@ -4890,9 +5286,10 @@ Safe to call more than once."
     (setq kitty-gfx--browser-xterm-mouse-was-off nil)
     (when (bound-and-true-p xterm-mouse-mode)
       (xterm-mouse-mode -1)))
-  ;; casty hid nothing in embed mode, but restore the cursor defensively
-  ;; and force a repaint of the region it occupied.
-  (ignore-errors (send-string-to-terminal "\e[?25h"))
+  ;; casty hid nothing in embed mode, but restore the cursor defensively on
+  ;; the launching terminal and force a repaint of the region it occupied.
+  (ignore-errors (send-string-to-terminal "\e[?25h" kitty-gfx--browser-terminal))
+  (setq kitty-gfx--browser-terminal nil)
   (force-mode-line-update t)
   (when (fboundp 'redraw-display) (redraw-display)))
 
@@ -4902,6 +5299,20 @@ Safe to call more than once."
     (when (buffer-live-p buf)
       (with-current-buffer buf
         (when kitty-gfx--browser-process
+          (kitty-gfx--browser-cleanup))))))
+
+(defun kitty-gfx--stop-terminal-processes (term)
+  "Stop any mpv/casty playback launched on terminal TERM.
+Called from `kitty-gfx--on-delete-terminal' so a disconnecting client
+leaves no subprocess streaming Kitty frames to a dead tty."
+  (dolist (buf (buffer-list))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (when (and kitty-gfx--mpv-process
+                   (eq kitty-gfx--mpv-terminal term))
+          (kitty-gfx--mpv-cleanup))
+        (when (and kitty-gfx--browser-process
+                   (eq kitty-gfx--browser-terminal term))
           (kitty-gfx--browser-cleanup))))))
 
 ;;;###autoload
@@ -4952,6 +5363,10 @@ Requires `kitty-gfx-enable-browser' to be non-nil and casty installed."
               (append
                (list (format "CASTY_CELL_WIDTH=%d" (or kitty-gfx--cell-pixel-width 8))
                      (format "CASTY_CELL_HEIGHT=%d" (or kitty-gfx--cell-pixel-height 16)))
+               ;; With debug on, ask casty to log each click's resolved CSS
+               ;; pixel + the element under it to *kitty-casty-log* so a missed
+               ;; click is visible (NONE) instead of a silent no-op.
+               (when kitty-gfx-debug (list "CASTY_DEBUG=1"))
                ;; A configured browser means we also skip casty's
                ;; Chrome-Headless-Shell auto-install bootstrap.
                (when kitty-gfx-casty-chrome
@@ -4982,6 +5397,9 @@ Requires `kitty-gfx-enable-browser' to be non-nil and casty installed."
                     :filter #'kitty-gfx--mpv-filter
                     :sentinel #'kitty-gfx--browser-process-sentinel)))
         (setq kitty-gfx--browser-process proc)
+        ;; Bind the browser to its launching terminal (see mpv above).
+        (setq kitty-gfx--browser-terminal (frame-terminal (selected-frame)))
+        (process-put proc 'kitty-gfx-terminal kitty-gfx--browser-terminal)
         (kitty-gfx--log "browser: started pid=%s url=%s" (process-id proc) url)
         (kitty-gfx--browser-ipc-connect socket buf))
       (message "kitty-gfx: browsing %s" url))))
@@ -5076,13 +5494,21 @@ subsequent label keystrokes are forwarded until a link is chosen or
 (defun kitty-gfx-browser-click (event)
   "Forward a left click in the browser frame to casty as a page click.
 The browser overlay sits at the window's top-left and never scrolls, so
-the clicked cell from EVENT maps directly to casty's 1-based content cell."
+the clicked cell from EVENT maps directly to casty's 1-based content cell.
+Clicks past the rendered grid (the 1-cell margin that `compute-geometry'
+leaves, or any over-wide window) fall outside casty's viewport and would
+be no-ops, so they are dropped rather than sent."
   (interactive "e")
   (let* ((cr (posn-col-row (event-start event)))
          (col (1+ (car cr)))
-         (row (1+ (cdr cr))))
-    (kitty-gfx--log "browser: click col=%d row=%d" col row)
-    (kitty-gfx--browser-send (list :cmd "click" :col col :row row))))
+         (row (1+ (cdr cr)))
+         (cols (or kitty-gfx--browser-cols col))
+         (rows (or kitty-gfx--browser-rows row)))
+    (if (or (> col cols) (> row rows))
+        (kitty-gfx--log "browser: click col=%d row=%d outside grid %dx%d (ignored)"
+                        col row cols rows)
+      (kitty-gfx--log "browser: click col=%d row=%d" col row)
+      (kitty-gfx--browser-send (list :cmd "click" :col col :row row)))))
 
 (defvar kitty-gfx-browser-mode-map
   (let ((map (make-sparse-keymap)))
