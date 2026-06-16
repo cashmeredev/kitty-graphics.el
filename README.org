@@ -5,7 +5,7 @@ Display images, video, and scaled text directly in terminal Emacs (~emacs -nw~) 
 
 The right backend is picked automatically at startup, so it works across ~20+ terminals with no configuration, and keeps working inside [[https://github.com/tmux/tmux][tmux]], where Kitty graphics are wrapped in DCS passthrough and Sixel runs natively on tmux >= 3.4.
 
-Version 0.6.0. Requires Emacs >= 27.1.
+Version 1.0.0. Requires Emacs >= 27.1.
 
 * Demo
 
@@ -194,11 +194,12 @@ The =SPC= / =q= / =?= keys are active on the video overlay while a video plays.
 
 *** Debugging
 
-| Command                            | Description                                |
-|------------------------------------+--------------------------------------------|
-| ~kitty-gfx-debug-state~            | Dump critical state to a debug buffer      |
-| ~kitty-gfx-debug-overlay-at-point~ | Dump info about the image overlay at point |
-| ~kitty-gfx-run-self-tests~         | Run batch-safe self-tests                  |
+| Command                            | Description                                        |
+|------------------------------------+----------------------------------------------------|
+| ~kitty-gfx-doctor~                 | Diagnostic report: backend, capabilities, binaries |
+| ~kitty-gfx-debug-state~            | Dump critical state to a debug buffer              |
+| ~kitty-gfx-debug-overlay-at-point~ | Dump info about the image overlay at point         |
+| ~kitty-gfx-run-self-tests~         | Run batch-safe self-tests                          |
 
 ** Customization
 
@@ -214,13 +215,24 @@ The =SPC= / =q= / =?= keys are active on the video overlay while a video plays.
 | ~kitty-gfx-cache-size~         |      64 | Max images kept in the terminal-side cache |
 | ~kitty-gfx-debug~              |     nil | Log debug info to the debug buffer / log   |
 
+*** Performance & conversion
+
+| Variable                       | Default  | Description                                                        |
+|--------------------------------+----------+--------------------------------------------------------------------|
+| ~kitty-gfx-async-conversion~   | t        | Convert non-PNG images to PNG in the background, off the main loop |
+| ~kitty-gfx-process-timeout~    | 15.0     | Seconds before a hung magick/identify/ffmpeg/typst call is killed  |
+| ~kitty-gfx-skip-clean-refresh~ | t        | Skip refreshing when no visible window content changed             |
+| ~kitty-gfx-base64-cache-bytes~ | 67108864 | Max bytes of base64-encoded image data cached in memory (64 MiB)   |
+
+External conversions (ImageMagick, ffmpeg, typst) run under a watchdog: if one exceeds ~kitty-gfx-process-timeout~ it is killed so a corrupt or pathological file cannot freeze Emacs. Sixel encoding has its own bound, ~kitty-gfx-sixel-encoder-timeout~. Set either to nil to disable the watchdog.
+
 *** shr images (eww, elfeed, mu4e, gnus)
 
-| Variable                    | Default | Description                                              |
-|-----------------------------+---------+----------------------------------------------------------|
-| ~kitty-gfx-shr-scale~       | nil     | Image sizing for shr backends: nil, a float, or ~fit~    |
-| ~kitty-gfx-shr-fit-width~   | 0.6     | Fraction of the window width under ~fit~ sizing          |
-| ~kitty-gfx-shr-fit-height~  | 20      | Maximum image height in rows under ~fit~ sizing          |
+| Variable                   | Default | Description                                           |
+|----------------------------+---------+-------------------------------------------------------|
+| ~kitty-gfx-shr-scale~      |     nil | Image sizing for shr backends: nil, a float, or ~fit~ |
+| ~kitty-gfx-shr-fit-width~  |     0.6 | Fraction of the window width under ~fit~ sizing       |
+| ~kitty-gfx-shr-fit-height~ |      20 | Maximum image height in rows under ~fit~ sizing       |
 
 By default shr images render at natural size, shrinking only to fit ~kitty-gfx-max-width~ / ~kitty-gfx-max-height~ — which often leaves feed images dominating the buffer. ~kitty-gfx-shr-scale~ tames them:
 
@@ -240,11 +252,13 @@ By default shr images render at natural size, shrinking only to fit ~kitty-gfx-m
 
 *** Sixel encoder
 
-| Variable                          | Default | Description                                          |
-|-----------------------------------+---------+------------------------------------------------------|
-| ~kitty-gfx-sixel-encoder-program~ | nil     | Encoder program (auto: img2sixel > magick > convert) |
-| ~kitty-gfx-sixel-encoder-args~    | nil     | Extra arguments passed to the encoder                |
-| ~kitty-gfx-sixel-encoder-timeout~ | 5.0     | Max seconds to wait for a single encoder run         |
+| Variable                          | Default | Description                                                |
+|-----------------------------------+---------+------------------------------------------------------------|
+| ~kitty-gfx-sixel-encoder-program~ | nil     | Encoder program (auto: img2sixel > magick > convert)       |
+| ~kitty-gfx-sixel-encoder-args~    | nil     | Extra arguments passed to the encoder                      |
+| ~kitty-gfx-sixel-encoder-timeout~ | 5.0     | Max seconds to wait for a single encoder run               |
+| ~kitty-gfx-sixel-dither~          | nil     | Dithering: nil (encoder default), "none", "fs", "atkinson" |
+| ~kitty-gfx-sixel-colors~          | 256     | Palette size; lower shrinks the payload, fewer colors      |
 
 *** tmux
 
@@ -256,20 +270,22 @@ By default shr images render at natural size, shrinking only to fit ~kitty-gfx-m
 
 *** Video
 
-| Variable                                 | Default                  | Description                                       |
-|------------------------------------------+--------------------------+---------------------------------------------------|
-| ~kitty-gfx-enable-video~                 | nil                      | Enable inline mpv video (mpv 0.36.0+)             |
-| ~kitty-gfx-video-file-extensions~        | mp4 mkv webm mov m4v avi | Extensions handled by inline mpv preview          |
-| ~kitty-gfx-video-thumbnail-seek~         | "0.5"                    | Seconds offset for thumbnail extraction           |
-| ~kitty-gfx-dired-preview-debounce~       | 0.3                      | Idle seconds before dired auto-preview            |
-| ~kitty-gfx-dirvish-video-inline-preview~ | nil                      | Where to play a video opened with RET in dirvish  |
+| Variable                                 | Default                  | Description                                      |
+|------------------------------------------+--------------------------+--------------------------------------------------|
+| ~kitty-gfx-enable-video~                 | nil                      | Enable inline mpv video (mpv 0.36.0+)            |
+| ~kitty-gfx-video-file-extensions~        | mp4 mkv webm mov m4v avi | Extensions handled by inline mpv preview         |
+| ~kitty-gfx-video-thumbnail-seek~         | "0.5"                    | Seconds offset for thumbnail extraction          |
+| ~kitty-gfx-dired-preview-debounce~       | 0.3                      | Idle seconds before dired auto-preview           |
+| ~kitty-gfx-dirvish-video-inline-preview~ | nil                      | Where to play a video opened with RET in dirvish |
 
 *** Headings & text sizing
 
-| Variable                       | Default                         | Description                                      |
-|--------------------------------+---------------------------------+--------------------------------------------------|
-| ~kitty-gfx-heading-scales~     | ((1 . 2.0) (2 . 1.5) (3 . 1.2)) | Org heading level -> visual scale factor         |
-| ~kitty-gfx-heading-sizes-auto~ | nil                             | Apply heading sizes automatically in org buffers |
+| Variable                              | Default                         | Description                                         |
+|---------------------------------------+---------------------------------+-----------------------------------------------------|
+| ~kitty-gfx-heading-scales~            | ((1 . 2.0) (2 . 1.5) (3 . 1.2)) | Org heading level -> visual scale factor            |
+| ~kitty-gfx-heading-sizes-auto~        | nil                             | Apply heading sizes automatically in org buffers    |
+| ~kitty-gfx-heading-scan-visible-only~ | t                               | Only instrument headings near the visible region    |
+| ~kitty-gfx-heading-conflicting-modes~ | (org-modern-mode ...)           | Minor modes disabled while heading sizes are active |
 
 *** Typst
 

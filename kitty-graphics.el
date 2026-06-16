@@ -3,7 +3,7 @@
 ;; Copyright (C) 2025-2026
 ;;
 ;; Author: cashmere
-;; Version: 0.6.0
+;; Version: 1.0.0
 ;; URL: https://github.com/cashmeredev/kitty-graphics.el
 ;; Keywords: terminals, images, multimedia
 ;; Package-Requires: ((emacs "27.1"))
@@ -160,6 +160,16 @@ The overlay reserves its blank screen area immediately and the image
 appears via a forced refresh once the background conversion finishes.
 When nil, conversion blocks Emacs as before."
   :type 'boolean
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-process-timeout 15.0
+  "Seconds a blocking external command may run before kitty-gfx kills it.
+Applies to the ImageMagick/identify pixel-size probe, PNG conversion,
+ffmpeg thumbnail extraction, and typst compilation, so a hung or
+pathological external process cannot freeze Emacs.  Sixel encoding has
+its own bound, `kitty-gfx-sixel-encoder-timeout'.  Set to nil or 0 to
+disable the watchdog."
+  :type '(choice (const :tag "No timeout" nil) number)
   :group 'kitty-graphics)
 
 (defcustom kitty-gfx-debug (and (getenv "KITTY_GFX_DEBUG") t)
@@ -994,6 +1004,33 @@ Sets `kitty-gfx--active-backend' to the detected backend symbol."
         (kitty-gfx--log "detect-protocol: result=%s" detected)
         detected)))
 
+(defun kitty-gfx--unsupported-reason (&optional frame)
+  "Return a human-readable string explaining why no backend is active.
+Re-examines FRAME's environment the way the detect functions do and
+reports the most likely cause: a graphical frame, tmux with
+passthrough off, a tmux too old for Sixel, or an unrecognized
+terminal.  Used by the mode-enable failure message and
+`kitty-gfx-doctor'."
+  (let* ((frame (or frame (selected-frame)))
+         (in-tmux (kitty-gfx--frame-getenv "TMUX" frame))
+         (term (or (frame-parameter frame 'tty-type)
+                   (kitty-gfx--frame-getenv "TERM" frame)))
+         (term-prog (kitty-gfx--frame-getenv "TERM_PROGRAM" frame)))
+    (cond
+     ((display-graphic-p frame)
+      "graphical frame; terminal graphics need a text terminal (emacs -nw)")
+     ((and in-tmux (not (kitty-gfx--tmux-passthrough-p frame)))
+      "inside tmux with allow-passthrough off; run: tmux set -g allow-passthrough on")
+     ((and in-tmux (not (kitty-gfx--tmux-sixel-supported-p frame)))
+      (let ((ver (kitty-gfx--tmux-version frame)))
+        (if ver
+            (format "tmux %d.%d is too old for Sixel (needs >= 3.4)"
+                    (car ver) (cadr ver))
+          "tmux version unknown; Sixel inside tmux needs tmux >= 3.4")))
+     (t
+      (format "no Kitty or Sixel terminal detected (TERM=%s, TERM_PROGRAM=%s); set `kitty-gfx-preferred-protocol' to force one"
+              (or term "?") (or term-prog "?"))))))
+
 (defun kitty-gfx--unread-non-reply (response patterns events)
   "Push back input consumed while reading a terminal reply.
 Strips every match of PATTERNS (and any trailing partial escape
@@ -1727,23 +1764,28 @@ Reset at the start of every run; consulted by the failure-feedback
 path so the user message can distinguish a hung encoder (watchdog
 fired) from a plain non-zero exit.")
 
-(defun kitty-gfx--sixel-run-encoder (program timeout dest-buffer args)
+(defun kitty-gfx--run-process (program args timeout dest-buffer)
   "Run PROGRAM with ARGS, writing stdout into DEST-BUFFER.
-TIMEOUT, when a positive number, terminates the process after that many
-seconds and signals an error.  Errors include captured stderr.
-Returns t on success, nil on failure (failures are logged, not signalled)."
-  (setq kitty-gfx--sixel-encode-timed-out nil)
-  (let* ((stderr-buf (generate-new-buffer " *kitty-gfx-sixel-stderr*"))
+When TIMEOUT is a positive number, a watchdog kills PROGRAM after that
+many seconds so a hung command cannot freeze Emacs.  Stderr is captured
+and logged.  Returns the integer exit status, the symbol `timeout' when
+the watchdog killed it, or nil when the process could not be started.
+DEST-BUFFER nil discards stdout."
+  (let* ((stderr-buf (generate-new-buffer " *kitty-gfx-process-stderr*"))
          (process-connection-type nil)
-         (proc (make-process :name "kitty-gfx-sixel-encoder"
-                             :buffer dest-buffer
-                             :command (cons program args)
-                             :coding 'binary
-                             :connection-type 'pipe
-                             :stderr stderr-buf
-                             :noquery t))
-         (timer (and (numberp timeout)
-                     (> timeout 0)
+         (proc (condition-case err
+                   (make-process :name (concat "kitty-gfx-"
+                                               (file-name-nondirectory program))
+                                 :buffer dest-buffer
+                                 :command (cons program args)
+                                 :coding 'binary
+                                 :connection-type 'pipe
+                                 :stderr stderr-buf
+                                 :noquery t)
+                 (error
+                  (kitty-gfx--log "run-process: %s failed to start: %S" program err)
+                  nil)))
+         (timer (and proc (numberp timeout) (> timeout 0)
                      (run-at-time
                       timeout nil
                       (lambda (p)
@@ -1751,33 +1793,42 @@ Returns t on success, nil on failure (failures are logged, not signalled)."
                           (process-put p 'kitty-gfx-timed-out t)
                           (delete-process p)))
                       proc))))
-    (set-process-sentinel proc #'ignore)
-    (unwind-protect
+    (if (not proc)
         (progn
-          (while (process-live-p proc)
-            (accept-process-output proc 0.1))
-          (let* ((timed-out (process-get proc 'kitty-gfx-timed-out))
-                 (exit (process-exit-status proc))
-                 (stderr (string-trim
-                          (with-current-buffer stderr-buf (buffer-string)))))
-            (cond
-             (timed-out
-              (setq kitty-gfx--sixel-encode-timed-out t)
-              (kitty-gfx--log
-               "sixel-encode: TIMEOUT after %.1fs (%s killed)"
-               (float timeout) program)
-              nil)
-             ((eq exit 0) t)
-             (t
-              (kitty-gfx--log "sixel-encode: %s exit=%s%s"
-                              program exit
-                              (if (string-empty-p stderr)
-                                  ""
-                                (concat ": " stderr)))
-              nil))))
-      (when (process-live-p proc) (delete-process proc))
-      (when timer (cancel-timer timer))
-      (when (buffer-live-p stderr-buf) (kill-buffer stderr-buf)))))
+          (when (buffer-live-p stderr-buf) (kill-buffer stderr-buf))
+          nil)
+      (set-process-sentinel proc #'ignore)
+      (unwind-protect
+          (progn
+            (while (process-live-p proc)
+              (accept-process-output proc 0.1))
+            (let ((stderr (string-trim
+                           (with-current-buffer stderr-buf (buffer-string)))))
+              (unless (string-empty-p stderr)
+                (kitty-gfx--log "run-process: %s stderr: %s" program stderr)))
+            (if (process-get proc 'kitty-gfx-timed-out)
+                (progn
+                  (kitty-gfx--log "run-process: TIMEOUT after %ss (%s killed)"
+                                  timeout program)
+                  'timeout)
+              (process-exit-status proc)))
+        (when (process-live-p proc) (delete-process proc))
+        (when timer (cancel-timer timer))
+        (when (buffer-live-p stderr-buf) (kill-buffer stderr-buf))))))
+
+(defun kitty-gfx--sixel-run-encoder (program timeout dest-buffer args)
+  "Run PROGRAM with ARGS, writing stdout into DEST-BUFFER.
+TIMEOUT, when a positive number, terminates the process after that many
+seconds.  Returns t on success, nil on failure (timeout or non-zero
+exit); a timeout also sets `kitty-gfx--sixel-encode-timed-out'."
+  (setq kitty-gfx--sixel-encode-timed-out nil)
+  (let ((status (kitty-gfx--run-process program args timeout dest-buffer)))
+    (cond
+     ((eq status 'timeout)
+      (setq kitty-gfx--sixel-encode-timed-out t)
+      nil)
+     ((eql status 0) t)
+     (t nil))))
 
 (defun kitty-gfx--sixel-img2sixel-tuning-args ()
   "Return img2sixel arguments for the dither and palette defcustoms."
@@ -3649,20 +3700,21 @@ second terminal skips the read+encode cost."
       (when (string-suffix-p "identify" identify)
         (kitty-gfx--log "image-pixel-size: WARNING deprecated `identify' binary resolved: %s (use `magick' instead)" identify))
       (with-temp-buffer
-        (let ((args (if (string-suffix-p "magick" identify)
-                        (list identify nil '(t nil) nil "identify" "-format" "%w %h"
-                              (concat file "[0]"))  ; first frame only
-                      (list identify nil '(t nil) nil "-format" "%w %h"
-                            (concat file "[0]")))))
-          (let ((exit-code (apply #'call-process args)))
-            (kitty-gfx--log "identify: exit=%d output=%S" exit-code (buffer-string))
-            (when (zerop exit-code)
-              (goto-char (point-min))
-              (when (looking-at "\\([0-9]+\\) \\([0-9]+\\)")
-                (let ((w (string-to-number (match-string 1)))
-                      (h (string-to-number (match-string 2))))
-                  (kitty-gfx--log "identify: %dx%d pixels" w h)
-                  (cons w h))))))))))
+        (let* ((args (if (string-suffix-p "magick" identify)
+                         (list "identify" "-format" "%w %h"
+                               (concat file "[0]"))  ; first frame only
+                       (list "-format" "%w %h" (concat file "[0]"))))
+               (status (kitty-gfx--run-process identify args
+                                               kitty-gfx-process-timeout
+                                               (current-buffer))))
+          (kitty-gfx--log "identify: status=%s output=%S" status (buffer-string))
+          (when (eql status 0)
+            (goto-char (point-min))
+            (when (looking-at "\\([0-9]+\\) \\([0-9]+\\)")
+              (let ((w (string-to-number (match-string 1)))
+                    (h (string-to-number (match-string 2))))
+                (kitty-gfx--log "identify: %dx%d pixels" w h)
+                (cons w h)))))))))
 
 (defun kitty-gfx--png-cache-get (file)
   "Return the cached PNG path for FILE, or nil if absent or stale."
@@ -3714,6 +3766,16 @@ the source file itself are skipped — that is user data, not ours."
   (or (executable-find "magick")
       (executable-find "convert")))
 
+(defun kitty-gfx--warn-no-imagemagick (file)
+  "Tell the user once that FILE needs ImageMagick that is not installed.
+Both the synchronous and background conversion paths call this so a
+missing `magick'/`convert' surfaces an echo-area message instead of
+images silently failing to appear."
+  (kitty-gfx--message-once
+   "imagemagick-missing"
+   (format "kitty-gfx: %s needs ImageMagick (magick/convert) to display; it is not on PATH"
+           (file-name-nondirectory file))))
+
 (defun kitty-gfx--convert-to-png (file)
   "Convert FILE to PNG if needed.  Returns path to PNG file.
 Returns FILE unchanged if it is already PNG.  Successful conversions
@@ -3730,14 +3792,14 @@ unavailable or conversion fails — callers must handle nil gracefully."
           (if (not convert)
               (progn
                 (kitty-gfx--log "convert-to-png: no ImageMagick, cannot convert %s" file)
-                (message "kitty-gfx: %s requires ImageMagick for display"
-                         (file-name-nondirectory file))
+                (kitty-gfx--warn-no-imagemagick file)
                 nil)
             (let ((out (make-temp-file "kitty-gfx-" nil ".png")))
               (kitty-gfx--log "convert-to-png: %s -> %s via %s" file out convert)
-              (let ((exit-code
-                     (call-process convert nil nil nil file out)))
-                (kitty-gfx--log "convert-to-png: exit-code=%s" exit-code)
+              (let ((status
+                     (kitty-gfx--run-process convert (list file out)
+                                             kitty-gfx-process-timeout nil)))
+                (kitty-gfx--log "convert-to-png: status=%s" status)
                 (if (and (file-exists-p out)
                          (> (file-attribute-size (file-attributes out)) 0))
                     (progn
@@ -3767,11 +3829,14 @@ when it finishes."
         (if (not convert)
             (progn
               (kitty-gfx--log "convert-to-png-async: no ImageMagick for %s" file)
+              (kitty-gfx--warn-no-imagemagick file)
               (funcall callback nil))
-          (let ((out (make-temp-file "kitty-gfx-" nil ".png")))
+          (let ((out (make-temp-file "kitty-gfx-" nil ".png"))
+                (proc nil))
             (puthash file (list callback) kitty-gfx--converting)
             (kitty-gfx--log "convert-to-png-async: %s -> %s via %s" file out convert)
-            (make-process
+            (setq proc
+             (make-process
              :name "kitty-gfx-convert"
              :command (list convert file out)
              :noquery t
@@ -3795,7 +3860,17 @@ when it finishes."
                                      (process-exit-status proc))
                      (ignore-errors (delete-file out)))
                    (dolist (cb (nreverse callbacks))
-                     (funcall cb (and ok out))))))))))))))
+                     (funcall cb (and ok out))))))))
+            (when (and (numberp kitty-gfx-process-timeout)
+                       (> kitty-gfx-process-timeout 0)
+                       proc)
+              (run-at-time
+               kitty-gfx-process-timeout nil
+               (lambda (p)
+                 (when (process-live-p p)
+                   (kitty-gfx--log "convert-to-png-async: TIMEOUT killing %s" file)
+                   (delete-process p)))
+               proc)))))))))
 
 (defvar kitty-gfx--dim-scale nil
   "When a positive float, multiply natural image cell dims by this factor.
@@ -4445,9 +4520,10 @@ will render even though detection reports Sixel as supported."
                      kitty-gfx--active-backend
                      (if (eq kitty-gfx--text-sizing-support 'scale)
                          ", text sizing" "")))
-        (kitty-gfx--log "mode: terminal not supported, aborting enable")
-        (setq kitty-graphics-mode nil)
-        (message "Kitty graphics: terminal not supported"))
+        (let ((reason (kitty-gfx--unsupported-reason)))
+          (kitty-gfx--log "mode: terminal not supported (%s), aborting enable" reason)
+          (setq kitty-graphics-mode nil)
+          (message "Kitty graphics: terminal not supported - %s" reason)))
     (kitty-gfx--log "mode: disabling")
     (kitty-gfx-stop-video)
     (kitty-gfx--stop-all-browsers)
@@ -4554,6 +4630,75 @@ a daemon, a GUI Emacs running a server, or a plain `emacs -nw'."
   (add-hook 'after-make-frame-functions #'kitty-gfx--enable-on-tty-frame)
   (unless (or (daemonp) (display-graphic-p))
     (kitty-graphics-mode 1)))
+
+;;;###autoload
+(defun kitty-gfx-doctor ()
+  "Show a terminal-graphics diagnostic report in a help buffer.
+Reports the active backend, detection result and (when nothing is
+supported) the likely reason, the queried cell size and text-sizing
+level, tmux state, the resolved Sixel encoder, and which external
+programs kitty-gfx relies on are installed.  Run this when images do
+not appear and you want to see what the package actually detected."
+  (interactive)
+  (let* ((frame (selected-frame))
+         (gui (display-graphic-p frame))
+         (backend kitty-gfx--active-backend)
+         (in-tmux (kitty-gfx--frame-getenv "TMUX" frame))
+         (term (frame-terminal frame))
+         (cell-w (or (terminal-parameter term 'kitty-gfx-cell-w)
+                     kitty-gfx--cell-pixel-width))
+         (cell-h (or (terminal-parameter term 'kitty-gfx-cell-h)
+                     kitty-gfx--cell-pixel-height))
+         (text-sizing (or (terminal-parameter term 'kitty-gfx-text-sizing)
+                          kitty-gfx--text-sizing-support))
+         (encoder (kitty-gfx--sixel-resolve-encoder))
+         (programs '(("magick" . "ImageMagick: PNG conversion and sizing")
+                     ("convert" . "ImageMagick legacy fallback")
+                     ("identify" . "ImageMagick legacy size probe")
+                     ("img2sixel" . "libsixel encoder (best Sixel quality)")
+                     ("ffmpeg" . "video thumbnails")
+                     ("typst" . "typst math preview")
+                     ("mpv" . "inline video")
+                     ("tmux" . "tmux passthrough")
+                     ("casty" . "inline web browser"))))
+    (with-help-window "*kitty-gfx-doctor*"
+      (with-current-buffer standard-output
+        (princ "kitty-gfx doctor\n================\n\n")
+        (princ (format "Mode enabled:    %s\n" (if kitty-graphics-mode "yes" "no")))
+        (princ (format "Frame type:      %s\n"
+                       (if gui "graphical (no terminal graphics)" "text terminal")))
+        (princ (format "Active backend:  %s\n" (or backend "none")))
+        (princ (format "Preferred:       %s\n" kitty-gfx-preferred-protocol))
+        (unless backend
+          (princ (format "Why unsupported: %s\n"
+                         (kitty-gfx--unsupported-reason frame))))
+        (princ (format "Cell size (px):  %dx%d%s\n"
+                       (or cell-w 8) (or cell-h 16)
+                       (if (and cell-w cell-h) "" "  (default; terminal did not answer CSI 16 t)")))
+        (princ (format "Text sizing:     %s\n" (or text-sizing "unknown")))
+        (when in-tmux
+          (let ((ver (kitty-gfx--tmux-version frame)))
+            (princ (format "tmux:            yes (version %s, passthrough %s, sixel-ok %s)\n"
+                           (if ver (format "%d.%d" (car ver) (cadr ver)) "unknown")
+                           (kitty-gfx--tmux-passthrough-state frame)
+                           (if (kitty-gfx--tmux-sixel-supported-p frame) "yes" "no")))))
+        (princ (format "Process timeout: %ss\n"
+                       (or kitty-gfx-process-timeout "disabled")))
+        (princ (format "Sixel timeout:   %ss\n"
+                       (or kitty-gfx-sixel-encoder-timeout "disabled")))
+        (princ (format "Sixel encoder:   %s\n"
+                       (if encoder (format "%s (%s)" (cdr encoder) (car encoder))
+                         "none found")))
+        (princ "\nExternal programs\n-----------------\n")
+        (dolist (p programs)
+          (let ((path (executable-find (car p))))
+            (princ (format "  %-10s %s  %s\n"
+                           (car p)
+                           (if path "found  " "MISSING")
+                           (or path (cdr p))))))
+        (princ (format "\nDebug log: %s (logging %s; toggle with `kitty-gfx-debug')\n"
+                       kitty-gfx--log-file
+                       (if kitty-gfx-debug "ON" "off")))))))
 
 ;;;; Org-mode integration
 
@@ -4671,18 +4816,18 @@ user knows why their videos have no thumbnails."
                                     kitty-gfx--video-thumbnail-cache-dir)))
         (if (file-exists-p out)
             out
-          (with-temp-buffer
-            (let ((exit (call-process
-                         ffmpeg nil t nil
-                         "-y" "-loglevel" "error"
-                         "-ss" kitty-gfx-video-thumbnail-seek
-                         "-i" file
-                         "-frames:v" "1"
-                         "-vf" "scale=640:-1"
-                         out)))
-              (kitty-gfx--log "video-thumbnail: exit=%s file=%s out=%s"
-                              exit file out)
-              (when (and (eq exit 0) (file-exists-p out)) out)))))))))
+          (let ((status (kitty-gfx--run-process
+                         ffmpeg
+                         (list "-y" "-loglevel" "error"
+                               "-ss" kitty-gfx-video-thumbnail-seek
+                               "-i" file
+                               "-frames:v" "1"
+                               "-vf" "scale=640:-1"
+                               out)
+                         kitty-gfx-process-timeout nil)))
+            (kitty-gfx--log "video-thumbnail: status=%s file=%s out=%s"
+                            status file out)
+            (when (and (eql status 0) (file-exists-p out)) out))))))))
 
 (defun kitty-gfx--org-display-inline-images-tty (&optional _include-linked beg end)
   "Display inline images in org buffer via Kitty graphics.
@@ -4934,18 +5079,15 @@ of the full preamble + fragment + ppi."
     (unless (file-exists-p png)
       (with-temp-file typ (insert body))
       (let* ((log-buf (get-buffer-create "*kitty-gfx-typst*"))
-             (ret (condition-case err
-                      (call-process kitty-gfx-typst-command nil log-buf nil
-                                    "compile"
-                                    "--format" "png"
-                                    "--ppi" (number-to-string kitty-gfx-typst-ppi)
-                                    typ png)
-                    (error
-                     (kitty-gfx--log "typst-render: call-process error: %S" err)
-                     -1))))
-        (unless (eq ret 0)
-          (kitty-gfx--log "typst-render: compile failed (exit=%s) for %s"
-                          ret typ)
+             (status (kitty-gfx--run-process
+                      kitty-gfx-typst-command
+                      (list "compile" "--format" "png"
+                            "--ppi" (number-to-string kitty-gfx-typst-ppi)
+                            typ png)
+                      kitty-gfx-process-timeout log-buf)))
+        (unless (eql status 0)
+          (kitty-gfx--log "typst-render: compile failed (status=%s) for %s"
+                          status typ)
           (setq png nil))))
     (and png (file-exists-p png) png)))
 

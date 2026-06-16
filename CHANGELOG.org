@@ -1,6 +1,22 @@
 * Changelog
 
-** Unreleased
+** kitty-graphics 1.0.0
+
+The stable 1.0. Everything since =0.6.0= settles here: a redisplay engine that does nothing when nothing changed, background image conversion, multi-terminal daemon rendering, a reworked document viewer with zoom and pan, a diagnostic command, a timeout watchdog over every external process, and a long bug-sweep over the process, overlay, and protocol lifecycles.
+
+*** Documents
+
+Doc-view was reworked: pages render centered in the window, =n= / =p= flip pages, and =+= / =-= / =0= zoom. On the Kitty backend a zoomed page is clipped to the window and panned by scrolling (pdf-tools style); on Sixel the page renders at fit size. PDF, DVI, PostScript, and EPUB all use the same path, and the doc-view welcome text is hidden so a page is the only thing on screen.
+
+Conversion is converter-agnostic: when MuPDF's =mutool= is on ~PATH~ doc-view uses it automatically (faster and sharper for PDFs), and Ghostscript still works. The SVG page path is guarded so doc-view's MuPDF SVG output is rasterized to PNG before placement.
+
+*** Diagnostics and reliability
+
+New ~kitty-gfx-doctor~ prints a report: active backend, queried cell size and text-sizing level, tmux state, the resolved Sixel encoder, and which relied-on external programs are installed. When a terminal is unsupported the mode now says why (graphical frame, tmux passthrough off, tmux too old for Sixel, or an unrecognized TERM) instead of just refusing, and a missing ImageMagick is surfaced once on both the synchronous and background conversion paths instead of images silently never appearing.
+
+Every blocking external command (ImageMagick, identify, ffmpeg, typst) runs under a watchdog bounded by new ~kitty-gfx-process-timeout~ (default 15s), so a corrupt or pathological file can no longer freeze Emacs. The Sixel encoder keeps its own ~kitty-gfx-sixel-encoder-timeout~; both share one process runner.
+
+The cell-size and text-sizing startup probes are deferred off the mode-enable path, so they no longer consume kkp.el's asynchronous keyboard-protocol reply (which could break kkp depending on tty-setup hook order).
 
 *** Performance
 
