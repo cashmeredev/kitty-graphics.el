@@ -4405,10 +4405,22 @@ placements."
             (kitty-gfx--log "mode: enabling (backend=%s)" kitty-gfx--active-backend)
             (when kitty-gfx--active-backend
               (funcall (kitty-gfx--backend-fn 'cleanup-all)))  ; clear stale state
-            (kitty-gfx--query-cell-size)
-            ;; Probe text sizing support (OSC 66) when on Kitty backend
-            (when (eq kitty-gfx--active-backend 'kitty)
-              (kitty-gfx--query-text-sizing-support))
+            ;; Defer terminal probing off the synchronous enable path.  These
+            ;; queries read the terminal with `read-event', which does not run
+            ;; `input-decode-map', so doing it here consumes replies another
+            ;; tty-setup consumer is still waiting for (e.g. kkp.el's async
+            ;; keyboard-protocol query) and breaks it (issue #33).  An idle
+            ;; timer lets the command loop route those replies first; the
+            ;; probes are idempotent (guarded per terminal parameter) and also
+            ;; run on the first refresh.
+            (run-with-idle-timer
+             0 nil
+             (lambda ()
+               (kitty-gfx--query-cell-size)
+               (when (eq kitty-gfx--active-backend 'kitty)
+                 (kitty-gfx--query-text-sizing-support))
+               (kitty-gfx--invalidate-window-signatures)
+               (kitty-gfx--schedule-refresh)))
             (kitty-gfx--install-hooks)
             (kitty-gfx--install-integrations)
             (kitty-gfx--invalidate-window-signatures)
