@@ -13,6 +13,12 @@ Version 0.6.0. Requires Emacs >= 27.1.
 
 [[file:assets/mpv-showcase.gif]]
 
+*Org heading text sizing (OSC 66, native scaled headings):*
+
+[[file:assets/text-headings.gif]]
+
+Heading rendering was massively reworked and is now stable for reading and navigating files. Editing scaled headings works far better than before (the overlay stays put and a debounced rescan re-renders in place as you type), but for now it is best used to /view/ files rather than to actively edit them: heavy editing re-renders on every debounce, and only one window per buffer renders the scaled headings while others show plain text. Toggle ~kitty-gfx-org-heading-sizes~ off when you switch to editing.
+
 *Sixel backend (foot):*
 
 [[file:assets/foot.gif]]
@@ -284,6 +290,7 @@ PNG is sent directly to the terminal. Other formats (JPEG, GIF, WebP, SVG, TIFF,
 - *tmux*: Kitty graphics now work inside tmux via DCS passthrough (~kitty-gfx-tmux-passthrough~), with a Unicode-placeholder placement mode (~kitty-gfx-kitty-placement-mode~) to survive pane switches. Sixel also works inside tmux >= 3.4 (foot/Konsole/mintty/mlterm/WezTerm as the outer terminal; ~kitty-gfx-tmux-allow-sixel~ to opt out). Because tmux's cell buffer is not pixel-aware, images may stick to old positions after scrolling, an upstream tmux limitation
 - Inline video on the Sixel backend is *experimental*: it needs an mpv built with libsixel (~--vo=sixel~), every frame is a full DCS payload (expect higher CPU than the Kitty backend), and it is excluded inside tmux like the Kitty path
 - Under a daemon, inline video and the casty browser are *bound to the client they were launched on* (a single subprocess streams to one terminal); other clients showing the same buffer see only the reserved blank area. Static images have no such limit and render on every client at once
+- *Scaled org headings* (OSC 66) are best for reading and navigating: while you type, a debounced rescan re-renders the heading in place, and only one canonical window per buffer renders the scaled headings (others showing the same buffer fall back to plain heading text). Toggle ~kitty-gfx-org-heading-sizes~ off for heavy editing
 - Animated GIFs display only the first frame (they route through the image pipeline as static images)
 - Sixel is limited to 256 colors (vs truecolor on Kitty) and is stateless, so images are re-emitted on every scroll, which may be slower on large images
 - The Sixel backend needs a Sixel encoder on ~PATH~. ~img2sixel~ (libsixel) is strongly recommended; ~magick~ / ~convert~ work as fallback but are noticeably slower. With no encoder on ~PATH~, the backend silently produces no output and only logs ~no encoder found~ when ~kitty-gfx-debug~ is non-nil
