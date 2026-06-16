@@ -1,4 +1,4 @@
-+TITLE: kitty-graphics.el
+#+TITLE: kitty-graphics.el
 #+AUTHOR: cashmere
 
 Display images, video, and scaled text directly in terminal Emacs (~emacs -nw~) using the [[https://sw.kovidgoyal.net/kitty/graphics-protocol/][Kitty graphics protocol]] or [[https://en.wikipedia.org/wiki/Sixel][Sixel]]. Beyond inline images it also does inline [[https://mpv.io/][mpv]] video playback, org-mode heading text sizing (OSC 66), and [[https://typst.app/][typst]] math previews.
