@@ -2,6 +2,82 @@
 
 ** Unreleased
 
+*** Performance
+
+Refreshes are now skipped entirely when nothing on screen changed: each visible image window stores a cheap signature (buffer, modification tick, displayed region, hscroll, pixel size) after a successful refresh, and the post-command scheduler does nothing while every signature still matches. New ~kitty-gfx-skip-clean-refresh~ (default ~t~) is the escape hatch.
+
+Non-PNG images (jpeg, webp, svg, ...) are converted to PNG in a background process instead of blocking Emacs, controlled by new ~kitty-gfx-async-conversion~ (default ~t~); the overlay reserves its space immediately and the image appears via a forced refresh once the conversion lands. Conversion results are cached per file mtime, so repeat displays skip ImageMagick altogether.
+
+Transmitting an image to a terminal that does not hold its data yet (a freshly attached daemon client, or a first display) no longer happens synchronously inside the refresh loop: transmits go through a queue drained one image per timer tick, keeping keystrokes responsive while a new client catches up.
+
+Base64 payloads are cached in memory keyed on file and mtime, bounded by new ~kitty-gfx-base64-cache-bytes~ (default 64 MiB, LRU eviction), so sending the same image to a second terminal skips the read and encode cost.
+
+*** Headings
+
+OSC 66 heading widths are now computed with ~string-width~ instead of character count, so CJK and emoji headings get their full double-width footprint for placement, erase, and collision detection.
+
+Editing a scaled heading no longer makes it vanish and reappear: the overlay stays in place, the buffer text shows at normal size while you type, and a debounced rescan updates the heading text, width, and OSC 66 rendering in place. A line that stops being a heading (or moves to an unscaled level) drops its overlay cleanly, and typing at the end of the heading is now detected at all.
+
+Heading instrumentation is lazy by default: only the displayed window region plus two screenfuls of margin is scanned, driven by scroll and window-change hooks, which keeps activation instant in buffers with thousands of headings. New ~kitty-gfx-heading-scan-visible-only~ (default ~t~); set to ~nil~ for the old full-buffer scan.
+
+Scaled headings no longer overwrite inline images: the emit phase seeds its occupied-row set from the image placements recorded on the target terminal and skips any heading that would overlap them, exactly like heading-heading conflicts.
+
+Enabling heading sizes no longer unfolds the whole buffer; folded and collapsed headings simply render as plain text until revealed.
+
+Live-terminal rendering is now stable: each heading reserves exactly its scaled width in spaces (clamped to the window, with the OSC 66 payload truncated to fit) and the reservation is flushed to the terminal before the block is painted, so Emacs redraws no longer clip the leading glyphs, no truncation marker appears, and over-wide reservations are gone. Erases are only ever emitted at freshly measured coordinates immediately before a placement; folds, scrolls, edits, and buffer switches rely on Emacs redrawing the reserved cells instead, which stops stale-coordinate erases from blanking real buffer text. Two live-testing fixes on top: screen columns now include the ~display-line-numbers~ width (headings and images no longer paint over or get clipped by the number column), and a heading that moves without a window scroll — or any visibility cycle via ~org-cycle~ — gets its old multicell block erased at the still-valid cached coordinates, eliminating ghost fragments after S-TAB and fold changes. Scrolls erase the emitted blocks from the scroll hook, before the window is redrawn while their cached coordinates still match the screen, so redraw-style scrolls can no longer leave clipped giant-glyph fragments at the old position.
+
+The minor modes disabled while heading sizes are active are now customizable via new ~kitty-gfx-heading-conflicting-modes~ (default matches the old hardcoded list).
+
+When the same org buffer is shown in several windows or terminals, one canonical window per buffer (preferring the selected window) renders the scaled headings; all other windows show plain heading text instead of flickering. Per-window heading rendering is a known limitation.
+
+*** Sixel and tmux
+
+Sixel encoding gained tuning knobs: new ~kitty-gfx-sixel-dither~ (nil for the encoder default, ~"none"~, ~"fs"~, or ~"atkinson"~) and ~kitty-gfx-sixel-colors~ (palette size, default 256) map onto img2sixel's ~-d~/~-p~ and ImageMagick's ~-dither~/~-colors~ flags; ~kitty-gfx-sixel-encoder-args~ remains the raw escape hatch appended after them. ImageMagick now resizes before quantizing, so the palette reduction actually sticks. Dropping to 16 colors with dithering off cuts the test-image payload from 2042 to 1412 bytes (img2sixel) and 4904 to 1712 (magick).
+
+When img2sixel encodes a source image larger than the target pixel box and ImageMagick is available, the image is first pre-scaled to a temp PNG (bounded by the same timeout watchdog as encoder runs) and img2sixel encodes that without ~-w~/~-h~, so quantization runs on the small image instead of the full-size one. The temp PNG is deleted after encoding; cache keys are unchanged.
+
+A failed or timed-out Sixel encode is no longer silent blank cells: the overlay shows a visible =[sixel: encode failed]= marker, a one-time message (per file, per session) names the encoder and whether the timeout watchdog killed it, and the failing overlay is not retried on every refresh. The failure marker records the file's mtime, so changing the file on disk (or re-displaying the image) retries the encode instead of sticking until Emacs restarts.
+
+tmux detection is now per terminal: the tmux version cache moved from a global to a terminal parameter, and the version is asked from each client's own tmux server (socket derived from that frame's TMUX env var) so daemon clients sitting in different tmux servers detect independently. When Sixel inside tmux is refused for an old tmux, the message names the detected version and the 3.4 minimum.
+
+New ~kitty-gfx--tmux-passthrough-p~ queries =#{allow-passthrough}= on the client's tmux socket (cached per terminal, ~on~/~all~ count as enabled). When the outer terminal speaks the Kitty protocol but tmux passthrough is off, the Kitty backend is no longer selected blindly — detection emits a one-time message with the exact fix (=tmux set -g allow-passthrough on=) and falls through to Sixel when available.
+
+*** Features
+
+**** Inline mpv video on the Sixel backend (experimental)
+
+~kitty-gfx-play-video~ now also works on the Sixel backend via mpv's native ~--vo=sixel~ output, sharing the whole kitty-vo pipeline (PTY frame forwarding, IPC pause/seek/reposition, hidden-buffer auto-pause). Requires an mpv built with libsixel (probed once via =mpv --vo=help=, with a Nix override hint when missing); the existing ~kitty-gfx-sixel-dither~ and ~kitty-gfx-sixel-colors~ defcustoms tune the frame encoding.
+
+**** Multi-tty daemon support
+
+Graphics now work under =emacs --daemon= with several =emacsclient -t= clients at once. Placements, image transmissions, and cleanup are routed per client terminal: each terminal keeps its own backend detection, cell size, text-sizing level, and transmitted-image set, and every refresh batch runs in its own synchronized-output block on the right tty. Inline video (mpv) and the casty browser stay bound to the terminal they were launched on. New ~kitty-graphics-setup~ is the daemon-aware entry point, and =just test-daemon*= recipes drive an isolated daemon for multi-client testing.
+
+**** shr image scaling (eww, elfeed, mu4e, gnus)
+
+New ~kitty-gfx-shr-scale~ controls how images render through shr, so feed
+images no longer dominate the buffer at full natural size. Set it to a
+float (e.g. ~0.25~) to render every image at a fraction of its natural
+size, or to ~fit~ for dynamic, window-relative sizing: each image is
+scaled into a box of ~kitty-gfx-shr-fit-width~ (fraction of the window
+width, default 0.6) by ~kitty-gfx-shr-fit-height~ rows (default 20),
+preserving aspect ratio and never enlarging images that already fit. The
+box tracks the live window. Default ~nil~ keeps the previous behaviour
+(natural size, shrink-to-fit ~kitty-gfx-max-width~ / ~kitty-gfx-max-height~).
+
+*** Fixes
+
+A bug-sweep pass over process, overlay, and protocol lifecycles, verified finding by finding.
+
+Placeholder mode (the default inside tmux) no longer shows a top-left crop of downscaled images: the virtual placement is registered with the rendered cell dimensions (~c~/~r~) at placement time and re-registered when they change. Direct placements inside tmux also stopped leaking their cursor movement through the passthrough envelope (it now executes pane-relative, only the APC is wrapped), the placement mode is resolved from the target client's environment under a multi-tty daemon, and images larger than the 297-cell placeholder grid (image-mode zoom) are clamped instead of aborting every refresh cycle.
+
+The cell-size and text-sizing startup probes no longer eat your keystrokes: typing while the probe waits (an =n= or =t= used to terminate the read early) leaked the real terminal reply into the command loop as garbage keys; both readers now complete only on a full match of the expected reply and push anything else back as input. OSC 66 heading text is capped at the protocol's 4096-byte limit on a UTF-8 boundary.
+
+mpv playback started from dired (or any window switch at the wrong moment) no longer loses its IPC connection to whatever buffer was current when the socket appeared — pause, auto-pause, repositioning, and cleanup work again, and the connection no longer leaks. The IPC socket pollers for mpv and casty are cancellable and stop on their own when the session is gone, a quit during a Sixel encode no longer leaves the encoder process running, the blank lines ~kitty-gfx-play-video~ inserts are removed when playback ends, and converted temp PNGs plus stale IPC sockets are deleted when Emacs exits instead of piling up in /tmp.
+
+The casty browser stops painting over unrelated buffers when no window shows it: frames are suppressed and the image is dropped, then repainted when the buffer is shown again, mirroring mpv's auto-pause. Its stderr log buffer is killed with the last browser session. mpv and casty are no longer offered inside tmux at all — their raw frame streams bypass the passthrough wrapper and could only render blank — and the unavailable-reason messages say so.
+
+Disabling ~kitty-graphics-mode~ now actually cleans up: blank image overlays and space-displayed scaled headings are removed from all buffers (with conflicting minor modes restored) before the backend state is reset, so re-enabling heading sizes works instead of erroring. Killing a buffer deletes its real per-window placements (not a never-emitted overlay id) on the terminals they were painted on, ~revert-buffer~ and major-mode switches no longer orphan overlays and placements, and ~kitty-gfx-clear-all~ no longer resets the image id counter under a live browser session (a later allocation could clobber the browser frame).
+
 ** kitty-graphics 0.6.0
 
 Three headline additions land in =0.6.0=: inline video playback, an
