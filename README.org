@@ -19,6 +19,12 @@ Version 0.6.0. Requires Emacs >= 27.1.
 
 Heading rendering was massively reworked and is now stable for reading and navigating files. Editing scaled headings works far better than before (the overlay stays put and a debounced rescan re-renders in place as you type), but for now it is best used to /view/ files rather than to actively edit them: heavy editing re-renders on every debounce, and only one window per buffer renders the scaled headings while others show plain text. Toggle ~kitty-gfx-org-heading-sizes~ off when you switch to editing.
 
+*shr image scaling (eww, elfeed, mu4e, gnus):*
+
+[[file:assets/shr-demo.gif]]
+
+With ~kitty-gfx-shr-scale~ set to ~fit~ (or a float fraction), inline images in eww/elfeed/mu4e/gnus are scaled into a window-relative box instead of dominating the buffer at full natural size.
+
 *Sixel backend (foot):*
 
 [[file:assets/foot.gif]]
