@@ -1262,22 +1262,30 @@ at transmit time, producing an unwanted ghost copy."
     (kitty-gfx--log "alloc-pid: %d" pid)
     pid))
 
-(defun kitty-gfx--place-image (image-id placement-id cols rows term-row term-col)
+(defun kitty-gfx--place-image (image-id placement-id cols rows term-row term-col
+                                        &optional src-x src-y src-w src-h)
   "Place image IMAGE-ID at terminal position TERM-ROW, TERM-COL.
 PLACEMENT-ID is the unique placement ID (p=PID) — reusing the same PID
 replaces the previous placement, preventing accumulation.
 COLS x ROWS is the size in terminal cells.
+When SRC-X/SRC-Y/SRC-W/SRC-H are all non-nil, only that source pixel
+rectangle of the stored image is shown (Kitty `x'/`y'/`w'/`h' params),
+scaled into COLS x ROWS cells — used for zoomed, clipped doc-view pages.
 Uses direct placement: move cursor, then `a=p' with `c' and `r' params.
 The cursor movement and the APC are sent separately: inside tmux only
 the APC may travel through the passthrough envelope — wrapping the
 cursor moves with it would make them execute on the outer terminal
 with pane-relative coordinates."
-  (kitty-gfx--log "place: id=%d pid=%d cols=%d rows=%d row=%d col=%d"
-                   image-id placement-id cols rows term-row term-col)
+  (kitty-gfx--log "place: id=%d pid=%d cols=%d rows=%d row=%d col=%d crop=%s"
+                   image-id placement-id cols rows term-row term-col
+                   (if src-x (format "%d,%d,%d,%d" src-x src-y src-w src-h) "none"))
   (kitty-gfx--terminal-send (format "\e7\e[%d;%dH" term-row term-col))
   (kitty-gfx--terminal-send
-   (format "\e_Gq=2,a=p,i=%d,p=%d,c=%d,r=%d\e\\"
-           image-id placement-id cols rows))
+   (concat (format "\e_Gq=2,a=p,i=%d,p=%d,c=%d,r=%d"
+                   image-id placement-id cols rows)
+           (when (and src-x src-y src-w src-h)
+             (format ",x=%d,y=%d,w=%d,h=%d" src-x src-y src-w src-h))
+           "\e\\"))
   (kitty-gfx--terminal-send "\e8"))
 
 ;;;; Kitty backend
@@ -3075,6 +3083,9 @@ refresh based on overlay type."
       ;; Heading overlay — phase 1: compute position + erase if moved.
       ;; OSC 66 emission happens in phase 2 (kitty-gfx--emit-heading-overlays).
       (kitty-gfx--refresh-heading-overlay ov win win-bottom)
+  (if (overlay-get ov 'kitty-gfx-doc-view)
+      ;; doc-view page — own zoom/scroll/crop path (centering + clipping).
+      (kitty-gfx--doc-view-refresh-overlay ov win)
   ;; Image overlay refresh
   (let* ((pos (kitty-gfx--overlay-screen-pos ov win))
          (rows (overlay-get ov 'kitty-gfx-rows))
@@ -3171,7 +3182,7 @@ refresh based on overlay type."
           (kitty-gfx--delete-image-placement ov placement)
           (kitty-gfx--forget-image-placement ov win)
           (overlay-put ov 'kitty-gfx-last-row nil)
-          (overlay-put ov 'kitty-gfx-last-col nil)))))))
+          (overlay-put ov 'kitty-gfx-last-col nil))))))))
 
 (defun kitty-gfx--heading-canonical-window (buf)
   "Return the single window that renders BUF's scaled headings.
@@ -5189,68 +5200,84 @@ Values > 1.0 zoom in, < 1.0 zoom out.")
   "Path to the current doc-view page image file.
 Stored so zoom commands can re-render without querying `doc-view-current-image'.")
 
+(defvar-local kitty-gfx--doc-view-scroll-col 0
+  "Horizontal scroll offset, in cells, into the zoomed doc-view page.")
+
+(defvar-local kitty-gfx--doc-view-scroll-row 0
+  "Vertical scroll offset, in cells, into the zoomed doc-view page.")
+
+(defvar-local kitty-gfx--doc-view-fit nil
+  "Page size in cells at scale 1.0 as (COLS . ROWS).")
+
+(defvar-local kitty-gfx--doc-view-src nil
+  "Source page image pixel size as (WIDTH . HEIGHT).")
+
 (defun kitty-gfx--doc-view-terminal-p ()
   "Non-nil when Kitty graphics is handling a doc-view buffer in a terminal."
   (and kitty-graphics-mode
        (not (display-graphic-p))
        (eq major-mode 'doc-view-mode)))
 
-(defun kitty-gfx--doc-view-image-cell-size ()
-  "Return the current doc-view Kitty image size as (COLS . ROWS), or nil."
-  (when (overlayp kitty-gfx--doc-view-overlay)
-    (let ((cols (overlay-get kitty-gfx--doc-view-overlay 'kitty-gfx-cols))
-          (rows (overlay-get kitty-gfx--doc-view-overlay 'kitty-gfx-rows)))
-      (when (and cols rows)
-        (cons cols rows)))))
+(defun kitty-gfx--doc-view-win-dims (&optional win)
+  "Return the usable doc-view area of WIN (or selected) as (COLS . ROWS)."
+  (cons (max 1 (1- (window-body-width win)))
+        (max 1 (1- (window-body-height win)))))
+
+(defun kitty-gfx--doc-view-total-size ()
+  "Return the zoomed page size in cells as (COLS . ROWS), or nil.
+This is the scale-1.0 fit size scaled by `kitty-gfx--doc-view-scale'."
+  (when kitty-gfx--doc-view-fit
+    (cons (max 1 (round (* kitty-gfx--doc-view-scale
+                           (car kitty-gfx--doc-view-fit))))
+          (max 1 (round (* kitty-gfx--doc-view-scale
+                           (cdr kitty-gfx--doc-view-fit)))))))
 
 (defun kitty-gfx--doc-view-max-hscroll ()
-  "Return the maximum horizontal scroll for the current Kitty doc-view page."
-  (let ((size (kitty-gfx--doc-view-image-cell-size)))
-    (max 0 (- (or (car size) 0) (window-body-width)))))
+  "Return the maximum horizontal cell scroll for the zoomed page."
+  (let ((total (kitty-gfx--doc-view-total-size)))
+    (max 0 (- (or (car total) 0) (car (kitty-gfx--doc-view-win-dims))))))
 
 (defun kitty-gfx--doc-view-max-vscroll ()
-  "Return the maximum vertical pixel scroll for the current Kitty doc-view page."
-  (let ((size (kitty-gfx--doc-view-image-cell-size)))
-    (max 0 (- (* (or (cdr size) 0) (frame-char-height))
-              (window-body-height nil t)))))
+  "Return the maximum vertical cell scroll for the zoomed page."
+  (let ((total (kitty-gfx--doc-view-total-size)))
+    (max 0 (- (or (cdr total) 0) (cdr (kitty-gfx--doc-view-win-dims))))))
 
 (defun kitty-gfx--doc-view-set-hscroll (ncols)
-  "Set horizontal scroll to NCOLS for Kitty doc-view and refresh the page."
+  "Scroll horizontally to NCOLS cells into the page and re-render."
   (let ((new (max 0 (min ncols (kitty-gfx--doc-view-max-hscroll)))))
-    (set-window-hscroll (selected-window) new)
+    (setq kitty-gfx--doc-view-scroll-col new)
     (kitty-gfx--schedule-refresh)
     new))
 
-(defun kitty-gfx--doc-view-set-vscroll (pixels)
-  "Set vertical pixel scroll to PIXELS for Kitty doc-view and refresh the page."
-  (let ((new (max 0 (min pixels (kitty-gfx--doc-view-max-vscroll)))))
-    (set-window-vscroll (selected-window) new t)
+(defun kitty-gfx--doc-view-set-vscroll (nrows)
+  "Scroll vertically to NROWS cells into the page and re-render."
+  (let ((new (max 0 (min nrows (kitty-gfx--doc-view-max-vscroll)))))
+    (setq kitty-gfx--doc-view-scroll-row new)
     (kitty-gfx--schedule-refresh)
     new))
 
 (defun kitty-gfx--doc-view-forward-hscroll (&optional n)
-  "Scroll the current Kitty doc-view page left by N columns."
-  (kitty-gfx--doc-view-set-hscroll (+ (window-hscroll) (or n 1))))
+  "Scroll the page rightward by N cells."
+  (kitty-gfx--doc-view-set-hscroll (+ kitty-gfx--doc-view-scroll-col (or n 1))))
 
 (defun kitty-gfx--doc-view-next-line (&optional n)
-  "Scroll the current Kitty doc-view page upward by N terminal rows."
-  (kitty-gfx--doc-view-set-vscroll
-   (+ (window-vscroll nil t) (* (or n 1) (frame-char-height)))))
+  "Scroll the page downward by N cell rows."
+  (kitty-gfx--doc-view-set-vscroll (+ kitty-gfx--doc-view-scroll-row (or n 1))))
 
 (defun kitty-gfx--doc-view-scroll-left (&optional n)
-  "Scroll the current Kitty doc-view page leftward by N columns."
+  "Scroll the page leftward by about a screenful of columns."
   (kitty-gfx--doc-view-forward-hscroll
    (cond
-    ((null n) (max 0 (- (window-body-width) 2)))
-    ((eq n '-) (min 0 (- 2 (window-body-width))))
+    ((null n) (max 1 (- (car (kitty-gfx--doc-view-win-dims)) 2)))
+    ((eq n '-) (min -1 (- 2 (car (kitty-gfx--doc-view-win-dims)))))
     (t (prefix-numeric-value n)))))
 
 (defun kitty-gfx--doc-view-scroll-up (&optional n)
-  "Scroll the current Kitty doc-view page upward by N rows."
+  "Scroll the page upward by about a screenful of rows."
   (kitty-gfx--doc-view-next-line
    (cond
-    ((null n) (max 0 (- (window-body-height) next-screen-context-lines)))
-    ((eq n '-) (min 0 (- next-screen-context-lines (window-body-height))))
+    ((null n) (max 1 (- (cdr (kitty-gfx--doc-view-win-dims)) next-screen-context-lines)))
+    ((eq n '-) (min -1 (- next-screen-context-lines (cdr (kitty-gfx--doc-view-win-dims)))))
     (t (prefix-numeric-value n)))))
 
 (defun kitty-gfx--doc-view-image-forward-hscroll-advice (orig-fn &optional n)
@@ -5343,6 +5370,67 @@ Stored so zoom commands can re-render without querying `doc-view-current-image'.
         (kitty-gfx--doc-view-set-vscroll (kitty-gfx--doc-view-max-vscroll)))
     (funcall orig-fn)))
 
+(defun kitty-gfx--doc-view-refresh-overlay (ov win)
+  "Render doc-view page OV in WIN at the current zoom and scroll.
+The page is centered when it fits the window width; when zoomed past
+the window it is clipped to the visible region (Kitty source crop) and
+panned via `kitty-gfx--doc-view-scroll-col'/`-row'.  Placeholder mode
+\(tmux) falls back to a plain clamped placement that Emacs clips."
+  (let ((id (overlay-get ov 'kitty-gfx-id))
+        (pos (kitty-gfx--overlay-screen-pos ov win))
+        (kitty (eq kitty-gfx--active-backend 'kitty)))
+    (if (not (and pos kitty-gfx--doc-view-fit))
+        ;; Off-screen — drop this window's placement (per-window, so other
+        ;; windows showing the same page keep theirs).
+        (let ((placement (kitty-gfx--image-placement ov win)))
+          (when placement
+            (kitty-gfx--delete-image-placement ov placement)
+            (kitty-gfx--forget-image-placement ov win)
+            (overlay-put ov 'kitty-gfx-last-row nil)))
+      (let* ((dims (kitty-gfx--doc-view-win-dims win))
+             (winw (car dims)) (winh (cdr dims))
+             ;; Zoom/crop/pan is Kitty-only (needs source cropping).  Other
+             ;; backends (Sixel) render at the fit size so the page stays
+             ;; stable and artifact-free; their scale/scroll are ignored.
+             (total (if kitty (kitty-gfx--doc-view-total-size) kitty-gfx--doc-view-fit))
+             (tc (car total)) (tr (cdr total))
+             (scol (if kitty (min kitty-gfx--doc-view-scroll-col (max 0 (- tc winw))) 0))
+             (srow (if kitty (min kitty-gfx--doc-view-scroll-row (max 0 (- tr winh))) 0))
+             (vc (max 1 (min winw (- tc scol))))
+             (vr (max 1 (min winh (- tr srow))))
+             (hpad (if (< tc winw) (/ (- winw tc) 2) 0))
+             (term-row (car pos))
+             (term-col (+ (cdr pos) hpad)))
+        (if kitty
+            ;; Per-window placement id so the same page in two windows gets
+            ;; two distinct on-screen copies (mirrors the image path).
+            (let* ((src kitty-gfx--doc-view-src)
+                   (pw (car src)) (ph (cdr src))
+                   (spx (/ (float pw) tc)) (spy (/ (float ph) tr))
+                   (x (round (* scol spx))) (y (round (* srow spy)))
+                   (w (max 1 (min (- pw x) (round (* vc spx)))))
+                   (h (max 1 (min (- ph y) (round (* vr spy)))))
+                   (pid (kitty-gfx--record-image-placement ov win term-row term-col vc vr nil)))
+              (if (eq (kitty-gfx--effective-placement-mode) 'direct)
+                  (kitty-gfx--place-image id pid vc vr term-row term-col x y w h)
+                (kitty-gfx--kitty-place ov id pid vc vr term-row term-col)))
+          ;; Sixel (or other): erase the previous area first when it moved or
+          ;; resized, since the stateless backend would otherwise leave old
+          ;; pixels behind; then re-encode the page at the fit cell size.
+          (let ((prev (kitty-gfx--image-placement ov win)))
+            (when (and prev
+                       (let ((d (cdr prev)))
+                         (not (and (eql (plist-get d :row) term-row)
+                                   (eql (plist-get d :col) term-col)
+                                   (eql (plist-get d :cols) vc)
+                                   (eql (plist-get d :rows) vr)))))
+              (kitty-gfx--delete-image-placement ov prev)
+              (kitty-gfx--forget-image-placement ov win)))
+          (let ((pid (kitty-gfx--record-image-placement ov win term-row term-col vc vr nil)))
+            (funcall (kitty-gfx--backend-fn 'place) ov id pid vc vr term-row term-col)))
+        (overlay-put ov 'kitty-gfx-last-row term-row)
+        (overlay-put ov 'kitty-gfx-last-col term-col)))))
+
 (defun kitty-gfx--doc-view-insert-image-advice (orig-fn file &rest args)
   "Around advice for `doc-view-insert-image'.
 Displays the page image via Kitty graphics instead of an Emacs
@@ -5352,46 +5440,66 @@ image spec.  FILE is the path to the page PNG."
         (kitty-gfx--log "doc-view-insert: file=%s scale=%.2f" file kitty-gfx--doc-view-scale)
         ;; Remember current file for zoom commands
         (setq kitty-gfx--doc-view-current-file file)
-        ;; Save old PID and remove overlay without terminal-side delete
-        ;; so the new placement atomically replaces it (WezTerm #5892).
-        ;; Also snapshot per-window placements for transplant onto the
-        ;; new overlay below (see image-mode-render rationale, issue #13).
-        (let ((old-pid (when kitty-gfx--doc-view-overlay
-                         (overlay-get kitty-gfx--doc-view-overlay 'kitty-gfx-pid)))
-              (old-placements (when kitty-gfx--doc-view-overlay
-                                (copy-sequence
-                                 (overlay-get kitty-gfx--doc-view-overlay
-                                              'kitty-gfx-placements)))))
-          (when kitty-gfx--doc-view-overlay
-            (kitty-gfx--remove-overlay kitty-gfx--doc-view-overlay old-pid)
+        ;; Drop doc-view's own "Welcome to DocView!" conversion-progress text
+        ;; (left on doc-view's overlay by `doc-view-buffer-message'); our
+        ;; overlay is separate, so it would otherwise show through behind the page.
+        (when (fboundp 'doc-view-current-overlay)
+          (let ((dv-ov (ignore-errors (doc-view-current-overlay))))
+            (when (overlayp dv-ov)
+              (overlay-put dv-ov 'display nil))))
+        ;; Retire the previous page overlay.  Re-rendering the SAME page (same
+        ;; image id, e.g. doc-view's double insert): keep the placement so the
+        ;; new one atomically replaces it (no flash, WezTerm #5892), and
+        ;; transplant its per-window placement so the same pid is reused.  A
+        ;; DIFFERENT page (new image id): Kitty placement ids are scoped per
+        ;; image id, so a new page at the same pid would NOT replace the old
+        ;; one and it would ghost — really delete the old placement (a=d).
+        (let* ((abs-file (expand-file-name file))
+               (cached-id (kitty-gfx--cache-get abs-file))
+               (old-ov kitty-gfx--doc-view-overlay)
+               (old-id (and old-ov (overlay-get old-ov 'kitty-gfx-id)))
+               (same-page (and old-id cached-id (eql old-id cached-id)))
+               (old-pid (and old-ov (overlay-get old-ov 'kitty-gfx-pid)))
+               (old-placements (and same-page old-ov
+                                    (copy-sequence
+                                     (overlay-get old-ov 'kitty-gfx-placements)))))
+          (when old-ov
+            (kitty-gfx--remove-overlay old-ov (and same-page old-pid))
             (setq kitty-gfx--doc-view-overlay nil))
           ;; Display the rendered page using only an overlay.  Do not erase
           ;; or insert text here: doc-view buffers visit the original PDF, so
           ;; mutating buffer text can corrupt the document if it is saved.
-          (let* ((win-w (- (window-body-width) 1))
-                 (win-h (- (window-body-height) 1))
-                 (abs-file (expand-file-name file))
+          (let* ((dims (kitty-gfx--doc-view-win-dims))
+                 (win-w (car dims))
+                 (win-h (cdr dims))
                  (px (kitty-gfx--image-pixel-size abs-file))
                  (base-dims (if px
                                 (kitty-gfx--compute-cell-dims
                                  (car px) (cdr px) win-w win-h)
                               (cons (min 40 win-w) (min 15 win-h))))
-                 (img-cols (max 1 (round (* kitty-gfx--doc-view-scale
-                                             (car base-dims)))))
-                 (img-rows (max 1 (round (* kitty-gfx--doc-view-scale
-                                             (cdr base-dims)))))
-                 (cached-id (kitty-gfx--cache-get abs-file))
                  (image-id (or cached-id (kitty-gfx--alloc-id))))
-            (set-window-hscroll (selected-window) 0)
-            (set-window-vscroll (selected-window) 0 t)
+            ;; Record the scale-1.0 fit size and source pixels; clamp any
+            ;; carried-over scroll to the new page's limits.  The page is
+            ;; drawn by `kitty-gfx--doc-view-refresh-overlay', which centers
+            ;; and crops it; the overlay only reserves the whole window.
+            (setq kitty-gfx--doc-view-fit base-dims
+                  kitty-gfx--doc-view-src
+                  (or px (cons (* win-w (or kitty-gfx--cell-pixel-width 8))
+                               (* win-h (or kitty-gfx--cell-pixel-height 16))))
+                  kitty-gfx--doc-view-scroll-col
+                  (min kitty-gfx--doc-view-scroll-col (kitty-gfx--doc-view-max-hscroll))
+                  kitty-gfx--doc-view-scroll-row
+                  (min kitty-gfx--doc-view-scroll-row (kitty-gfx--doc-view-max-vscroll)))
             (unless cached-id
               (when (funcall (kitty-gfx--backend-fn 'prepare) abs-file image-id)
                 (kitty-gfx--cache-put abs-file image-id)))
             (when (or cached-id (gethash abs-file kitty-gfx--image-cache))
               (setq kitty-gfx--doc-view-overlay
                     (kitty-gfx--make-overlay (point-min) (point-max)
-                                             image-id img-cols img-rows
-                                             abs-file old-pid))
+                                             image-id win-w win-h
+                                             abs-file (and same-page old-pid)))
+              (when kitty-gfx--doc-view-overlay
+                (overlay-put kitty-gfx--doc-view-overlay 'kitty-gfx-doc-view t))
               (when (and old-placements kitty-gfx--doc-view-overlay)
                 (overlay-put kitty-gfx--doc-view-overlay
                              'kitty-gfx-placements old-placements))
@@ -5401,23 +5509,23 @@ image spec.  FILE is the path to the page PNG."
 
 (defun kitty-gfx--doc-view-enlarge-advice (orig-fn factor)
   "Around advice for `doc-view-enlarge'.
-Updates `kitty-gfx--doc-view-scale' and re-renders the page."
+Updates `kitty-gfx--doc-view-scale' and re-renders the page in place.
+The stored page image is reused; only the crop/scale changes."
   (if (and kitty-graphics-mode (not (display-graphic-p)))
-      (when kitty-gfx--doc-view-current-file
-        (setq kitty-gfx--doc-view-scale
-              (* kitty-gfx--doc-view-scale factor))
-        (kitty-gfx--doc-view-insert-image-advice
-         nil kitty-gfx--doc-view-current-file))
+      (when kitty-gfx--doc-view-overlay
+        (setq kitty-gfx--doc-view-scale (* kitty-gfx--doc-view-scale factor))
+        (kitty-gfx--schedule-refresh))
     (funcall orig-fn factor)))
 
 (defun kitty-gfx--doc-view-scale-reset-advice (orig-fn &rest args)
   "Around advice for `doc-view-scale-reset'.
-Resets `kitty-gfx--doc-view-scale' to 1.0 and re-renders the page."
+Resets scale to 1.0, recenters, and re-renders the page in place."
   (if (and kitty-graphics-mode (not (display-graphic-p)))
-      (when kitty-gfx--doc-view-current-file
-        (setq kitty-gfx--doc-view-scale 1.0)
-        (kitty-gfx--doc-view-insert-image-advice
-         nil kitty-gfx--doc-view-current-file))
+      (when kitty-gfx--doc-view-overlay
+        (setq kitty-gfx--doc-view-scale 1.0
+              kitty-gfx--doc-view-scroll-col 0
+              kitty-gfx--doc-view-scroll-row 0)
+        (kitty-gfx--schedule-refresh))
     (apply orig-fn args)))
 
 ;;;; Dired integration
