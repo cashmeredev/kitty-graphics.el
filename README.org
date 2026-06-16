@@ -25,6 +25,12 @@ Heading rendering was massively reworked and is now stable for reading and navig
 
 With ~kitty-gfx-shr-scale~ set to ~fit~ (or a float fraction), inline images in eww/elfeed/mu4e/gnus are scaled into a window-relative box instead of dominating the buffer at full natural size.
 
+*PDF and document viewing (doc-view):*
+
+[[file:assets/doc-view.gif]]
+
+PDFs, DVI, PostScript, and EPUB render inline through doc-view, page-centered, with =n=/=p= to flip pages and =+=/=-=/=0= to zoom. On the Kitty backend a zoomed page is clipped to the window and panned by scrolling; on Sixel the page renders at fit size. With MuPDF's ~mutool~ on ~PATH~ doc-view uses it automatically; Ghostscript also works.
+
 *Sixel backend (foot):*
 
 [[file:assets/foot.gif]]
