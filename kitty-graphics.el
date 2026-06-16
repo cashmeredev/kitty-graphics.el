@@ -1301,9 +1301,11 @@ env otherwise."
 Reads env vars via `kitty-gfx--frame-getenv' so emacs --daemon
 clients see the attached terminal's environment.
 
-Inside tmux `TERM_PROGRAM' is masked to \"tmux\", so we also accept
-terminal-specific env markers (e.g. `GHOSTTY_RESOURCES_DIR') as
-evidence that the outer terminal speaks the Kitty protocol.
+Inside tmux `TERM_PROGRAM' is masked to \"tmux\", and over `kitten ssh'
+KITTY_PID is unset on the remote (it is the *local* kitty's pid), so we
+also accept terminal-specific env markers — KITTY_WINDOW_ID /
+KITTY_PUBLIC_KEY for kitty, `GHOSTTY_RESOURCES_DIR' for Ghostty, etc. —
+as evidence that the outer terminal speaks the Kitty protocol.
 
 When inside tmux with `allow-passthrough' off, the Kitty APC escapes
 would be swallowed by tmux, so the backend reports unsupported (with
@@ -1311,12 +1313,19 @@ a one-time message naming the fix) and detection falls through to
 Sixel when available."
   (let* ((frame (selected-frame))
          (kitty-pid (kitty-gfx--frame-getenv "KITTY_PID" frame))
+         ;; KITTY_WINDOW_ID / KITTY_PUBLIC_KEY are exported by kitty's shell
+         ;; integration and survive both `kitten ssh' (where KITTY_PID is
+         ;; absent) and tmux (where TERM_PROGRAM is masked to "tmux").
+         (kitty-window-id (kitty-gfx--frame-getenv "KITTY_WINDOW_ID" frame))
+         (kitty-public-key (kitty-gfx--frame-getenv "KITTY_PUBLIC_KEY" frame))
          (term-prog (kitty-gfx--frame-getenv "TERM_PROGRAM" frame))
          (ghostty (or (kitty-gfx--frame-getenv "GHOSTTY_RESOURCES_DIR" frame)
                       (kitty-gfx--frame-getenv "GHOSTTY_BIN_DIR" frame)))
          (wezterm (kitty-gfx--frame-getenv "WEZTERM_EXECUTABLE" frame))
          (in-tmux (kitty-gfx--frame-getenv "TMUX" frame))
          (supported (or kitty-pid
+                        kitty-window-id
+                        kitty-public-key
                         ghostty
                         wezterm
                         (member term-prog '("kitty" "WezTerm" "ghostty")))))
@@ -1326,8 +1335,8 @@ Sixel when available."
        "tmux-passthrough-off"
        "kitty-gfx: tmux blocks Kitty graphics (allow-passthrough is off); run: tmux set -g allow-passthrough on, then toggle kitty-graphics-mode to re-detect")
       (setq supported nil))
-    (kitty-gfx--log "kitty-detect: %s (KITTY_PID=%s TERM_PROGRAM=%s GHOSTTY=%s WEZTERM=%s)"
-                     supported kitty-pid term-prog
+    (kitty-gfx--log "kitty-detect: %s (KITTY_PID=%s KITTY_WINDOW_ID=%s TERM_PROGRAM=%s GHOSTTY=%s WEZTERM=%s)"
+                     supported kitty-pid kitty-window-id term-prog
                      (if ghostty "set" "no") (if wezterm "set" "no"))
     supported))
 
