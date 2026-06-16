@@ -89,6 +89,13 @@ test-markdown:
         --eval "(when (bound-and-true-p kitty-graphics-mode) (kitty-graphics-mode -1))" --eval "(kitty-graphics-mode 1)" \
         tests/test-markdown.md
 
+# Test shr image scaling in eww (kitty-gfx-shr-scale 'fit); pass a different url=...
+test-shr url="https://en.wikipedia.org/wiki/Cat":
+    TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
+        --eval "(setq kitty-gfx-shr-scale 'fit)" \
+        --eval "(when (bound-and-true-p kitty-graphics-mode) (kitty-graphics-mode -1))" --eval "(kitty-graphics-mode 1)" \
+        --eval "(eww \"{{url}}\")"
+
 # Test LaTeX fragment preview in org-mode (C-c C-x C-l on a fragment)
 test-latex:
     TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
