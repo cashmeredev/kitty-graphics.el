@@ -1,5 +1,13 @@
 * Changelog
 
+** kitty-graphics 1.0.2
+
+GIF previews work again.  Converting an animated GIF whole made ImageMagick write one PNG per frame, so the single target file never appeared and the preview looked like a conversion failure; the conversion now selects the first frame (=file[0]=, also for WebP) and produces the one still it expects.
+
+Opening a GIF now animates it through mpv.  New ~kitty-gfx-play-gifs-with-mpv~ (default ~t~) routes an opened GIF to mpv playback while dired/dirvish browsing still shows the static first-frame thumbnail; set it to nil to keep GIFs as stills everywhere.
+
+The video preview/playback buffer can be closed with =q= after the video ends.  The =q= binding lived only on the mpv overlay, which is deleted when playback stops, so under evil the normal-state =q= (record macro) shadowed it and the buffer could not be quit; =q= is now bound buffer-locally (and in evil normal state) the same way the image-mode buffer already did it.
+
 ** kitty-graphics 1.0.1
 
 Sixel images no longer vanish a moment after they appear. On the Kitty backend an image is a persistent placement that survives redisplay, so the refresh loop skips it when its position is unchanged; Sixel pixels live in the text grid and any redisplay of those cells wipes them, and the unchanged-position skip meant nothing ever repainted. The refresh now re-emits Sixel images at an unchanged position instead of skipping them, so dired/dirvish previews and =image-mode= stay on screen in foot, Konsole, and other Sixel terminals.

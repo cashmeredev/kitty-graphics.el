@@ -3,7 +3,7 @@
 ;; Copyright (C) 2025-2026
 ;;
 ;; Author: cashmere
-;; Version: 1.0.1
+;; Version: 1.0.2
 ;; URL: https://github.com/cashmeredev/kitty-graphics.el
 ;; Keywords: terminals, images, multimedia
 ;; Package-Requires: ((emacs "27.1"))
@@ -231,6 +231,15 @@ Helium, Brave, …) instead of downloading Chrome Headless Shell."
   "File extensions handled by inline mpv preview in dired / dirvish.
 Compared lowercase against `file-name-extension'."
   :type '(repeat string)
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-play-gifs-with-mpv t
+  "When non-nil, opening a GIF plays it animated through mpv.
+GIF still previews as a static first-frame thumbnail while browsing
+dired / dirvish (it stays an image for `kitty-gfx--image-file-p'); this
+only affects what happens when the file is opened for playback, where
+mpv loops the animation.  Has no effect when mpv is unavailable."
+  :type 'boolean
   :group 'kitty-graphics)
 
 (defcustom kitty-gfx-video-thumbnail-seek "0.5"
@@ -3801,6 +3810,18 @@ the source file itself are skipped — that is user data, not ours."
   (or (executable-find "magick")
       (executable-find "convert")))
 
+(defun kitty-gfx--magick-input (file)
+  "Return the ImageMagick input spec for converting FILE to a still PNG.
+Animated containers (GIF, WebP) explode into one PNG per frame when
+converted whole, so the target file never appears and the conversion
+looks like a failure.  Select the first frame with a [0] read modifier;
+the inline preview only ever shows a still anyway."
+  (let ((ext (and (file-name-extension file)
+                  (downcase (file-name-extension file)))))
+    (if (member ext '("gif" "webp"))
+        (concat file "[0]")
+      file)))
+
 (defun kitty-gfx--warn-no-imagemagick (file)
   "Tell the user once that FILE needs ImageMagick that is not installed.
 Both the synchronous and background conversion paths call this so a
@@ -3832,7 +3853,8 @@ unavailable or conversion fails — callers must handle nil gracefully."
             (let ((out (make-temp-file "kitty-gfx-" nil ".png")))
               (kitty-gfx--log "convert-to-png: %s -> %s via %s" file out convert)
               (let ((status
-                     (kitty-gfx--run-process convert (list file out)
+                     (kitty-gfx--run-process convert
+                                             (list (kitty-gfx--magick-input file) out)
                                              kitty-gfx-process-timeout nil)))
                 (kitty-gfx--log "convert-to-png: status=%s" status)
                 (if (and (file-exists-p out)
@@ -3873,7 +3895,7 @@ when it finishes."
             (setq proc
              (make-process
              :name "kitty-gfx-convert"
-             :command (list convert file out)
+             :command (list convert (kitty-gfx--magick-input file) out)
              :noquery t
              :sentinel
              (lambda (proc _event)
@@ -4808,6 +4830,17 @@ whether playback is actually wired up."
   (let ((ext (file-name-extension file)))
     (and ext (member (downcase ext) kitty-gfx-video-file-extensions))))
 
+(defun kitty-gfx--mpv-playable-extension-p (file)
+  "Return non-nil if opening FILE should hand it to mpv for playback.
+True for video extensions, and for GIF when `kitty-gfx-play-gifs-with-mpv'
+is enabled so an opened GIF animates instead of showing a still.  Used
+by the open/play routes only; the preview dispatch keeps GIF on the
+still-thumbnail image path."
+  (let ((ext (and (file-name-extension file)
+                  (downcase (file-name-extension file)))))
+    (or (and ext (member ext kitty-gfx-video-file-extensions))
+        (and kitty-gfx-play-gifs-with-mpv (equal ext "gif")))))
+
 (defun kitty-gfx--video-file-p (file)
   "Return non-nil if FILE is a video that the mpv preview can handle.
 Requires `kitty-gfx-enable-video' to be enabled, mpv on PATH, and
@@ -5734,6 +5767,19 @@ window alive and let `kill-buffer' surface the previous buffer."
     (when (and (window-live-p win) (not (one-window-p t)))
       (delete-window win))))
 
+(defun kitty-gfx--install-preview-quit-key ()
+  "Bind `q' to close the current preview/playback buffer.
+Sets a buffer-local map and, under evil, the normal-state key too.
+The mpv overlay carries its own `q' while a video plays, but that
+overlay is deleted when the video ends; without a buffer-local binding
+evil's normal-state `q' (record macro) then shadows the close key and
+the buffer cannot be quit.  Mirrors the image-mode setup."
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "q") #'kitty-gfx--preview-quit)
+    (use-local-map map))
+  (when (fboundp 'evil-local-set-key)
+    (evil-local-set-key 'normal (kbd "q") #'kitty-gfx--preview-quit)))
+
 (defun kitty-gfx--make-preview-buffer (file)
   "Create the preview side-window buffer for FILE.
 Returns (BUF . WIN).  Sets up the standard `q'-to-close keymap
@@ -5747,9 +5793,7 @@ shared by image and video previews."
         (erase-buffer)
         (insert (format "  %s\n\n" (file-name-nondirectory file))))
       (setq-local buffer-read-only t)
-      (let ((map (make-sparse-keymap)))
-        (define-key map (kbd "q") #'kitty-gfx--preview-quit)
-        (use-local-map map)))
+      (kitty-gfx--install-preview-quit-key))
     (cons buf win)))
 
 (defun kitty-gfx--preview-display (image-path win buf)
@@ -5851,8 +5895,8 @@ heavier shortcut for full playback."
   (unless (derived-mode-p 'dired-mode)
     (user-error "Not in a dired buffer"))
   (let ((file (dired-get-file-for-visit)))
-    (unless (kitty-gfx--video-extension-p file)
-      (user-error "Not a video file"))
+    (unless (kitty-gfx--mpv-playable-extension-p file)
+      (user-error "Not a playable video/GIF file"))
     (when-let* ((reason (kitty-gfx--mpv-unavailable-reason)))
       (user-error "kitty-gfx: cannot play video: %s" reason))
     ;; Single-video invariant: kill any other live playback first.
@@ -5899,7 +5943,7 @@ there would cause dirvish to rebuild its layout (transient
 buffer briefly going full-frame before mpv starts."
   (let ((file (ignore-errors (dired-get-file-for-visit))))
     (cond
-     ((not (and file (kitty-gfx--video-extension-p file)))
+     ((not (and file (kitty-gfx--mpv-playable-extension-p file)))
       (apply orig-fn args))
      ((kitty-gfx--mpv-unavailable-reason)
       (kitty-gfx--warn-mpv-unavailable
@@ -5915,7 +5959,7 @@ buffer briefly going full-frame before mpv starts."
   "Around advice on `dired-find-file-other-window' that routes videos to mpv."
   (let ((file (ignore-errors (dired-get-file-for-visit))))
     (cond
-     ((not (and file (kitty-gfx--video-extension-p file)))
+     ((not (and file (kitty-gfx--mpv-playable-extension-p file)))
       (apply orig-fn args))
      ((kitty-gfx--mpv-unavailable-reason)
       (kitty-gfx--warn-mpv-unavailable
@@ -5940,7 +5984,7 @@ to non-nil to instead keep the layout and play ENTRY inside the
 existing dirvish preview side window."
   (when (and (memq find-fn '(find-file find-alternate-file))
              (stringp entry)
-             (kitty-gfx--video-extension-p entry)
+             (kitty-gfx--mpv-playable-extension-p entry)
              ;; mpv unreachable: warn and yield to dirvish's normal
              ;; find-fn (returns nil from the hook).  We've still
              ;; told the user why we didn't preview.
@@ -5972,9 +6016,7 @@ existing dirvish preview side window."
           (erase-buffer)
           (insert (format "  %s\n\n" basename)))
         (setq-local buffer-read-only t)
-        (let ((map (make-sparse-keymap)))
-          (define-key map (kbd "q") #'kitty-gfx--preview-quit)
-          (use-local-map map)))
+        (kitty-gfx--install-preview-quit-key))
       (cond
        ;; Opt-in: play inside the existing dirvish preview side window.
        ((and kitty-gfx-dirvish-video-inline-preview
