@@ -3,7 +3,7 @@
 ;; Copyright (C) 2025-2026
 ;;
 ;; Author: cashmere
-;; Version: 1.0.0
+;; Version: 1.0.1
 ;; URL: https://github.com/cashmeredev/kitty-graphics.el
 ;; Keywords: terminals, images, multimedia
 ;; Package-Requires: ((emacs "27.1"))
@@ -2006,6 +2006,9 @@ sticks until the file changes on disk or the image is re-displayed."
   (let* ((file (overlay-get ov 'kitty-gfx-file))
          (png (gethash file kitty-gfx--sixel-cache))
          (cache-path (kitty-gfx--sixel-cache-path file cols rows))
+         (dims (cons cols rows))
+         (mem (and (equal (overlay-get ov 'kitty-gfx-sixel-dims) dims)
+                   (overlay-get ov 'kitty-gfx-sixel-data)))
          (sixel-data nil))
     (cond
      ((kitty-gfx--sixel-failure-current-p ov file)
@@ -2013,14 +2016,20 @@ sticks until the file changes on disk or the image is re-displayed."
      ((not png)
       (kitty-gfx--log "sixel-place: no PNG cached for %s" file))
      (t
-      ;; Check if sixel encoding is cached
-      (if (file-exists-p cache-path)
-          (progn
-            (kitty-gfx--log "sixel-place: using cached sixel %s" cache-path)
-            (with-temp-buffer
-              (set-buffer-multibyte nil)
-              (insert-file-contents-literally cache-path)
-              (setq sixel-data (buffer-string))))
+      ;; In-memory hit (re-emit at unchanged size) skips both the disk
+      ;; read and the encoder; the on-screen refresh loop leans on this
+      ;; so a Sixel image survives redisplay without re-encoding.
+      (cond
+       (mem
+        (kitty-gfx--log "sixel-place: reusing in-memory sixel for %s" file)
+        (setq sixel-data mem))
+       ((file-exists-p cache-path)
+        (kitty-gfx--log "sixel-place: using cached sixel %s" cache-path)
+        (with-temp-buffer
+          (set-buffer-multibyte nil)
+          (insert-file-contents-literally cache-path)
+          (setq sixel-data (buffer-string))))
+       (t
         ;; Encode on-demand
         (kitty-gfx--log "sixel-place: encoding %s at %dx%d" png cols rows)
         (setq sixel-data (kitty-gfx--sixel-encode png cols rows))
@@ -2040,9 +2049,11 @@ sticks until the file changes on disk or the image is re-displayed."
                               kitty-gfx-cache-size)
               (ignore-errors (delete-file victim))
               (setq kitty-gfx--sixel-temp-files
-                    (butlast kitty-gfx--sixel-temp-files))))))
+                    (butlast kitty-gfx--sixel-temp-files)))))))
       ;; Emit Sixel sequence if we have data
       (when sixel-data
+        (overlay-put ov 'kitty-gfx-sixel-data sixel-data)
+        (overlay-put ov 'kitty-gfx-sixel-dims dims)
         (let* ((cw (or kitty-gfx--cell-pixel-width 8))
                (ch (or kitty-gfx--cell-pixel-height 16)))
           (kitty-gfx--log "sixel-place: emitting at row=%d col=%d data-len=%d pixel-target=%dx%d"
@@ -3165,8 +3176,32 @@ refresh based on overlay type."
             (cond
              ((and (eql new-row last-row)
                    (eql new-col last-col))
-              (kitty-gfx--log "refresh-ov: pid=%d unchanged at row=%d col=%d"
-                              pid new-row new-col))
+              ;; Kitty keeps the image as a persistent placement, so an
+              ;; unchanged position is a no-op.  Sixel pixels live in the
+              ;; text grid and any redisplay of those cells (blank-display
+              ;; repaint, neighbouring edit) wipes them, leaving the image
+              ;; gone since no later refresh re-emits at the same spot.  So
+              ;; on Sixel re-emit from the cached encoding (cheap: no
+              ;; re-encode, inside the refresh sync block, image-id/pid
+              ;; ignored by `kitty-gfx--sixel-place').
+              (cond
+               ((not (eq kitty-gfx--active-backend 'sixel))
+                (kitty-gfx--log "refresh-ov: pid=%d unchanged at row=%d col=%d"
+                                pid new-row new-col))
+               ;; Re-emit only once the encoding is in hand; while the
+               ;; first encode is still running a re-emit would kick off
+               ;; a redundant second encode of the same image (the disk
+               ;; cache isn't written yet), so skip until it lands.
+               ((and (equal (overlay-get ov 'kitty-gfx-sixel-dims)
+                            (cons cols rows))
+                     (overlay-get ov 'kitty-gfx-sixel-data))
+                (kitty-gfx--log "refresh-ov: pid=%d sixel re-emit at row=%d col=%d"
+                                pid new-row new-col)
+                (funcall (kitty-gfx--backend-fn 'place)
+                         ov id pid cols rows new-row new-col))
+               (t
+                (kitty-gfx--log "refresh-ov: pid=%d sixel re-emit deferred (no cached encoding)"
+                                pid))))
              ((not (kitty-gfx--ensure-transmitted
                     (overlay-get ov 'kitty-gfx-file) id))
               (kitty-gfx--log "refresh-ov: pid=%d deferred (transmit queued or converting)"

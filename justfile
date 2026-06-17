@@ -71,11 +71,15 @@ test-headings file="tests/test-kitty-gfx.org":
         --eval "(when (bound-and-true-p kitty-graphics-mode) (kitty-graphics-mode -1))" --eval "(kitty-graphics-mode 1)" \
         {{file}}
 
-# Test image-mode rendering
+# Test image-mode rendering (starts a fresh /tmp/kitty-gfx.log for this run)
 test-image:
+    rm -f /tmp/kitty-gfx.log
+    @echo ">> fresh debug log: /tmp/kitty-gfx.log"
     TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
+        --eval "(setq kitty-gfx-debug t)" \
         --eval "(when (bound-and-true-p kitty-graphics-mode) (kitty-graphics-mode -1))" --eval "(kitty-graphics-mode 1)" \
         tests/test-image.png
+    @echo ">> debug log written to /tmp/kitty-gfx.log"
 
 # Test doc-view / PDF rendering
 test-pdf:

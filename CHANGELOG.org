@@ -1,5 +1,11 @@
 * Changelog
 
+** kitty-graphics 1.0.1
+
+Sixel images no longer vanish a moment after they appear. On the Kitty backend an image is a persistent placement that survives redisplay, so the refresh loop skips it when its position is unchanged; Sixel pixels live in the text grid and any redisplay of those cells wipes them, and the unchanged-position skip meant nothing ever repainted. The refresh now re-emits Sixel images at an unchanged position instead of skipping them, so dired/dirvish previews and =image-mode= stay on screen in foot, Konsole, and other Sixel terminals.
+
+The re-emit reuses the encoding instead of running the encoder again. Each overlay caches its encoded Sixel data in memory keyed on cell size, and a re-emit is deferred while the first encode is still in flight (the disk cache isn't written yet), so a large preview is encoded once rather than two or three times as redisplay timers fire during the blocking encode.
+
 ** kitty-graphics 1.0.0
 
 The stable 1.0. Everything since =0.6.0= settles here: a redisplay engine that does nothing when nothing changed, background image conversion, multi-terminal daemon rendering, a reworked document viewer with zoom and pan, a diagnostic command, a timeout watchdog over every external process, and a long bug-sweep over the process, overlay, and protocol lifecycles.
