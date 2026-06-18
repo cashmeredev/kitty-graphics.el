@@ -1,5 +1,9 @@
 * Changelog
 
+** kitty-graphics 1.0.3
+
+Images show up again under kitty -> tmux -> emacs.  With =allow-passthrough= off the Kitty protocol can't traverse tmux, so detection fell back to Sixel, but kitty and ghostty have no Sixel support and tmux only drew its own =SIXEL IMAGE= placeholder.  Detection no longer falls back to Sixel when the outer terminal is kitty/ghostty and keeps pointing at =tmux set -g allow-passthrough on= instead; =kitty-gfx-doctor= stops reporting a misleading =sixel-ok yes= for this case.
+
 ** kitty-graphics 1.0.2
 
 GIF previews work again.  Converting an animated GIF whole made ImageMagick write one PNG per frame, so the single target file never appeared and the preview looked like a conversion failure; the conversion now selects the first frame (=file[0]=, also for WebP) and produces the one still it expects.
