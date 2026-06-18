@@ -1687,11 +1687,29 @@ emacs --daemon clients; FRAME defaults to the selected frame."
               (or (> (car ver) 3)
                   (and (= (car ver) 3) (>= (cadr ver) 4)))))))
 
+(defun kitty-gfx--outer-terminal-no-sixel-p (&optional frame)
+  "Return non-nil when the terminal hosting tmux cannot render Sixel.
+Kitty and Ghostty speak the Kitty graphics protocol but have no Sixel
+support, so a Sixel emitted inside tmux is stored and then drawn by tmux
+as its own \"SIXEL IMAGE\" placeholder instead of an image.  Detected via
+the same env markers as `kitty-gfx--kitty-detect' (KITTY_*, GHOSTTY_*),
+which survive the tmux TERM_PROGRAM masking."
+  (let ((frame (or frame (selected-frame))))
+    (or (kitty-gfx--frame-getenv "KITTY_PID" frame)
+        (kitty-gfx--frame-getenv "KITTY_WINDOW_ID" frame)
+        (kitty-gfx--frame-getenv "KITTY_PUBLIC_KEY" frame)
+        (kitty-gfx--frame-getenv "GHOSTTY_RESOURCES_DIR" frame)
+        (kitty-gfx--frame-getenv "GHOSTTY_BIN_DIR" frame)
+        (member (kitty-gfx--frame-getenv "TERM_PROGRAM" frame)
+                '("kitty" "ghostty"))
+        nil)))
+
 (defun kitty-gfx--sixel-detect ()
   "Return non-nil if the terminal likely supports Sixel protocol.
 Inside tmux, requires tmux >= 3.4 (native Sixel rendering, 2024-02-13)
-and `kitty-gfx-tmux-allow-sixel'.  Older tmux versions still disable
-Sixel because they drop the DCS payload.
+and `kitty-gfx-tmux-allow-sixel'.  Older tmux versions still drop the
+DCS payload, and a kitty/ghostty outer terminal cannot render Sixel at
+all (tmux would only draw its placeholder), so both disable Sixel.
 
 Reads env vars via `kitty-gfx--frame-getenv' so emacs --daemon
 clients see the attached terminal's environment.  Falls back to the
@@ -1725,6 +1743,12 @@ is typical for daemons launched from a non-tty service unit."
                                                  "contour" "WezTerm"))
                              windows-terminal)
                          t)))
+    (when (and supported in-tmux (kitty-gfx--outer-terminal-no-sixel-p frame))
+      (kitty-gfx--log "sixel-detect: disabled, outer terminal has no Sixel; tmux would only draw its placeholder")
+      (kitty-gfx--message-once
+       "sixel-outer-no-sixel"
+       "kitty-gfx: this terminal has no Sixel support, so tmux only shows a placeholder; run: tmux set -g allow-passthrough on to use the Kitty protocol instead")
+      (setq supported nil))
     (kitty-gfx--log
      "sixel-detect: %s (TERM=%s TERM_PROGRAM=%s TMUX=%s tmux-ver=%s tmux-ok=%s WT=%s)"
      supported term term-prog (if in-tmux "yes" "no")
@@ -4738,7 +4762,11 @@ not appear and you want to see what the package actually detected."
             (princ (format "tmux:            yes (version %s, passthrough %s, sixel-ok %s)\n"
                            (if ver (format "%d.%d" (car ver) (cadr ver)) "unknown")
                            (kitty-gfx--tmux-passthrough-state frame)
-                           (if (kitty-gfx--tmux-sixel-supported-p frame) "yes" "no")))))
+                           (cond
+                            ((kitty-gfx--outer-terminal-no-sixel-p frame)
+                             "no (this terminal has no Sixel)")
+                            ((kitty-gfx--tmux-sixel-supported-p frame) "yes")
+                            (t "no"))))))
         (princ (format "Process timeout: %ss\n"
                        (or kitty-gfx-process-timeout "disabled")))
         (princ (format "Sixel timeout:   %ss\n"
