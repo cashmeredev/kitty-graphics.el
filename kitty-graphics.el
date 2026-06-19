@@ -723,6 +723,19 @@ Maximum scale is 7.0 (limited by protocol)."
                                     (number :tag "Custom (1.0-7.0)")))
   :group 'kitty-graphics)
 
+(defcustom kitty-gfx-heading-valign 2
+  "Vertical alignment of scaled heading text within its multicell block.
+One of 0 (top), 1 (bottom), or 2 (centered).  Emitted as the OSC 66
+`v=' parameter, which Kitty honors only for fractionally-scaled text
+\(scales like 1.5 or 1.2 that render shorter than the rows they
+reserve).  Integer scales such as 2.0 fill their block exactly, so this
+has no effect on them.  Centering removes the gap a fractional heading
+would otherwise leave below itself."
+  :type '(choice (const :tag "Top" 0)
+                 (const :tag "Bottom" 1)
+                 (const :tag "Centered" 2))
+  :group 'kitty-graphics)
+
 (defcustom kitty-gfx-heading-sizes-auto nil
   "When non-nil, automatically apply heading sizes in org buffers.
 Heading sizes are applied when `org-mode' is activated and
@@ -2257,9 +2270,12 @@ OSC-66-payload, SGR-reset, restore-cursor."
          (cols (overlay-get ov 'kitty-gfx-cols))
          (rows (overlay-get ov 'kitty-gfx-rows))
          (sgr (kitty-gfx--heading-sgr level))
-         ;; Build the OSC 66 metadata: s=S, and optionally n=N:d=D
+         ;; Build the OSC 66 metadata: s=S, and optionally n=N:d=D:v=V.
+         ;; v= (vertical alignment) only applies to fractional scaling,
+         ;; so it rides along only on the n/d branch.
          (meta (if (and frac-n frac-d (> frac-d 0))
-                   (format "s=%d:n=%d:d=%d" cell-s frac-n frac-d)
+                   (format "s=%d:n=%d:d=%d:v=%d"
+                           cell-s frac-n frac-d kitty-gfx-heading-valign)
                  (format "s=%d" cell-s))))
     (kitty-gfx--log "place-heading: L%d row=%d col=%d s=%d n=%d d=%d text=%S"
                      level row col cell-s frac-n frac-d text)
@@ -2306,6 +2322,29 @@ blanked body lines after fold/scroll)."
   (let ((text (overlay-get ov 'kitty-gfx-heading-text)))
     (when (and text (not (equal (overlay-get ov 'display) text)))
       (overlay-put ov 'display text))))
+
+(defun kitty-gfx--heading-erase-all ()
+  "Erase every emitted heading multicell block at its cached position.
+Unlike `kitty-gfx--heading-reset', which trusts Emacs to repaint the
+heading line, this writes an explicit ECH erase first.  Used on
+window-layout changes (a popup, which-key, or the minibuffer opening a
+window over the buffer): the new window owns those terminal cells, so
+Emacs never repaints them and the stale glyphs would otherwise bleed
+into the popup.  Clears each block's cached position so the debounced
+refresh re-places the still-visible ones afterwards."
+  (dolist (buf (buffer-list))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (dolist (ov kitty-gfx--overlays)
+          (when (and (overlay-buffer ov)
+                     (overlay-get ov 'kitty-gfx-heading)
+                     (overlay-get ov 'kitty-gfx-heading-emitted))
+            (kitty-gfx--erase-heading-at
+             (overlay-get ov 'kitty-gfx-last-row)
+             (overlay-get ov 'kitty-gfx-last-col)
+             (or (overlay-get ov 'kitty-gfx-cols) 0)
+             (or (overlay-get ov 'kitty-gfx-rows) 1))
+            (kitty-gfx--heading-reset ov)))))))
 
 (defun kitty-gfx--heading-fit-text (text cell-s max-cols)
   "Return the longest prefix of TEXT whose scaled width fits MAX-COLS.
@@ -3592,16 +3631,22 @@ settling to one)."
   ;; direct placement when it is re-placed at a different geometry, and
   ;; Sixel is stateless and must be explicitly overwritten.
   ;;
-  ;; Heading overlays PRESERVE their cache — the refresh cycle needs
-  ;; old→new position comparison to erase multicell blocks properly.
+  ;; Heading multicell blocks are erased at their cached position here
+  ;; too: unlike a scroll (handled by `kitty-gfx--on-window-scroll',
+  ;; which preserves the cache for old→new comparison), a layout change
+  ;; can drop a popup/minibuffer window over the buffer, and Emacs will
+  ;; not repaint the cells the block occupies — so the stale glyphs would
+  ;; bleed into the popup unless we wipe them explicitly.
   (kitty-gfx--sync-begin)
   (unwind-protect
-      (dolist (buf (buffer-list))
-        (with-current-buffer buf
-          (dolist (ov kitty-gfx--overlays)
-            (when (and (overlay-buffer ov)
-                       (not (overlay-get ov 'kitty-gfx-heading)))
-              (kitty-gfx--delete-image-placements ov)))))
+      (progn
+        (kitty-gfx--heading-erase-all)
+        (dolist (buf (buffer-list))
+          (with-current-buffer buf
+            (dolist (ov kitty-gfx--overlays)
+              (when (and (overlay-buffer ov)
+                         (not (overlay-get ov 'kitty-gfx-heading)))
+                (kitty-gfx--delete-image-placements ov))))))
     (kitty-gfx--sync-end))
   ;; Longer debounce: cancel any fast leading-edge cooldown and
   ;; schedule a 0.1s delayed refresh to let window layout settle.

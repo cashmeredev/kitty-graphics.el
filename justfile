@@ -58,18 +58,25 @@ test-typst:
         --eval "(setq kitty-gfx-debug t)" \
         tests/test-typst.typ
 
-# Test org-mode inline images -- C-c C-x C-v after open
+# Test org-mode inline images -- C-c C-x C-v after open (fresh /tmp/kitty-gfx.log)
 test-org:
+    rm -f /tmp/kitty-gfx.log
+    @echo ">> fresh debug log: /tmp/kitty-gfx.log"
     TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
+        --eval "(setq kitty-gfx-debug t)" \
         --eval "(when (bound-and-true-p kitty-graphics-mode) (kitty-graphics-mode -1))" --eval "(kitty-graphics-mode 1)" \
         tests/test-kitty-gfx.org
+    @echo ">> debug log written to /tmp/kitty-gfx.log"
 
-# Test text sizing protocol (OSC 66) on org headings
+# Test text sizing protocol (OSC 66) on org headings (fresh /tmp/kitty-gfx.log)
 test-headings file="tests/test-kitty-gfx.org":
+    rm -f /tmp/kitty-gfx.log
+    @echo ">> fresh debug log: /tmp/kitty-gfx.log"
     TERM={{TERM_}} {{EMACS}} -nw {{QFLAG}} -l {{SRC}} \
-        --eval "(setq kitty-gfx-heading-sizes-auto t)" \
+        --eval "(setq kitty-gfx-debug t kitty-gfx-heading-sizes-auto t)" \
         --eval "(when (bound-and-true-p kitty-graphics-mode) (kitty-graphics-mode -1))" --eval "(kitty-graphics-mode 1)" \
         {{file}}
+    @echo ">> debug log written to /tmp/kitty-gfx.log"
 
 # Test image-mode rendering (starts a fresh /tmp/kitty-gfx.log for this run)
 test-image:
