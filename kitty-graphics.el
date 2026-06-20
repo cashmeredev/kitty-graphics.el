@@ -56,6 +56,7 @@
 
 ;; Forward declarations for optional dependencies
 (declare-function org-element-context "org-element" ())
+(declare-function org-element-link-parser "org-element" ())
 (declare-function org-element-type "org-element" (element))
 (declare-function org-element-property "org-element" (property element))
 (declare-function org-attach-dir "org-attach" (&optional create-if-not-exists-p))
@@ -4945,16 +4946,23 @@ would otherwise make every relative image path fail to resolve."
         (widen)
         (save-excursion
           (goto-char start)
-          ;; Match file:, attachment:, relative (./) and absolute (/) paths
+          ;; Match file:, attachment:, relative (./) and absolute (/) paths.
+          ;; Parse each candidate with `org-element-link-parser' at the
+          ;; link start rather than `org-element-context': the latter
+          ;; consults the org-element cache and, in long-running sessions
+          ;; with caching on, returns the containing paragraph/headline
+          ;; instead of the link object, so every image gets skipped.  The
+          ;; parser reads the link directly at point, independent of cache.
           (while (re-search-forward
                   "\\[\\[\\(file:\\|attachment:\\|[./~]\\)" stop t)
-            (let* ((context (org-element-context))
-                   (type (org-element-type context)))
-              (when (eq type 'link)
-                (let* ((link-beg (org-element-property :begin context))
-                       (link-end (org-element-property :end context))
-                       (path (org-element-property :path context))
-                       (link-type (org-element-property :type context))
+            (goto-char (match-beginning 0))
+            (let ((link (org-element-link-parser)))
+              (if (not link)
+                  (goto-char (match-end 0))
+                (let* ((link-beg (org-element-property :begin link))
+                       (link-end (org-element-property :end link))
+                       (path (org-element-property :path link))
+                       (link-type (org-element-property :type link))
                        (file (cond
                               ((string= link-type "file") path)
                               ((string= link-type "attachment")
@@ -4979,7 +4987,11 @@ would otherwise make every relative image path fail to resolve."
                        (kitty-gfx--log "org-display: ERROR %s: %s"
                                         file (error-message-string err))
                        (message "kitty-gfx: %s: %s"
-                                 file (error-message-string err))))))))))))))
+                                 file (error-message-string err)))))
+                  ;; Continue past this link so the next search does not
+                  ;; re-match inside it.
+                  (goto-char (max (or link-end (match-end 0))
+                                  (1+ (point)))))))))))))
 
 
 (defun kitty-gfx--org-display-advice (orig-fn &rest args)
