@@ -5172,7 +5172,10 @@ image via Kitty graphics instead of an Emacs image spec."
         ;; Don't create duplicate overlays at the same position
         (unless (cl-some (lambda (ov) (overlay-get ov 'kitty-gfx))
                          (overlays-in beg end))
-          (kitty-gfx-display-image movefile beg end)
+          ;; Size like org inline images so a wide display equation fits
+          ;; the window; `fit' never enlarges, so normal text-sized
+          ;; fragments are unchanged (`kitty-gfx-org-image-scale').
+          (kitty-gfx--org-display-image movefile beg end)
           ;; Tag the most recently created overlay with org properties
           ;; so org-clear-latex-preview can find and clean it up.
           (when-let* ((ov (car kitty-gfx--overlays)))
