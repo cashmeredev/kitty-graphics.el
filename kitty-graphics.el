@@ -726,6 +726,16 @@ Maximum scale is 7.0 (limited by protocol)."
                                     (number :tag "Custom (1.0-7.0)")))
   :group 'kitty-graphics)
 
+(defcustom kitty-gfx-heading-min-scale 1.2
+  "Smallest scale worth rendering as a multicell heading.
+Any scale > 1.0 needs at least two terminal rows (a glyph that tall
+cannot fit in one cell), so a barely-larger heading doubles its line
+height for little visual gain.  Configured scales above 1.0 but below
+this threshold are left at normal one-row size.  Set to 1.0 to scale
+every heading whose scale exceeds 1.0."
+  :type 'number
+  :group 'kitty-graphics)
+
 (defcustom kitty-gfx-heading-valign 2
   "Vertical alignment of scaled heading text within its multicell block.
 One of 0 (top), 1 (bottom), or 2 (centered).  Emitted as the OSC 66
@@ -2226,6 +2236,12 @@ Examples:
                         (setq best-n n best-d d best-err err))))
         (list s best-n best-d)))))
 
+(defun kitty-gfx--heading-scaled-p (scale)
+  "Return non-nil when SCALE warrants a multicell heading overlay.
+A scale above 1.0 but below `kitty-gfx-heading-min-scale' is treated as
+not worth the extra terminal row and stays at normal size."
+  (and scale (> scale 1.0) (>= scale kitty-gfx-heading-min-scale)))
+
 (defun kitty-gfx--validate-osc66 (s n d text)
   "Return non-nil if OSC 66 parameters are valid per protocol spec.
 S is cell scale (1-7), N is fractional numerator (0-15),
@@ -2481,6 +2497,13 @@ cycle flushes the spaces to the terminal before emitting OSC 66."
 Tests pure logic functions that don't require a terminal.
 Signals error on failure, prints success message otherwise."
   (interactive)
+  ;; heading-scaled-p: honors the min-scale threshold
+  (let ((kitty-gfx-heading-min-scale 1.2))
+    (cl-assert (not (kitty-gfx--heading-scaled-p 1.0)) nil "1.0 should not scale")
+    (cl-assert (not (kitty-gfx--heading-scaled-p 1.1)) nil "1.1 below min should not scale")
+    (cl-assert (kitty-gfx--heading-scaled-p 1.2) nil "1.2 at min should scale")
+    (cl-assert (kitty-gfx--heading-scaled-p 2.0) nil "2.0 should scale")
+    (cl-assert (not (kitty-gfx--heading-scaled-p nil)) nil "nil should not scale"))
   ;; decompose-scale: identity
   (cl-assert (equal (kitty-gfx--decompose-scale 1.0) '(1 0 0))
              nil "decompose 1.0 failed")
@@ -2839,7 +2862,7 @@ already owns the line)."
                (scale (and level (alist-get level kitty-gfx-heading-scales)))
                (cell-s (overlay-get ov 'kitty-gfx-heading-cell-s))
                (decomposed (and scale (kitty-gfx--decompose-scale scale))))
-          (when (and scale (> scale 1.0)
+          (when (and (kitty-gfx--heading-scaled-p scale)
                      (= cell-s (nth 0 decomposed)))
             (let* ((segments (and kitty-gfx-heading-fontify-keywords
                                   (kitty-gfx--org-heading-segments level)))
@@ -2915,7 +2938,7 @@ a kitty-gfx heading overlay."
                  (scale (alist-get level kitty-gfx-heading-scales))
                  (line-beg (line-beginning-position))
                  (line-end (line-end-position)))
-            (when (and scale (> scale 1.0))
+            (when (kitty-gfx--heading-scaled-p scale)
               ;; Skip if already has a heading overlay
               (unless (cl-some (lambda (ov)
                                  (overlay-get ov 'kitty-gfx-heading))
