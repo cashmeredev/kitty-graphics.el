@@ -4927,11 +4927,20 @@ user knows why their videos have no thumbnails."
 
 (defun kitty-gfx--org-display-inline-images-tty (&optional _include-linked beg end)
   "Display inline images in org buffer via Kitty graphics.
-Scans for file:, attachment:, and relative path links."
+Scans for file:, attachment:, and relative path links.
+
+Relative links are resolved against the buffer file's directory (as
+org itself does for inline images), not `default-directory', which
+packages like Projectile or dired re-bind to the project root and
+would otherwise make every relative image path fail to resolve."
   (when (derived-mode-p 'org-mode)
     (let ((start (or beg (point-min)))
-          (stop (or end (point-max))))
-      (kitty-gfx--log "org-display: scanning region %d..%d in %s" start stop (buffer-name))
+          (stop (or end (point-max)))
+          (default-directory (if buffer-file-name
+                                 (file-name-directory buffer-file-name)
+                               default-directory)))
+      (kitty-gfx--log "org-display: scanning region %d..%d in %s (dir %s)"
+                      start stop (buffer-name) default-directory)
       (save-restriction
         (widen)
         (save-excursion
