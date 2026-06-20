@@ -134,6 +134,34 @@ Only consulted when `kitty-gfx-shr-scale' is `fit'."
   :type 'integer
   :group 'kitty-graphics)
 
+(defcustom kitty-gfx-org-image-scale 'fit
+  "Sizing for org-mode inline images in the terminal.
+nil renders at natural size, shrinking only to fit `kitty-gfx-max-width'
+and `kitty-gfx-max-height'.  A float (e.g. 0.25) renders at that fraction
+of natural size, still capped at the max dimensions.  The symbol `fit'
+scales each image into a box derived from the live window:
+`kitty-gfx-org-image-fit-width' of the window width and
+`kitty-gfx-org-image-fit-height' rows tall, preserving aspect ratio and
+never enlarging images that already fit.  Mirrors `kitty-gfx-shr-scale'
+for the eww/mu4e backends.  Defaults to `fit' so large images do not
+overflow the window."
+  :type '(choice (const :tag "Natural size (shrink to fit max)" nil)
+                 (number :tag "Fraction of natural size")
+                 (const :tag "Dynamic window-relative fit" fit))
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-org-image-fit-width 0.8
+  "Fraction of the window width an org inline image may occupy under `fit'.
+Only consulted when `kitty-gfx-org-image-scale' is `fit'."
+  :type 'number
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-org-image-fit-height 25
+  "Maximum org inline image height in rows under `fit' sizing.
+Only consulted when `kitty-gfx-org-image-scale' is `fit'."
+  :type 'integer
+  :group 'kitty-graphics)
+
 (defcustom kitty-gfx-chunk-size 4096
   "Maximum base64 chunk size for image transfer."
   :type 'integer
@@ -4958,6 +4986,23 @@ user knows why their videos have no thumbnails."
                             status file out)
             (when (and (eql status 0) (file-exists-p out)) out))))))))
 
+(defun kitty-gfx--org-display-image (file start end)
+  "Display org inline image FILE honoring `kitty-gfx-org-image-scale'.
+Mirrors `kitty-gfx--shr-display-image': `fit' scales into a
+window-relative box, a number scales by that factor, nil uses the full
+`kitty-gfx-max-width'/`kitty-gfx-max-height' caps."
+  (pcase kitty-gfx-org-image-scale
+    ('fit
+     (let ((box (kitty-gfx--fit-box (get-buffer-window (current-buffer))
+                                    kitty-gfx-org-image-fit-width
+                                    kitty-gfx-org-image-fit-height)))
+       (kitty-gfx-display-image file start end (car box) (cdr box))))
+    ((and (pred numberp) factor)
+     (let ((kitty-gfx--dim-scale factor))
+       (kitty-gfx-display-image file start end)))
+    (_ (kitty-gfx-display-image file start end
+                                kitty-gfx-max-width kitty-gfx-max-height))))
+
 (defun kitty-gfx--org-display-inline-images-tty (&optional _include-linked beg end)
   "Display inline images in org buffer via Kitty graphics.
 Scans for file:, attachment:, and relative path links.
@@ -5012,9 +5057,8 @@ would otherwise make every relative image path fail to resolve."
                     (kitty-gfx--log "org-display: found link %s at %d..%d"
                                      file link-beg link-end)
                     (condition-case err
-                        (kitty-gfx-display-image
-                         (expand-file-name file) link-beg link-end
-                         kitty-gfx-max-width kitty-gfx-max-height)
+                        (kitty-gfx--org-display-image
+                         (expand-file-name file) link-beg link-end)
                       (error
                        (kitty-gfx--log "org-display: ERROR %s: %s"
                                         file (error-message-string err))
@@ -5419,16 +5463,25 @@ can otherwise remain over newly-created window separators."
 
 ;;;; shr integration (eww, mu4e, gnus)
 
+(defun kitty-gfx--fit-box (win fit-width fit-height)
+  "Return (MAX-COLS . MAX-ROWS) for fitting an image into WIN.
+MAX-COLS is FIT-WIDTH of WIN's body width, MAX-ROWS is FIT-HEIGHT, each
+capped at `kitty-gfx-max-width'/`kitty-gfx-max-height'.  Used by both the
+shr and org `fit' image sizing paths."
+  (let ((win-w (if (window-live-p win)
+                   (window-body-width win)
+                 kitty-gfx-max-width)))
+    (cons (max 1 (min kitty-gfx-max-width (round (* win-w fit-width))))
+          (max 1 (min kitty-gfx-max-height fit-height)))))
+
 (defun kitty-gfx--shr-display-image (file start end)
   "Display FILE for the shr backends, honoring `kitty-gfx-shr-scale'."
   (pcase kitty-gfx-shr-scale
     ('fit
-     (let* ((win (get-buffer-window (current-buffer)))
-            (win-w (if win (window-body-width win) kitty-gfx-max-width))
-            (max-c (max 1 (min kitty-gfx-max-width
-                               (round (* win-w kitty-gfx-shr-fit-width)))))
-            (max-r (max 1 (min kitty-gfx-max-height kitty-gfx-shr-fit-height))))
-       (kitty-gfx-display-image file start end max-c max-r)))
+     (let ((box (kitty-gfx--fit-box (get-buffer-window (current-buffer))
+                                    kitty-gfx-shr-fit-width
+                                    kitty-gfx-shr-fit-height)))
+       (kitty-gfx-display-image file start end (car box) (cdr box))))
     ((and (pred numberp) factor)
      (let ((kitty-gfx--dim-scale factor))
        (kitty-gfx-display-image file start end)))
