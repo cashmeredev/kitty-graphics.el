@@ -5002,8 +5002,11 @@ Scans for file:, attachment:, and relative path links."
 ;; org 10.0+ uses org-link-preview instead of org-toggle-inline-images
 
 (defun kitty-gfx--org-link-preview-advice (orig-fn &optional arg beg end)
-  "Around advice for `org-link-preview' (org 10.0+).
-With prefix ARG \\[universal-argument], clear previews."
+  "Around advice for `org-link-preview' (org 9.7+).
+Mirrors org's own toggle semantics: with no prefix ARG, hide the
+previews when any are already shown in the region (or buffer) and
+otherwise display them.  \\[universal-argument] clears the region;
+\\[universal-argument] \\[universal-argument] \\[universal-argument] clears the whole buffer."
   (if (and kitty-graphics-mode (not (display-graphic-p)))
       (cond
        ;; C-u = clear
@@ -5012,9 +5015,12 @@ With prefix ARG \\[universal-argument], clear previews."
        ;; C-u C-u C-u = clear whole buffer
        ((equal arg '(64))
         (kitty-gfx-remove-images))
-       ;; Otherwise display images
+       ;; No prefix: toggle — remove if anything is shown, else display.
        (t
-        (kitty-gfx--org-display-inline-images-tty nil beg end)))
+        (if (cl-some (lambda (ov) (overlay-get ov 'kitty-gfx))
+                     (overlays-in (or beg (point-min)) (or end (point-max))))
+            (kitty-gfx-remove-images beg end)
+          (kitty-gfx--org-display-inline-images-tty nil beg end))))
     (funcall orig-fn arg beg end)))
 
 (defun kitty-gfx--org-link-preview-region-advice (orig-fn &optional include-linked refresh beg end)
