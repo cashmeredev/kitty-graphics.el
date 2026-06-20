@@ -3553,14 +3553,41 @@ viewport instrumented via `kitty-gfx--heading-scan-visible'."
                              kitty-gfx--force-redisplay t)
                        (kitty-gfx--refresh)))))
 
+(defun kitty-gfx--frame-resized-p (frame)
+  "Return non-nil if FRAME's pixel size changed since the last call.
+Records the new size on the frame so the next call compares against it.
+A pixel-size change means a terminal-level resize (the kitty OS window
+changed, e.g. a new split or `toggle_layout'), as opposed to a purely
+internal Emacs window reconfiguration that leaves the frame untouched."
+  (let ((size (cons (frame-pixel-width frame) (frame-pixel-height frame)))
+        (prev (frame-parameter frame 'kitty-gfx-pixel-size)))
+    (set-frame-parameter frame 'kitty-gfx-pixel-size size)
+    (not (equal size prev))))
+
+(defun kitty-gfx--forget-terminal-transmits (term)
+  "Drop TERM's record of which images it holds so they re-transmit.
+Kitty evicts a window's image data when its layout changes (a new
+split, or `toggle_layout stack'), but Emacs's per-terminal transmitted
+set still lists those ids, so the refresh only re-places them — against
+bytes the terminal no longer has, leaving the image blank and
+unrecoverable even via `org-toggle-inline-images' (issue #36).  Clearing
+the set makes `kitty-gfx--ensure-transmitted' re-send the bytes before
+the next placement."
+  (let ((h (terminal-parameter term 'kitty-gfx-transmitted)))
+    (when h
+      (kitty-gfx--log "forget-terminal-transmits: dropping %d ids after resize"
+                      (hash-table-count h))
+      (clrhash h))))
+
 (defun kitty-gfx--on-window-change (frame)
   "Handle window configuration change for image refresh.
 Invalidates cell pixel size, deletes stale image placements, then
 clears image position caches so the refresh cycle re-places images
-at their new positions.  Uses a longer debounce than normal refresh
-to let Emacs finish window layout transitions (e.g., when closing a
-split, Emacs briefly shows two windows for the same buffer before
-settling to one)."
+at their new positions.  On a terminal-level resize, also forgets the
+transmitted-image set so kitty re-receives evicted image data.  Uses a
+longer debounce than normal refresh to let Emacs finish window layout
+transitions (e.g., when closing a split, Emacs briefly shows two
+windows for the same buffer before settling to one)."
   (kitty-gfx--log "on-window-change: deleting stale placements and invalidating cell size")
   (kitty-gfx--heading-scan-visible)
   (kitty-gfx--invalidate-window-signatures)
@@ -3569,10 +3596,15 @@ settling to one)."
   ;; Invalidate FRAME's terminal cell-size parameter too, so the
   ;; per-terminal query guard re-queries it (a resize can change the
   ;; pixel cell size, and the guard keys on the parameter, not the global).
+  ;; When the frame itself resized, the terminal may have dropped image
+  ;; data during its relayout, so forget the transmitted set and let the
+  ;; refresh re-transmit (issue #36).
   (let ((term (and (frame-live-p frame) (frame-terminal frame))))
     (when (and term (terminal-live-p term))
       (set-terminal-parameter term 'kitty-gfx-cell-w nil)
-      (set-terminal-parameter term 'kitty-gfx-cell-h nil)))
+      (set-terminal-parameter term 'kitty-gfx-cell-h nil)
+      (when (kitty-gfx--frame-resized-p frame)
+        (kitty-gfx--forget-terminal-transmits term))))
   ;; Clear stale per-window records on any mpv overlay so the next
   ;; refresh recomputes coordinates against the new layout.  The mpv
   ;; overlay is NEVER pushed onto `kitty-gfx--overlays' (mpv has no
