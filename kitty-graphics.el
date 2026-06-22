@@ -84,6 +84,7 @@
 (declare-function org-link-display-format "ol" (s))
 (declare-function org-current-level "org" ())
 (defvar org-heading-regexp)
+(defvar org-comment-regexp)
 (defvar image-mode-map)
 (declare-function markdown-overlays--resolve-image-url "markdown-overlays" (url))
 (declare-function json-encode "json" (object))
@@ -2559,6 +2560,36 @@ Signals error on failure, prints success message otherwise."
                         "--vo-kitty-top=5"))
       (cl-assert (member expected args)
                  nil (format "kitty vo args should contain %s" expected))))
+  ;; org inline images: commented-out links (`# [[...]]') must not render,
+  ;; matching native org which skips them via the parse tree (issue from #37).
+  (require 'org)
+  (let* ((img (make-temp-file "kitty-gfx-selftest" nil ".png"))
+         (rendered nil)
+         (record (lambda (file &rest _) (push (file-name-nondirectory file) rendered))))
+    (unwind-protect
+        (cl-letf (((symbol-function 'kitty-gfx--org-display-image) record)
+                  ((symbol-function 'kitty-gfx--image-file-p) (lambda (_) t)))
+          (with-temp-buffer
+            (org-mode)
+            (setq buffer-file-name (expand-file-name "selftest.org"))
+            (insert (format "# [[%s]]\n\n[[%s]]\n" img img))
+            (kitty-gfx--org-display-inline-images-tty))
+          (cl-assert (= (length rendered) 1)
+                     nil "org-display should skip commented-out image links")
+          ;; A link the user just commented out must drop its leftover
+          ;; preview overlay, else the orphan drives a refresh feedback loop.
+          (let ((kitty-gfx--dry-run t))
+            (with-temp-buffer
+              (org-mode)
+              (setq buffer-file-name (expand-file-name "selftest.org"))
+              (insert (format "# [[%s]]\n" img))
+              (overlay-put (make-overlay (point-min) (line-end-position 0))
+                           'kitty-gfx t)
+              (kitty-gfx--org-display-inline-images-tty)
+              (cl-assert (null (cl-find-if (lambda (o) (overlay-get o 'kitty-gfx))
+                                           (overlays-in (point-min) (point-max))))
+                         nil "commenting a link should remove its preview overlay"))))
+      (delete-file img)))
   (message "kitty-gfx: all self-tests passed"))
 
 ;;;; Heading overlay management
@@ -5033,41 +5064,57 @@ would otherwise make every relative image path fail to resolve."
           (while (re-search-forward
                   "\\[\\[\\(file:\\|attachment:\\|[./~]\\)" stop t)
             (goto-char (match-beginning 0))
-            (let ((link (org-element-link-parser)))
-              (if (not link)
-                  (goto-char (match-end 0))
-                (let* ((link-beg (org-element-property :begin link))
-                       (link-end (org-element-property :end link))
-                       (path (org-element-property :path link))
-                       (link-type (org-element-property :type link))
-                       (file (cond
-                              ((string= link-type "file") path)
-                              ((string= link-type "attachment")
-                               (ignore-errors
-                                 (require 'org-attach)
-                                 (when-let* ((dir (org-attach-dir)))
-                                   (expand-file-name path dir))))
-                              (t path))))
-                  (when (and file
-                             (file-exists-p (expand-file-name file))
-                             (kitty-gfx--image-file-p file)
-                             (not (cl-some (lambda (ov)
-                                             (overlay-get ov 'kitty-gfx))
-                                           (overlays-in link-beg link-end))))
-                    (kitty-gfx--log "org-display: found link %s at %d..%d"
-                                     file link-beg link-end)
-                    (condition-case err
-                        (kitty-gfx--org-display-image
-                         (expand-file-name file) link-beg link-end)
-                      (error
-                       (kitty-gfx--log "org-display: ERROR %s: %s"
-                                        file (error-message-string err))
-                       (message "kitty-gfx: %s: %s"
-                                 file (error-message-string err)))))
-                  ;; Continue past this link so the next search does not
-                  ;; re-match inside it.
-                  (goto-char (max (or link-end (match-end 0))
-                                  (1+ (point)))))))))))))
+            ;; Skip links on commented-out lines (`# [[...]]').  Native
+            ;; `org-display-inline-images' works off the parse tree, where a
+            ;; comment line holds no link element, so it never renders these.
+            ;; This TTY scanner walks raw text, so it has to recognize the
+            ;; comment itself; otherwise commented images still display.  A
+            ;; link the user just commented out keeps a live preview overlay,
+            ;; so remove it here: an orphaned image overlay on the commented
+            ;; line otherwise lingers and the refresh cycle keeps re-placing
+            ;; it, perturbing the layout into a scroll/refresh feedback loop.
+            (if (save-excursion
+                  (beginning-of-line)
+                  (looking-at-p org-comment-regexp))
+                (progn
+                  (kitty-gfx-remove-images (line-beginning-position)
+                                           (line-end-position))
+                  (forward-line 1))
+              (let ((link (org-element-link-parser)))
+                (if (not link)
+                    (goto-char (match-end 0))
+                  (let* ((link-beg (org-element-property :begin link))
+                         (link-end (org-element-property :end link))
+                         (path (org-element-property :path link))
+                         (link-type (org-element-property :type link))
+                         (file (cond
+                                ((string= link-type "file") path)
+                                ((string= link-type "attachment")
+                                 (ignore-errors
+                                   (require 'org-attach)
+                                   (when-let* ((dir (org-attach-dir)))
+                                     (expand-file-name path dir))))
+                                (t path))))
+                    (when (and file
+                               (file-exists-p (expand-file-name file))
+                               (kitty-gfx--image-file-p file)
+                               (not (cl-some (lambda (ov)
+                                               (overlay-get ov 'kitty-gfx))
+                                             (overlays-in link-beg link-end))))
+                      (kitty-gfx--log "org-display: found link %s at %d..%d"
+                                      file link-beg link-end)
+                      (condition-case err
+                          (kitty-gfx--org-display-image
+                           (expand-file-name file) link-beg link-end)
+                        (error
+                         (kitty-gfx--log "org-display: ERROR %s: %s"
+                                         file (error-message-string err))
+                         (message "kitty-gfx: %s: %s"
+                                  file (error-message-string err)))))
+                    ;; Continue past this link so the next search does not
+                    ;; re-match inside it.
+                    (goto-char (max (or link-end (match-end 0))
+                                    (1+ (point))))))))))))))
 
 
 (defun kitty-gfx--org-display-advice (orig-fn &rest args)
