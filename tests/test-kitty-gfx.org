@@ -4,7 +4,7 @@
 
 Here is an inline image using file: link:
 
-[[file:test-image.png]]
+# [[file:test-image.png]]
 
 Some text after the image to verify overlay positioning.
 

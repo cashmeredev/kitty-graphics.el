@@ -56,6 +56,7 @@
 
 ;; Forward declarations for optional dependencies
 (declare-function org-element-context "org-element" ())
+(declare-function org-element-link-parser "org-element" ())
 (declare-function org-element-type "org-element" (element))
 (declare-function org-element-property "org-element" (property element))
 (declare-function org-attach-dir "org-attach" (&optional create-if-not-exists-p))
@@ -83,6 +84,7 @@
 (declare-function org-link-display-format "ol" (s))
 (declare-function org-current-level "org" ())
 (defvar org-heading-regexp)
+(defvar org-comment-regexp)
 (defvar image-mode-map)
 (declare-function markdown-overlays--resolve-image-url "markdown-overlays" (url))
 (declare-function json-encode "json" (object))
@@ -130,6 +132,34 @@ Only consulted when `kitty-gfx-shr-scale' is `fit'."
 (defcustom kitty-gfx-shr-fit-height 20
   "Maximum image height in rows under `fit' sizing.
 Only consulted when `kitty-gfx-shr-scale' is `fit'."
+  :type 'integer
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-org-image-scale 'fit
+  "Sizing for org-mode inline images in the terminal.
+nil renders at natural size, shrinking only to fit `kitty-gfx-max-width'
+and `kitty-gfx-max-height'.  A float (e.g. 0.25) renders at that fraction
+of natural size, still capped at the max dimensions.  The symbol `fit'
+scales each image into a box derived from the live window:
+`kitty-gfx-org-image-fit-width' of the window width and
+`kitty-gfx-org-image-fit-height' rows tall, preserving aspect ratio and
+never enlarging images that already fit.  Mirrors `kitty-gfx-shr-scale'
+for the eww/mu4e backends.  Defaults to `fit' so large images do not
+overflow the window."
+  :type '(choice (const :tag "Natural size (shrink to fit max)" nil)
+                 (number :tag "Fraction of natural size")
+                 (const :tag "Dynamic window-relative fit" fit))
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-org-image-fit-width 0.8
+  "Fraction of the window width an org inline image may occupy under `fit'.
+Only consulted when `kitty-gfx-org-image-scale' is `fit'."
+  :type 'number
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-org-image-fit-height 25
+  "Maximum org inline image height in rows under `fit' sizing.
+Only consulted when `kitty-gfx-org-image-scale' is `fit'."
   :type 'integer
   :group 'kitty-graphics)
 
@@ -2530,6 +2560,36 @@ Signals error on failure, prints success message otherwise."
                         "--vo-kitty-top=5"))
       (cl-assert (member expected args)
                  nil (format "kitty vo args should contain %s" expected))))
+  ;; org inline images: commented-out links (`# [[...]]') must not render,
+  ;; matching native org which skips them via the parse tree (issue from #37).
+  (require 'org)
+  (let* ((img (make-temp-file "kitty-gfx-selftest" nil ".png"))
+         (rendered nil)
+         (record (lambda (file &rest _) (push (file-name-nondirectory file) rendered))))
+    (unwind-protect
+        (cl-letf (((symbol-function 'kitty-gfx--org-display-image) record)
+                  ((symbol-function 'kitty-gfx--image-file-p) (lambda (_) t)))
+          (with-temp-buffer
+            (org-mode)
+            (setq buffer-file-name (expand-file-name "selftest.org"))
+            (insert (format "# [[%s]]\n\n[[%s]]\n" img img))
+            (kitty-gfx--org-display-inline-images-tty))
+          (cl-assert (= (length rendered) 1)
+                     nil "org-display should skip commented-out image links")
+          ;; A link the user just commented out must drop its leftover
+          ;; preview overlay, else the orphan drives a refresh feedback loop.
+          (let ((kitty-gfx--dry-run t))
+            (with-temp-buffer
+              (org-mode)
+              (setq buffer-file-name (expand-file-name "selftest.org"))
+              (insert (format "# [[%s]]\n" img))
+              (overlay-put (make-overlay (point-min) (line-end-position 0))
+                           'kitty-gfx t)
+              (kitty-gfx--org-display-inline-images-tty)
+              (cl-assert (null (cl-find-if (lambda (o) (overlay-get o 'kitty-gfx))
+                                           (overlays-in (point-min) (point-max))))
+                         nil "commenting a link should remove its preview overlay"))))
+      (delete-file img)))
   (message "kitty-gfx: all self-tests passed"))
 
 ;;;; Heading overlay management
@@ -3552,14 +3612,41 @@ viewport instrumented via `kitty-gfx--heading-scan-visible'."
                              kitty-gfx--force-redisplay t)
                        (kitty-gfx--refresh)))))
 
+(defun kitty-gfx--frame-resized-p (frame)
+  "Return non-nil if FRAME's pixel size changed since the last call.
+Records the new size on the frame so the next call compares against it.
+A pixel-size change means a terminal-level resize (the kitty OS window
+changed, e.g. a new split or `toggle_layout'), as opposed to a purely
+internal Emacs window reconfiguration that leaves the frame untouched."
+  (let ((size (cons (frame-pixel-width frame) (frame-pixel-height frame)))
+        (prev (frame-parameter frame 'kitty-gfx-pixel-size)))
+    (set-frame-parameter frame 'kitty-gfx-pixel-size size)
+    (not (equal size prev))))
+
+(defun kitty-gfx--forget-terminal-transmits (term)
+  "Drop TERM's record of which images it holds so they re-transmit.
+Kitty evicts a window's image data when its layout changes (a new
+split, or `toggle_layout stack'), but Emacs's per-terminal transmitted
+set still lists those ids, so the refresh only re-places them — against
+bytes the terminal no longer has, leaving the image blank and
+unrecoverable even via `org-toggle-inline-images' (issue #36).  Clearing
+the set makes `kitty-gfx--ensure-transmitted' re-send the bytes before
+the next placement."
+  (let ((h (terminal-parameter term 'kitty-gfx-transmitted)))
+    (when h
+      (kitty-gfx--log "forget-terminal-transmits: dropping %d ids after resize"
+                      (hash-table-count h))
+      (clrhash h))))
+
 (defun kitty-gfx--on-window-change (frame)
   "Handle window configuration change for image refresh.
 Invalidates cell pixel size, deletes stale image placements, then
 clears image position caches so the refresh cycle re-places images
-at their new positions.  Uses a longer debounce than normal refresh
-to let Emacs finish window layout transitions (e.g., when closing a
-split, Emacs briefly shows two windows for the same buffer before
-settling to one)."
+at their new positions.  On a terminal-level resize, also forgets the
+transmitted-image set so kitty re-receives evicted image data.  Uses a
+longer debounce than normal refresh to let Emacs finish window layout
+transitions (e.g., when closing a split, Emacs briefly shows two
+windows for the same buffer before settling to one)."
   (kitty-gfx--log "on-window-change: deleting stale placements and invalidating cell size")
   (kitty-gfx--heading-scan-visible)
   (kitty-gfx--invalidate-window-signatures)
@@ -3568,10 +3655,15 @@ settling to one)."
   ;; Invalidate FRAME's terminal cell-size parameter too, so the
   ;; per-terminal query guard re-queries it (a resize can change the
   ;; pixel cell size, and the guard keys on the parameter, not the global).
+  ;; When the frame itself resized, the terminal may have dropped image
+  ;; data during its relayout, so forget the transmitted set and let the
+  ;; refresh re-transmit (issue #36).
   (let ((term (and (frame-live-p frame) (frame-terminal frame))))
     (when (and term (terminal-live-p term))
       (set-terminal-parameter term 'kitty-gfx-cell-w nil)
-      (set-terminal-parameter term 'kitty-gfx-cell-h nil)))
+      (set-terminal-parameter term 'kitty-gfx-cell-h nil)
+      (when (kitty-gfx--frame-resized-p frame)
+        (kitty-gfx--forget-terminal-transmits term))))
   ;; Clear stale per-window records on any mpv overlay so the next
   ;; refresh recomputes coordinates against the new layout.  The mpv
   ;; overlay is NEVER pushed onto `kitty-gfx--overlays' (mpv has no
@@ -4925,52 +5017,104 @@ user knows why their videos have no thumbnails."
                             status file out)
             (when (and (eql status 0) (file-exists-p out)) out))))))))
 
+(defun kitty-gfx--org-display-image (file start end)
+  "Display org inline image FILE honoring `kitty-gfx-org-image-scale'.
+Mirrors `kitty-gfx--shr-display-image': `fit' scales into a
+window-relative box, a number scales by that factor, nil uses the full
+`kitty-gfx-max-width'/`kitty-gfx-max-height' caps."
+  (pcase kitty-gfx-org-image-scale
+    ('fit
+     (let ((box (kitty-gfx--fit-box (get-buffer-window (current-buffer))
+                                    kitty-gfx-org-image-fit-width
+                                    kitty-gfx-org-image-fit-height)))
+       (kitty-gfx-display-image file start end (car box) (cdr box))))
+    ((and (pred numberp) factor)
+     (let ((kitty-gfx--dim-scale factor))
+       (kitty-gfx-display-image file start end)))
+    (_ (kitty-gfx-display-image file start end
+                                kitty-gfx-max-width kitty-gfx-max-height))))
+
 (defun kitty-gfx--org-display-inline-images-tty (&optional _include-linked beg end)
   "Display inline images in org buffer via Kitty graphics.
-Scans for file:, attachment:, and relative path links."
+Scans for file:, attachment:, and relative path links.
+
+Relative links are resolved against the buffer file's directory (as
+org itself does for inline images), not `default-directory', which
+packages like Projectile or dired re-bind to the project root and
+would otherwise make every relative image path fail to resolve."
   (when (derived-mode-p 'org-mode)
     (let ((start (or beg (point-min)))
-          (stop (or end (point-max))))
-      (kitty-gfx--log "org-display: scanning region %d..%d in %s" start stop (buffer-name))
+          (stop (or end (point-max)))
+          (default-directory (if buffer-file-name
+                                 (file-name-directory buffer-file-name)
+                               default-directory)))
+      (kitty-gfx--log "org-display: scanning region %d..%d in %s (dir %s)"
+                      start stop (buffer-name) default-directory)
       (save-restriction
         (widen)
         (save-excursion
           (goto-char start)
-          ;; Match file:, attachment:, relative (./) and absolute (/) paths
+          ;; Match file:, attachment:, relative (./) and absolute (/) paths.
+          ;; Parse each candidate with `org-element-link-parser' at the
+          ;; link start rather than `org-element-context': the latter
+          ;; consults the org-element cache and, in long-running sessions
+          ;; with caching on, returns the containing paragraph/headline
+          ;; instead of the link object, so every image gets skipped.  The
+          ;; parser reads the link directly at point, independent of cache.
           (while (re-search-forward
                   "\\[\\[\\(file:\\|attachment:\\|[./~]\\)" stop t)
-            (let* ((context (org-element-context))
-                   (type (org-element-type context)))
-              (when (eq type 'link)
-                (let* ((link-beg (org-element-property :begin context))
-                       (link-end (org-element-property :end context))
-                       (path (org-element-property :path context))
-                       (link-type (org-element-property :type context))
-                       (file (cond
-                              ((string= link-type "file") path)
-                              ((string= link-type "attachment")
-                               (ignore-errors
-                                 (require 'org-attach)
-                                 (when-let* ((dir (org-attach-dir)))
-                                   (expand-file-name path dir))))
-                              (t path))))
-                  (when (and file
-                             (file-exists-p (expand-file-name file))
-                             (kitty-gfx--image-file-p file)
-                             (not (cl-some (lambda (ov)
-                                             (overlay-get ov 'kitty-gfx))
-                                           (overlays-in link-beg link-end))))
-                    (kitty-gfx--log "org-display: found link %s at %d..%d"
-                                     file link-beg link-end)
-                    (condition-case err
-                        (kitty-gfx-display-image
-                         (expand-file-name file) link-beg link-end
-                         kitty-gfx-max-width kitty-gfx-max-height)
-                      (error
-                       (kitty-gfx--log "org-display: ERROR %s: %s"
-                                        file (error-message-string err))
-                       (message "kitty-gfx: %s: %s"
-                                 file (error-message-string err))))))))))))))
+            (goto-char (match-beginning 0))
+            ;; Skip links on commented-out lines (`# [[...]]').  Native
+            ;; `org-display-inline-images' works off the parse tree, where a
+            ;; comment line holds no link element, so it never renders these.
+            ;; This TTY scanner walks raw text, so it has to recognize the
+            ;; comment itself; otherwise commented images still display.  A
+            ;; link the user just commented out keeps a live preview overlay,
+            ;; so remove it here: an orphaned image overlay on the commented
+            ;; line otherwise lingers and the refresh cycle keeps re-placing
+            ;; it, perturbing the layout into a scroll/refresh feedback loop.
+            (if (save-excursion
+                  (beginning-of-line)
+                  (looking-at-p org-comment-regexp))
+                (progn
+                  (kitty-gfx-remove-images (line-beginning-position)
+                                           (line-end-position))
+                  (forward-line 1))
+              (let ((link (org-element-link-parser)))
+                (if (not link)
+                    (goto-char (match-end 0))
+                  (let* ((link-beg (org-element-property :begin link))
+                         (link-end (org-element-property :end link))
+                         (path (org-element-property :path link))
+                         (link-type (org-element-property :type link))
+                         (file (cond
+                                ((string= link-type "file") path)
+                                ((string= link-type "attachment")
+                                 (ignore-errors
+                                   (require 'org-attach)
+                                   (when-let* ((dir (org-attach-dir)))
+                                     (expand-file-name path dir))))
+                                (t path))))
+                    (when (and file
+                               (file-exists-p (expand-file-name file))
+                               (kitty-gfx--image-file-p file)
+                               (not (cl-some (lambda (ov)
+                                               (overlay-get ov 'kitty-gfx))
+                                             (overlays-in link-beg link-end))))
+                      (kitty-gfx--log "org-display: found link %s at %d..%d"
+                                      file link-beg link-end)
+                      (condition-case err
+                          (kitty-gfx--org-display-image
+                           (expand-file-name file) link-beg link-end)
+                        (error
+                         (kitty-gfx--log "org-display: ERROR %s: %s"
+                                         file (error-message-string err))
+                         (message "kitty-gfx: %s: %s"
+                                  file (error-message-string err)))))
+                    ;; Continue past this link so the next search does not
+                    ;; re-match inside it.
+                    (goto-char (max (or link-end (match-end 0))
+                                    (1+ (point))))))))))))))
 
 
 (defun kitty-gfx--org-display-advice (orig-fn &rest args)
@@ -5002,8 +5146,11 @@ Scans for file:, attachment:, and relative path links."
 ;; org 10.0+ uses org-link-preview instead of org-toggle-inline-images
 
 (defun kitty-gfx--org-link-preview-advice (orig-fn &optional arg beg end)
-  "Around advice for `org-link-preview' (org 10.0+).
-With prefix ARG \\[universal-argument], clear previews."
+  "Around advice for `org-link-preview' (org 9.7+).
+Mirrors org's own toggle semantics: with no prefix ARG, hide the
+previews when any are already shown in the region (or buffer) and
+otherwise display them.  \\[universal-argument] clears the region;
+\\[universal-argument] \\[universal-argument] \\[universal-argument] clears the whole buffer."
   (if (and kitty-graphics-mode (not (display-graphic-p)))
       (cond
        ;; C-u = clear
@@ -5012,9 +5159,12 @@ With prefix ARG \\[universal-argument], clear previews."
        ;; C-u C-u C-u = clear whole buffer
        ((equal arg '(64))
         (kitty-gfx-remove-images))
-       ;; Otherwise display images
+       ;; No prefix: toggle — remove if anything is shown, else display.
        (t
-        (kitty-gfx--org-display-inline-images-tty nil beg end)))
+        (if (cl-some (lambda (ov) (overlay-get ov 'kitty-gfx))
+                     (overlays-in (or beg (point-min)) (or end (point-max))))
+            (kitty-gfx-remove-images beg end)
+          (kitty-gfx--org-display-inline-images-tty nil beg end))))
     (funcall orig-fn arg beg end)))
 
 (defun kitty-gfx--org-link-preview-region-advice (orig-fn &optional include-linked refresh beg end)
@@ -5069,7 +5219,10 @@ image via Kitty graphics instead of an Emacs image spec."
         ;; Don't create duplicate overlays at the same position
         (unless (cl-some (lambda (ov) (overlay-get ov 'kitty-gfx))
                          (overlays-in beg end))
-          (kitty-gfx-display-image movefile beg end)
+          ;; Size like org inline images so a wide display equation fits
+          ;; the window; `fit' never enlarges, so normal text-sized
+          ;; fragments are unchanged (`kitty-gfx-org-image-scale').
+          (kitty-gfx--org-display-image movefile beg end)
           ;; Tag the most recently created overlay with org properties
           ;; so org-clear-latex-preview can find and clean it up.
           (when-let* ((ov (car kitty-gfx--overlays)))
@@ -5360,16 +5513,25 @@ can otherwise remain over newly-created window separators."
 
 ;;;; shr integration (eww, mu4e, gnus)
 
+(defun kitty-gfx--fit-box (win fit-width fit-height)
+  "Return (MAX-COLS . MAX-ROWS) for fitting an image into WIN.
+MAX-COLS is FIT-WIDTH of WIN's body width, MAX-ROWS is FIT-HEIGHT, each
+capped at `kitty-gfx-max-width'/`kitty-gfx-max-height'.  Used by both the
+shr and org `fit' image sizing paths."
+  (let ((win-w (if (window-live-p win)
+                   (window-body-width win)
+                 kitty-gfx-max-width)))
+    (cons (max 1 (min kitty-gfx-max-width (round (* win-w fit-width))))
+          (max 1 (min kitty-gfx-max-height fit-height)))))
+
 (defun kitty-gfx--shr-display-image (file start end)
   "Display FILE for the shr backends, honoring `kitty-gfx-shr-scale'."
   (pcase kitty-gfx-shr-scale
     ('fit
-     (let* ((win (get-buffer-window (current-buffer)))
-            (win-w (if win (window-body-width win) kitty-gfx-max-width))
-            (max-c (max 1 (min kitty-gfx-max-width
-                               (round (* win-w kitty-gfx-shr-fit-width)))))
-            (max-r (max 1 (min kitty-gfx-max-height kitty-gfx-shr-fit-height))))
-       (kitty-gfx-display-image file start end max-c max-r)))
+     (let ((box (kitty-gfx--fit-box (get-buffer-window (current-buffer))
+                                    kitty-gfx-shr-fit-width
+                                    kitty-gfx-shr-fit-height)))
+       (kitty-gfx-display-image file start end (car box) (cdr box))))
     ((and (pred numberp) factor)
      (let ((kitty-gfx--dim-scale factor))
        (kitty-gfx-display-image file start end)))
