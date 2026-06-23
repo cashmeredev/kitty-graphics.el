@@ -9,7 +9,7 @@ at scaled font sizes using the Kitty text sizing protocol (OSC 66).
 Integrates with org-mode, image-mode, shr/eww/mu4e/gnus, dired, and dirvish.
 
 Language: **Emacs Lisp** (`lexical-binding: t`). Single source file (~3300 lines).
-Current version: **0.6.0** (see Versioning section).
+Current version: **1.0.4** (see Versioning section).
 
 ## Build / Validate
 

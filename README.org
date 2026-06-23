@@ -5,7 +5,7 @@ Display images, video, and scaled text directly in terminal Emacs (~emacs -nw~) 
 
 The right backend is picked automatically at startup, so it works across ~20+ terminals with no configuration, and keeps working inside [[https://github.com/tmux/tmux][tmux]], where Kitty graphics are wrapped in DCS passthrough and Sixel runs natively on tmux >= 3.4.
 
-Version 1.0.3. Requires Emacs >= 27.1.
+Version 1.0.4. Requires Emacs >= 27.1.
 
 * Demo
 
