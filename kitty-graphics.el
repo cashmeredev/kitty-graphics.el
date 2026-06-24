@@ -83,6 +83,9 @@
 (declare-function org-get-heading "org" (&optional no-tags no-todo no-priority no-comment))
 (declare-function org-link-display-format "ol" (s))
 (declare-function org-current-level "org" ())
+(declare-function org-get-todo-state "org" ())
+(declare-function org-get-tags "org" (&optional pos local))
+(declare-function org-get-todo-face "org" (kwd))
 (defvar org-heading-regexp)
 (defvar org-comment-regexp)
 (defvar image-mode-map)
@@ -751,6 +754,39 @@ Maximum scale is 7.0 (limited by protocol)."
                                     (const :tag "1.5x" 1.5)
                                     (const :tag "1.2x" 1.2)
                                     (number :tag "Custom (1.0-7.0)")))
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-heading-min-scale 1.2
+  "Smallest scale worth rendering as a multicell heading.
+Any scale > 1.0 needs at least two terminal rows (a glyph that tall
+cannot fit in one cell), so a barely-larger heading doubles its line
+height for little visual gain.  Configured scales above 1.0 but below
+this threshold are left at normal one-row size.  Set to 1.0 to scale
+every heading whose scale exceeds 1.0."
+  :type 'number
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-heading-valign 2
+  "Vertical alignment of scaled heading text within its multicell block.
+One of 0 (top), 1 (bottom), or 2 (centered).  Emitted as the OSC 66
+`v=' parameter, which Kitty honors only for fractionally-scaled text
+\(scales like 1.5 or 1.2 that render shorter than the rows they
+reserve).  Integer scales such as 2.0 fill their block exactly, so this
+has no effect on them.  Centering removes the gap a fractional heading
+would otherwise leave below itself."
+  :type '(choice (const :tag "Top" 0)
+                 (const :tag "Bottom" 1)
+                 (const :tag "Centered" 2))
+  :group 'kitty-graphics)
+
+(defcustom kitty-gfx-heading-fontify-keywords t
+  "When non-nil, render a scaled org heading's parts in their own colors.
+The TODO/DONE keyword, priority cookie, title, and tags are emitted as
+separate OSC 66 segments, each with the SGR of the face Emacs would
+fontify it with (`org-todo'/`org-done', `org-priority', `org-level-N',
+`org-tag').  When nil, only the plain title is shown, rendered in the
+heading-level color (the pre-1.1 behavior)."
+  :type 'boolean
   :group 'kitty-graphics)
 
 (defcustom kitty-gfx-heading-sizes-auto nil
@@ -2230,6 +2266,12 @@ Examples:
                         (setq best-n n best-d d best-err err))))
         (list s best-n best-d)))))
 
+(defun kitty-gfx--heading-scaled-p (scale)
+  "Return non-nil when SCALE warrants a multicell heading overlay.
+A scale above 1.0 but below `kitty-gfx-heading-min-scale' is treated as
+not worth the extra terminal row and stays at normal size."
+  (and scale (> scale 1.0) (>= scale kitty-gfx-heading-min-scale)))
+
 (defun kitty-gfx--validate-osc66 (s n d text)
   "Return non-nil if OSC 66 parameters are valid per protocol spec.
 S is cell scale (1-7), N is fractional numerator (0-15),
@@ -2249,27 +2291,108 @@ valid UTF-8."
     (setq text (substring text 0 -1)))
   text)
 
+(defun kitty-gfx--color-sgr (selector color)
+  "Return an SGR color parameter \"SELECTOR;2;R;G;B\" for COLOR, or nil.
+SELECTOR is 38 for foreground or 48 for background.  COLOR is an Emacs
+color name or hex string; unspecified or unresolvable colors yield nil.
+\"#RRGGBB\" hex is parsed directly so the emitted truecolor is exact
+regardless of the frame's display color model; named colors go through
+`color-values'."
+  (let ((rgb (cond
+              ((not (stringp color)) nil)
+              ((string-prefix-p "unspecified" color) nil)
+              ((string-match
+                "\\`#\\([0-9a-fA-F]\\{2\\}\\)\\([0-9a-fA-F]\\{2\\}\\)\\([0-9a-fA-F]\\{2\\}\\)\\'"
+                color)
+               (list (string-to-number (match-string 1 color) 16)
+                     (string-to-number (match-string 2 color) 16)
+                     (string-to-number (match-string 3 color) 16)))
+              (t (let ((v (color-values color)))
+                   (and v (mapcar (lambda (x) (/ x 256)) v)))))))
+    (when rgb
+      (format "%d;2;%d;%d;%d" selector (nth 0 rgb) (nth 1 rgb) (nth 2 rgb)))))
+
+(defun kitty-gfx--spec-attribute (spec attr)
+  "Resolve face attribute ATTR from SPEC, following `:inherit'.
+SPEC may be a named face symbol, an attribute plist, a color string
+\(taken as the foreground), or a list of any of those — the shapes
+`org-get-todo-face' returns for custom TODO keywords.  Returns the
+attribute value, or nil when unspecified."
+  (cond
+   ((null spec) nil)
+   ((and (symbolp spec) (facep spec))
+    (let ((v (face-attribute spec attr nil t)))
+      (unless (eq v 'unspecified) v)))
+   ((stringp spec)
+    (when (eq attr :foreground) spec))
+   ((keywordp (car-safe spec))
+    (let ((v (plist-get spec attr)))
+      (if (and v (not (eq v 'unspecified)))
+          v
+        (kitty-gfx--spec-attribute (plist-get spec :inherit) attr))))
+   ((consp spec)
+    (cl-some (lambda (s) (kitty-gfx--spec-attribute s attr)) spec))))
+
+(defun kitty-gfx--face-sgr (face)
+  "Return an SGR escape string rendering FACE's visual attributes.
+FACE may be a named face, an attribute plist, a color string, or a
+list of those — the shapes `org-get-todo-face' yields for custom TODO
+keywords.  Honors weight, slant, underline, and 24-bit foreground and
+background, following `:inherit'.  Stays bold by default (matching the
+prior behavior) unless the face is explicitly light, so scaled text
+always stands out."
+  (let ((weight (kitty-gfx--spec-attribute face :weight))
+        (slant (kitty-gfx--spec-attribute face :slant))
+        (underline (kitty-gfx--spec-attribute face :underline))
+        (fg (kitty-gfx--color-sgr 38 (kitty-gfx--spec-attribute face :foreground)))
+        (bg (kitty-gfx--color-sgr 48 (kitty-gfx--spec-attribute face :background)))
+        (params nil))
+    (if (memq weight '(light semi-light semilight ultra-light extra-light thin))
+        (push "2" params)
+      (push "1" params))
+    (when (memq slant '(italic oblique))
+      (push "3" params))
+    (when (and underline (not (eq underline 'unspecified)))
+      (push "4" params))
+    (when fg (push fg params))
+    (when bg (push bg params))
+    (format "\e[%sm" (mapconcat #'identity (nreverse params) ";"))))
+
 (defun kitty-gfx--heading-sgr (level)
-  "Return SGR escape string for org heading at LEVEL.
-Applies bold + 24-bit foreground color from org-level-N face.
-Falls back to bold-only when color is unavailable or face undefined."
-  (let* ((face (intern (format "org-level-%d" (min level 8))))
-         (fg (and (facep face)
-                  (face-attribute face :foreground nil t)))
-         (color (when (and (stringp fg)
-                           (not (string-prefix-p "unspecified" fg)))
-                  (color-values fg))))
-    (if color
-        (format "\e[1;38;2;%d;%d;%dm"
-                (/ (nth 0 color) 256)
-                (/ (nth 1 color) 256)
-                (/ (nth 2 color) 256))
-      "\e[1m")))
+  "Return SGR escape string for an org heading at LEVEL.
+Renders the `org-level-N' face (capped at level 8) via
+`kitty-gfx--face-sgr', falling back to bold when undefined."
+  (kitty-gfx--face-sgr (intern (format "org-level-%d" (min level 8)))))
+
+(defun kitty-gfx--emit-heading-segments (segments limit row col cell-s meta)
+  "Emit SEGMENTS as consecutive OSC 66 blocks starting at ROW, COL.
+Each (TEXT . FACE) run is rendered with its own SGR via
+`kitty-gfx--face-sgr', sharing the OSC 66 sizing META.  The combined
+text is truncated to LIMIT characters so a heading fitted to the window
+width does not overflow.  Returns the next free column."
+  (let ((remaining limit)
+        (cur-col col))
+    (dolist (seg segments)
+      (when (> remaining 0)
+        (let* ((full (substring-no-properties (car seg)))
+               (text (if (<= (length full) remaining)
+                         full
+                       (substring full 0 remaining))))
+          (setq remaining (- remaining (length text)))
+          (when (> (length text) 0)
+            (kitty-gfx--terminal-send
+             (format "\e7\e[%d;%dH%s\e]66;%s;%s\a\e[0m\e8"
+                     row cur-col (kitty-gfx--face-sgr (cdr seg)) meta text))
+            (setq cur-col (+ cur-col (* (string-width text) cell-s)))))))
+    cur-col))
 
 (defun kitty-gfx--place-heading (ov)
   "Emit OSC 66 to render heading overlay OV at its cached terminal position.
 Pre-erases the target area using ECH before emitting, preventing
 artifacts from partial overwrites (adapted from mdfried's pattern).
+With `kitty-gfx-heading-fontify-keywords', the heading is emitted as
+per-part colored segments (TODO keyword, priority, title, tags);
+otherwise as one block in the heading-level color.
 Sequence: save-cursor, erase-area, move-to-position, SGR-color,
 OSC-66-payload, SGR-reset, restore-cursor."
   (let* ((raw-text (or (overlay-get ov 'kitty-gfx-render-text)
@@ -2287,9 +2410,12 @@ OSC-66-payload, SGR-reset, restore-cursor."
          (cols (overlay-get ov 'kitty-gfx-cols))
          (rows (overlay-get ov 'kitty-gfx-rows))
          (sgr (kitty-gfx--heading-sgr level))
-         ;; Build the OSC 66 metadata: s=S, and optionally n=N:d=D
+         ;; Build the OSC 66 metadata: s=S, and optionally n=N:d=D:v=V.
+         ;; v= (vertical alignment) only applies to fractional scaling,
+         ;; so it rides along only on the n/d branch.
          (meta (if (and frac-n frac-d (> frac-d 0))
-                   (format "s=%d:n=%d:d=%d" cell-s frac-n frac-d)
+                   (format "s=%d:n=%d:d=%d:v=%d"
+                           cell-s frac-n frac-d kitty-gfx-heading-valign)
                  (format "s=%d" cell-s))))
     (kitty-gfx--log "place-heading: L%d row=%d col=%d s=%d n=%d d=%d text=%S"
                      level row col cell-s frac-n frac-d text)
@@ -2297,9 +2423,13 @@ OSC-66-payload, SGR-reset, restore-cursor."
     ;; This prevents ghost artifacts from previous content or
     ;; partially-overwritten multicell blocks.
     (kitty-gfx--erase-heading-at row col (or cols 0) (or rows 1))
-    (kitty-gfx--terminal-send
-     (format "\e7\e[%d;%dH%s\e]66;%s;%s\a\e[0m\e8"
-             row col sgr meta text))
+    (let ((segments (overlay-get ov 'kitty-gfx-heading-segments)))
+      (if segments
+          (kitty-gfx--emit-heading-segments
+           segments (length text) row col cell-s meta)
+        (kitty-gfx--terminal-send
+         (format "\e7\e[%d;%dH%s\e]66;%s;%s\a\e[0m\e8"
+                 row col sgr meta text))))
     (overlay-put ov 'kitty-gfx-heading-emitted t)))
 
 (defun kitty-gfx--erase-heading-at (row col cols rows)
@@ -2336,6 +2466,29 @@ blanked body lines after fold/scroll)."
   (let ((text (overlay-get ov 'kitty-gfx-heading-text)))
     (when (and text (not (equal (overlay-get ov 'display) text)))
       (overlay-put ov 'display text))))
+
+(defun kitty-gfx--heading-erase-all ()
+  "Erase every emitted heading multicell block at its cached position.
+Unlike `kitty-gfx--heading-reset', which trusts Emacs to repaint the
+heading line, this writes an explicit ECH erase first.  Used on
+window-layout changes (a popup, which-key, or the minibuffer opening a
+window over the buffer): the new window owns those terminal cells, so
+Emacs never repaints them and the stale glyphs would otherwise bleed
+into the popup.  Clears each block's cached position so the debounced
+refresh re-places the still-visible ones afterwards."
+  (dolist (buf (buffer-list))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (dolist (ov kitty-gfx--overlays)
+          (when (and (overlay-buffer ov)
+                     (overlay-get ov 'kitty-gfx-heading)
+                     (overlay-get ov 'kitty-gfx-heading-emitted))
+            (kitty-gfx--erase-heading-at
+             (overlay-get ov 'kitty-gfx-last-row)
+             (overlay-get ov 'kitty-gfx-last-col)
+             (or (overlay-get ov 'kitty-gfx-cols) 0)
+             (or (overlay-get ov 'kitty-gfx-rows) 1))
+            (kitty-gfx--heading-reset ov)))))))
 
 (defun kitty-gfx--heading-fit-text (text cell-s max-cols)
   "Return the longest prefix of TEXT whose scaled width fits MAX-COLS.
@@ -2374,6 +2527,13 @@ cycle flushes the spaces to the terminal before emitting OSC 66."
 Tests pure logic functions that don't require a terminal.
 Signals error on failure, prints success message otherwise."
   (interactive)
+  ;; heading-scaled-p: honors the min-scale threshold
+  (let ((kitty-gfx-heading-min-scale 1.2))
+    (cl-assert (not (kitty-gfx--heading-scaled-p 1.0)) nil "1.0 should not scale")
+    (cl-assert (not (kitty-gfx--heading-scaled-p 1.1)) nil "1.1 below min should not scale")
+    (cl-assert (kitty-gfx--heading-scaled-p 1.2) nil "1.2 at min should scale")
+    (cl-assert (kitty-gfx--heading-scaled-p 2.0) nil "2.0 should scale")
+    (cl-assert (not (kitty-gfx--heading-scaled-p nil)) nil "nil should not scale"))
   ;; decompose-scale: identity
   (cl-assert (equal (kitty-gfx--decompose-scale 1.0) '(1 0 0))
              nil "decompose 1.0 failed")
@@ -2425,6 +2585,35 @@ Signals error on failure, prints success message otherwise."
   (let ((sgr (kitty-gfx--heading-sgr 1)))
     (cl-assert (stringp sgr) nil "heading-sgr should return string")
     (cl-assert (string-prefix-p "\e[" sgr) nil "heading-sgr should be SGR escape"))
+  ;; face-sgr: undefined face falls back to bold
+  (cl-assert (equal (kitty-gfx--face-sgr 'no-such-face-xyz) "\e[1m")
+             nil "face-sgr should fall back to bold for undefined face")
+  ;; face-sgr: a real face yields a well-formed SGR escape
+  (let ((sgr (kitty-gfx--face-sgr 'bold)))
+    (cl-assert (and (string-prefix-p "\e[" sgr) (string-suffix-p "m" sgr))
+               nil "face-sgr should be a complete SGR escape"))
+  ;; face-sgr: italic face emits the slant parameter
+  (cl-assert (string-match-p ";?3;?\\|\\[3m" (kitty-gfx--face-sgr 'italic))
+             nil "face-sgr should emit slant for an italic face")
+  ;; color-sgr: foreground vs background selector, unusable color -> nil
+  (cl-assert (string-prefix-p "38;2;" (kitty-gfx--color-sgr 38 "#ffffff"))
+             nil "color-sgr should build a 38;2 foreground param")
+  (cl-assert (string-prefix-p "48;2;" (kitty-gfx--color-sgr 48 "#000000"))
+             nil "color-sgr should build a 48;2 background param")
+  (cl-assert (null (kitty-gfx--color-sgr 38 "unspecified-fg"))
+             nil "color-sgr should reject unspecified colors")
+  ;; spec-attribute: resolves plists, color strings, and :inherit
+  (cl-assert (equal (kitty-gfx--spec-attribute '(:foreground "#ff0000") :foreground)
+                    "#ff0000")
+             nil "spec-attribute should read a plist foreground")
+  (cl-assert (equal (kitty-gfx--spec-attribute "#00ff00" :foreground) "#00ff00")
+             nil "spec-attribute should treat a color string as foreground")
+  (cl-assert (null (kitty-gfx--spec-attribute "#00ff00" :background))
+             nil "spec-attribute color string has no background")
+  ;; face-sgr: a custom TODO-style color plist yields the right RGB
+  (cl-assert (string-match-p "38;2;255;0;0"
+                             (kitty-gfx--face-sgr '(:foreground "#ff0000")))
+             nil "face-sgr should render a custom keyword color")
   ;; make-heading-overlay: creates overlay with correct properties
   (with-temp-buffer
     (insert "* Test Heading\nBody text\n")
@@ -2733,15 +2922,16 @@ already owns the line)."
                (scale (and level (alist-get level kitty-gfx-heading-scales)))
                (cell-s (overlay-get ov 'kitty-gfx-heading-cell-s))
                (decomposed (and scale (kitty-gfx--decompose-scale scale))))
-          (when (and scale (> scale 1.0)
+          (when (and (kitty-gfx--heading-scaled-p scale)
                      (= cell-s (nth 0 decomposed)))
-            (let* ((raw (org-get-heading t t t t))
-                   (text (substring-no-properties
-                          (if (fboundp 'org-link-display-format)
-                              (org-link-display-format raw)
-                            raw))))
+            (let* ((segments (and kitty-gfx-heading-fontify-keywords
+                                  (kitty-gfx--org-heading-segments level)))
+                   (text (if segments
+                             (mapconcat #'car segments "")
+                           (kitty-gfx--org-heading-title level))))
               (move-overlay ov line-beg line-end)
               (overlay-put ov 'kitty-gfx-heading-text text)
+              (overlay-put ov 'kitty-gfx-heading-segments segments)
               (overlay-put ov 'kitty-gfx-heading-scale (float scale))
               (overlay-put ov 'kitty-gfx-heading-frac-n (nth 1 decomposed))
               (overlay-put ov 'kitty-gfx-heading-frac-d (nth 2 decomposed))
@@ -2752,6 +2942,43 @@ already owns the line)."
               (overlay-put ov 'kitty-gfx-heading-emitted nil)
               (kitty-gfx--log "heading-update: L%d re-anchored text=%S" level text)
               t)))))))
+
+(defun kitty-gfx--org-heading-title (level)
+  "Return the plain, link-formatted title of the org heading at point.
+LEVEL is unused but kept for symmetry with `kitty-gfx--org-heading-segments'."
+  (ignore level)
+  (let ((raw (org-get-heading t t t t)))
+    (substring-no-properties
+     (if (fboundp 'org-link-display-format)
+         (org-link-display-format raw)
+       raw))))
+
+(defun kitty-gfx--org-heading-segments (level)
+  "Return styled (TEXT . FACE) runs for the org heading at point.
+Splits the heading into its TODO/DONE keyword, priority cookie, title,
+and tags, each paired with the face Emacs fontifies it with.  Point
+must be at the heading line.  The concatenation of the run texts is the
+full string the heading should display."
+  (let ((title-face (intern (format "org-level-%d" (min level 8))))
+        (todo (org-get-todo-state))
+        (tags (org-get-tags nil t))
+        (title (kitty-gfx--org-heading-title level))
+        (priority (save-excursion
+                    (beginning-of-line)
+                    (when (re-search-forward
+                           "^\\*+ +\\(?:[A-Z0-9]+ +\\)?\\(\\[#[A-Z0-9]\\]\\)"
+                           (line-end-position) t)
+                      (match-string-no-properties 1))))
+        (segments nil))
+    (when todo
+      (push (cons (concat todo " ") (org-get-todo-face todo)) segments))
+    (when priority
+      (push (cons (concat priority " ") 'org-priority) segments))
+    (push (cons title title-face) segments)
+    (when tags
+      (push (cons (concat " :" (mapconcat #'identity tags ":") ":") 'org-tag)
+            segments))
+    (nreverse segments)))
 
 (defun kitty-gfx--org-apply-heading-sizes (&optional beg end)
   "Scan org headings in region BEG..END and create scaled overlays.
@@ -2771,17 +2998,19 @@ a kitty-gfx heading overlay."
                  (scale (alist-get level kitty-gfx-heading-scales))
                  (line-beg (line-beginning-position))
                  (line-end (line-end-position)))
-            (when (and scale (> scale 1.0))
+            (when (kitty-gfx--heading-scaled-p scale)
               ;; Skip if already has a heading overlay
               (unless (cl-some (lambda (ov)
                                  (overlay-get ov 'kitty-gfx-heading))
                                (overlays-in line-beg line-end))
-                (let* ((raw (org-get-heading t t t t))
-                       (text (if (fboundp 'org-link-display-format)
-                                 (org-link-display-format raw)
-                               raw)))
-                  (kitty-gfx--make-heading-overlay
-                   line-beg line-end text scale level)
+                (let* ((segments (and kitty-gfx-heading-fontify-keywords
+                                      (kitty-gfx--org-heading-segments level)))
+                       (text (if segments
+                                 (mapconcat #'car segments "")
+                               (kitty-gfx--org-heading-title level)))
+                       (ov (kitty-gfx--make-heading-overlay
+                            line-beg line-end text scale level)))
+                  (overlay-put ov 'kitty-gfx-heading-segments segments)
                   (cl-incf count)))))))
       (kitty-gfx--log "apply-heading-sizes: created %d overlays" count)
       (when (> count 0)
@@ -3684,16 +3913,22 @@ windows for the same buffer before settling to one)."
   ;; direct placement when it is re-placed at a different geometry, and
   ;; Sixel is stateless and must be explicitly overwritten.
   ;;
-  ;; Heading overlays PRESERVE their cache — the refresh cycle needs
-  ;; old→new position comparison to erase multicell blocks properly.
+  ;; Heading multicell blocks are erased at their cached position here
+  ;; too: unlike a scroll (handled by `kitty-gfx--on-window-scroll',
+  ;; which preserves the cache for old→new comparison), a layout change
+  ;; can drop a popup/minibuffer window over the buffer, and Emacs will
+  ;; not repaint the cells the block occupies — so the stale glyphs would
+  ;; bleed into the popup unless we wipe them explicitly.
   (kitty-gfx--sync-begin)
   (unwind-protect
-      (dolist (buf (buffer-list))
-        (with-current-buffer buf
-          (dolist (ov kitty-gfx--overlays)
-            (when (and (overlay-buffer ov)
-                       (not (overlay-get ov 'kitty-gfx-heading)))
-              (kitty-gfx--delete-image-placements ov)))))
+      (progn
+        (kitty-gfx--heading-erase-all)
+        (dolist (buf (buffer-list))
+          (with-current-buffer buf
+            (dolist (ov kitty-gfx--overlays)
+              (when (and (overlay-buffer ov)
+                         (not (overlay-get ov 'kitty-gfx-heading)))
+                (kitty-gfx--delete-image-placements ov))))))
     (kitty-gfx--sync-end))
   ;; Longer debounce: cancel any fast leading-edge cooldown and
   ;; schedule a 0.1s delayed refresh to let window layout settle.
