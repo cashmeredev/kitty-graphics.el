@@ -269,6 +269,10 @@ changes; `kitty-graphics--browser-ipc-filter` parses replies and clears
 ## Known Issues & Planned Work
 
 - **Fixed**: Overlays remain visible when org headings are collapsed (#1)
+- **Fixed**: Images placed too low after a window split (#47) -- Emacs's
+  `posn-at-point' reports a row inside a multi-line blank reservation
+  when it starts a line right after a truncated one;
+  `kitty-graphics--image-top-row' derives the top from the overlay end
 - **Partial**: tmux support (#2) -- Sixel works inside tmux >= 3.4 (native
   rendering, foot/Konsole/etc as outer terminal); guarded by
   `kitty-graphics-tmux-allow-sixel'.  Known caveat: images may persist after
