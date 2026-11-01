@@ -3320,6 +3320,40 @@ Vanilla sessions without line numbers always get 0."
         (round (line-number-display-width 'columns)))
     0))
 
+(defun kitty-graphics--image-top-row (ov win row lnum-width visual-col)
+  "Return the body row of image overlay OV's top edge in WIN.
+ROW is what `posn-at-point' reported for OV's start.  Emacs reports a
+row inside the reservation instead of its top when the multi-line
+`display' string starts a line right after a truncated one (#47).
+The overlay END is still reported correctly, and the blank
+reservation's trailing newline puts END exactly ROWS below the top,
+so derive the top from there.  The correction only applies to the
+blank reservation made by `kitty-graphics--make-overlay', only when it
+fits the window without wrapping and END is visible, and it only ever
+moves ROW up within the reserved block, so correct positions are
+returned unchanged."
+  (let ((rows (overlay-get ov 'kitty-graphics-rows))
+        (cols (overlay-get ov 'kitty-graphics-cols))
+        (display (overlay-get ov 'display))
+        (end (overlay-end ov)))
+    (or (and (integerp rows) (integerp cols) (> rows 1)
+             (not (overlay-get ov 'kitty-graphics-heading))
+             (stringp display)
+             (= (length display) (* rows (1+ cols)))
+             (string-suffix-p "\n" display)
+             (< (overlay-start ov) end)
+             (< (+ lnum-width visual-col cols) (window-body-width win))
+             (let* ((end-pos (posn-at-point end win))
+                    (end-row (and end-pos (cdr (posn-col-row end-pos))))
+                    (top-row (and end-row (- end-row rows))))
+               (when (and top-row (>= top-row 0)
+                          (< top-row row) (< row (+ top-row rows)))
+                 (kitty-graphics--log "screen-pos: pid=%s row %d -> %d (end-row=%d rows=%d)"
+                                      (overlay-get ov 'kitty-graphics-pid)
+                                      row top-row end-row rows)
+                 top-row)))
+        row)))
+
 (defun kitty-graphics--overlay-screen-pos (ov &optional win)
   "Return (TERM-ROW . TERM-COL) for overlay OV in WIN, or nil if hidden.
 Coordinates are 1-indexed terminal positions.  WIN defaults to a window
@@ -3370,6 +3404,9 @@ range, inside a folded region, or not visible on screen."
                                (current-column)))
                  (visual-col (max 0 (- buffer-col (window-hscroll win))))
                  (lnum-width (kitty-graphics--window-line-number-width win)))
+            (when row
+              (setq row (kitty-graphics--image-top-row
+                         ov win row lnum-width visual-col)))
             (kitty-graphics--log "screen-pos-detail: pid=%s posn-col=%d buffer-col=%d visual-col=%d lnum-width=%d posn-row=%d posn-xy=%S body-left=%d body-top=%d"
                             (overlay-get ov 'kitty-graphics-pid) posn-col buffer-col
                             visual-col lnum-width row posn-xy body-left body-top)
