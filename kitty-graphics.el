@@ -4488,8 +4488,21 @@ max cols/rows.  nil means shrink-to-fit the max dimensions (the default).")
 (defun kitty-graphics--compute-cell-dims (pixel-w pixel-h max-cols max-rows)
   "Compute (COLS . ROWS) in terminal cells for image placement.
 With direct placements, COLS and ROWS map directly to terminal columns/rows."
-  (let* ((cw (or kitty-graphics--cell-pixel-width 8))
-         (ch (or kitty-graphics--cell-pixel-height 16))
+  ;; Startup probes are deferred, and window changes invalidate their
+  ;; results.  Resolve the cell size before committing image dimensions,
+  ;; otherwise the first image can use 8x16 while later ones use the
+  ;; queried size.  The query is a no-op when this terminal is cached.
+  ;; read-event can only read replies from the selected terminal; render
+  ;; paths targeting another client must use that client's cached values.
+  (when (and (not noninteractive)
+             (not (display-graphic-p))
+             (or (null kitty-graphics--target-terminal)
+                 (eq kitty-graphics--target-terminal (frame-terminal))))
+    (kitty-graphics--query-cell-size))
+  (let* ((cw (or (kitty-graphics--tparam 'kitty-graphics-cell-w)
+                 kitty-graphics--cell-pixel-width 8))
+         (ch (or (kitty-graphics--tparam 'kitty-graphics-cell-h)
+                 kitty-graphics--cell-pixel-height 16))
          (img-cols (max 1 (ceiling (/ (float pixel-w) cw))))
          (img-rows (max 1 (ceiling (/ (float pixel-h) ch))))
          (fit (min (if (> img-cols max-cols)
