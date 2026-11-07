@@ -1337,6 +1337,25 @@ keystrokes consumed while waiting are pushed back onto
       (set-terminal-parameter nil 'kitty-graphics-cell-h h)
       (kitty-graphics--log "cell-size final: %dx%d" w h))))
 
+(defun kitty-graphics--cell-pixel-size ()
+  "Return (WIDTH . HEIGHT) in pixels for the output terminal.
+Use the terminal's cached dimensions, querying it first if needed.
+Terminal replies can only be read from the selected terminal in an
+interactive text session.  For other terminals, GUI frames, or batch
+execution, use cached dimensions or the existing global defaults.
+Fall back to 8x16 pixels when no dimensions are available."
+  ;; The query already checks the selected terminal's cache.  Keep its
+  ;; input restrictions here so image sizing only needs a pair of numbers.
+  (when (and (not noninteractive)
+             (not (display-graphic-p))
+             (or (null kitty-graphics--target-terminal)
+                 (eq kitty-graphics--target-terminal (frame-terminal))))
+    (kitty-graphics--query-cell-size))
+  (cons (or (kitty-graphics--tparam 'kitty-graphics-cell-w)
+            kitty-graphics--cell-pixel-width 8)
+        (or (kitty-graphics--tparam 'kitty-graphics-cell-h)
+            kitty-graphics--cell-pixel-height 16)))
+
 (defun kitty-graphics--query-text-sizing-support ()
   "Detect terminal text sizing protocol support via CPR probing.
 Sends three cursor position queries interleaved with OSC 66 width
@@ -4488,8 +4507,11 @@ max cols/rows.  nil means shrink-to-fit the max dimensions (the default).")
 (defun kitty-graphics--compute-cell-dims (pixel-w pixel-h max-cols max-rows)
   "Compute (COLS . ROWS) in terminal cells for image placement.
 With direct placements, COLS and ROWS map directly to terminal columns/rows."
-  (let* ((cw (or kitty-graphics--cell-pixel-width 8))
-         (ch (or kitty-graphics--cell-pixel-height 16))
+  ;; Resolve the cell size before committing image dimensions, including
+  ;; when startup probes are still pending or a window change invalidated it.
+  (let* ((cell-size (kitty-graphics--cell-pixel-size))
+         (cw (car cell-size))
+         (ch (cdr cell-size))
          (img-cols (max 1 (ceiling (/ (float pixel-w) cw))))
          (img-rows (max 1 (ceiling (/ (float pixel-h) ch))))
          (fit (min (if (> img-cols max-cols)
