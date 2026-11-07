@@ -67,7 +67,7 @@ Integrations and capabilities:
 
 - Emacs >= 27.1
 - A supported terminal:
-  - *Kitty backend*: [[https://sw.kovidgoyal.net/kitty/][Kitty]] >= 0.20.0, WezTerm, or Ghostty
+  - *Kitty backend*: [[https://sw.kovidgoyal.net/kitty/][Kitty]] >= 0.20.0, WezTerm, Ghostty, or [[https://www.superlogical.com/rex][Rex]]
   - *Sixel backend*: foot, Konsole, xterm (with ~+sixel~), mlterm, mintty, Windows Terminal, VS Code Terminal, and others with Sixel support
 - A Sixel encoder on ~PATH~, /required/ for the Sixel backend.
   - *Strongly recommended*: ~img2sixel~ from [[https://github.com/saitoha/libsixel][libsixel]] (Nix: ~nixpkgs#libsixel~). Roughly =2.2x= smaller payloads and =~10x= faster than ImageMagick, which matters a lot in tmux where every refresh re-emits the full DCS payload.
