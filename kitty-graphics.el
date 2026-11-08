@@ -1621,7 +1621,8 @@ Sixel when available."
                         kitty-public-key
                         ghostty
                         wezterm
-                        (member term-prog '("kitty" "WezTerm" "ghostty")))))
+                        ;; Rex embeds libghostty and sets only TERM_PROGRAM.
+                        (member term-prog '("kitty" "WezTerm" "ghostty" "rex")))))
     (when (and supported in-tmux (not (kitty-graphics--tmux-passthrough-p frame)))
       (kitty-graphics--log "kitty-detect: disabled, tmux allow-passthrough is off")
       (kitty-graphics--message-once
@@ -2922,6 +2923,15 @@ Signals error on failure, prints success message otherwise."
                         "--vo-kitty-top=5"))
       (cl-assert (member expected args)
                  nil (format "kitty vo args should contain %s" expected))))
+  ;; kitty-detect: Rex (built on libghostty) exports only TERM_PROGRAM=rex.
+  (let ((env nil))
+    (cl-letf (((symbol-function 'kitty-graphics--frame-getenv)
+               (lambda (var &optional _frame) (cdr (assoc var env)))))
+      (setq env '(("TERM_PROGRAM" . "rex")))
+      (cl-assert (kitty-graphics--kitty-detect) nil "TERM_PROGRAM=rex should detect Kitty")
+      (setq env '(("TERM_PROGRAM" . "Apple_Terminal")))
+      (cl-assert (not (kitty-graphics--kitty-detect))
+                 nil "an unknown TERM_PROGRAM should not detect Kitty")))
   ;; org inline images: commented-out links (`# [[...]]') must not render,
   ;; matching native org which skips them via the parse tree (issue from #37).
   (require 'org)
